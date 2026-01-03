@@ -1,0 +1,16 @@
+{
+  "name": "@form-app/api",
+  "private": true,
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy",
+    "migrate:local": "npx wrangler d1 migrations apply form_app_db --local",
+    "migrate:remote": "npx wrangler d1 migrations apply form_app_db --remote",
+    "lint": "echo \"lint not configured\""
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240821.0",
+    "typescript": "^5.4.5",
+    "wrangler": "^4.54.0"
+  }
+}

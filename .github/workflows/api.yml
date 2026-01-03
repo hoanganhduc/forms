@@ -1,0 +1,81 @@
+name: Deploy API Worker
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      API_BASE: https://form-app-api.hoanganhduc.workers.dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            echo "WARNING: package-lock.json not found, using npm install"
+            npm install
+          fi
+
+      - name: Deploy
+        working-directory: apps/api
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GIT_COMMIT: ${{ github.sha }}
+        run: npx wrangler deploy -c wrangler.toml
+
+      - name: Post-deploy checks
+        env:
+          API_BASE: ${{ env.API_BASE }}
+        run: |
+          node - <<'NODE'
+          const baseUrl = process.env.API_BASE || "https://form-app-api.hoanganhduc.workers.dev";
+          const checks = [
+            { path: "/api/forms", expect200: true },
+            { path: "/api/admin/health", expect200: false },
+            { path: "/api/admin/forms", expect200: false },
+            { path: "/api/admin/submissions", expect200: false },
+            { path: "/api/debug/version", expect200: true, optional: true }
+          ];
+
+          async function fetchText(path) {
+            const res = await fetch(`${baseUrl}${path}`);
+            const text = await res.text();
+            return { status: res.status, text };
+          }
+
+          (async () => {
+            for (const check of checks) {
+              const result = await fetchText(check.path);
+              const status = result.status;
+              if (status === 404) {
+                console.error(`FAIL GET ${check.path} status=${status} body=${result.text}`);
+                process.exit(1);
+              }
+              if (check.expect200 && status !== 200) {
+                if (check.optional) {
+                  console.log(`SKIP GET ${check.path} status=${status}`);
+                  continue;
+                }
+                console.error(`FAIL GET ${check.path} status=${status} body=${result.text}`);
+                process.exit(1);
+              }
+              console.log(`OK GET ${check.path} status=${status}`);
+            }
+          })().catch((err) => {
+            console.error("Post-deploy checks failed", err?.message || err);
+            process.exit(1);
+          });
+          NODE

@@ -1,0 +1,165 @@
+# form-app
+
+Monorepo for a Cloudflare Worker API (apps/api) and a Vite + React web app (apps/web).
+The app supports public forms, OAuth (Google/GitHub), user submissions, file uploads
+with VirusTotal scanning, and optional Google Drive finalization.
+
+## Prereqs
+- Node.js (npm)
+
+## Setup
+- `npm install`
+
+## Local dev
+- `npm run dev` (runs API + web)
+- `npm run dev:api`
+- `npm run dev:web`
+- For web env overrides:
+  - `VITE_API_BASE=http://127.0.0.1:8787 VITE_WEB_BASE=/forms/ npm run dev:web`
+- Open `http://localhost:5173/forms/` for the homepage and public form list.
+- Login buttons redirect to OAuth and return to the app after authentication.
+- Admin UI (after login): `http://localhost:5173/forms/#/admin`
+- Builder UI (admin): `http://localhost:5173/forms/#/admin/builder` (create/edit forms & templates)
+- Public fill route: `http://localhost:5173/forms/#/f/hus-demo-1`
+- Docs stub: `http://localhost:5173/forms/#/docs`
+- File upload test: choose a file on the form page and submit; API stores in R2.
+- Form runtime test:
+  - Open `http://localhost:5173/forms/#/f/hus-demo-1`
+  - Verify fields render, submit, and resubmit if unlocked.
+- File upload test:
+  - Submit the form to create a submission ID.
+  - Select files in a file field and click "Upload selected files".
+  - Use "Check status" to poll VirusTotal and finalize to Drive when clean.
+- Dashboard test:
+  - Sign in and open `http://localhost:5173/forms/#/me`
+  - Verify the form appears after at least one submission.
+- Clean local caches (keeps env files): `clean.bat`
+
+## Migrations
+- `npm run migrate:local -w apps/api`
+- `npm run migrate:remote -w apps/api`
+
+## Smoke test
+- `API_BASE=http://127.0.0.1:8787 TOKEN=your_jwt npm run smoke:api`
+
+## Admin exports
+- CSV: `GET /api/admin/forms/:slug/export.csv`
+- TXT (JSONL): `GET /api/admin/forms/:slug/export.txt`
+
+## Deploy: GitHub Pages (web)
+- Build:
+  - `VITE_API_BASE=https://form-app-api.hoanganhduc.workers.dev VITE_WEB_BASE=/forms/ npm run build:web`
+- Upload `apps/web/dist` to GitHub Pages (via your pages.yml workflow).
+- Access at `https://hoanganhduc.github.io/forms/`.
+
+## Deploy: Cloudflare Workers (api)
+- Ensure `apps/api/wrangler.toml` has correct bindings:
+  - D1, KV, R2, and vars (`BASE_URL_API`, `BASE_URL_WEB`, `ALLOWED_ORIGIN`, etc).
+- Run migrations:
+  - `npx wrangler d1 migrations apply form_app_db --remote`
+- Deploy:
+  - `cd apps/api && npx wrangler deploy -c wrangler.toml`
+
+## Quick API reference
+- `GET /api/health`
+- `GET /api/forms`
+- `GET /api/forms/:slug`
+- `POST /api/submissions`
+- `GET /api/me/submissions`
+- `GET /api/me/submissions/:id`
+- `GET /api/me/submission?formSlug=...`
+- `POST /api/uploads/init`
+- `PUT /api/uploads/put`
+- `POST /api/uploads/complete`
+- `GET /api/submissions/upload/status`
+
+## App routes
+- Public:
+  - `/#/` home + public forms
+  - `/#/f/:slug` form fill
+  - `/#/docs` docs
+- User:
+  - `/#/me` dashboard
+  - `/#/me/submissions/:id` submission detail
+  - `/#/account` linked identities + delete account
+- Admin:
+  - `/#/admin` dashboard
+
+## OAuth + account linking
+- Login:
+  - `GET /auth/login/google`
+  - `GET /auth/login/github`
+- Link providers (must be signed in):
+  - `GET /auth/link/google`
+  - `GET /auth/link/github`
+- Deleted users cannot re-login; OAuth callback redirects to `/account?error=user_deleted`.
+
+## Upload flow (current)
+The API uses a staged upload flow:
+1) `POST /api/uploads/init` to create draft upload metadata.
+2) `PUT /api/uploads/put` to upload bytes to R2.
+3) `POST /api/uploads/complete` to create a DB row and kick off VirusTotal.
+4) `POST /api/uploads/vt/recheck` (admin) or per-file "Check status" to update VT status.
+5) Finalization happens when scans are clean and Drive is configured.
+
+## Template visibility
+- Template visibility is deprecated. The `templates.is_public` column remains for compatibility,
+  but the API and UI ignore it and treat all templates as reusable.
+
+## Field rules
+- Email fields can require a specific domain (e.g., `example.com`). Server-side validation enforces it.
+- Email fields can auto-fill from the logged-in user when enabled in the builder. If the login
+  email domain does not match the required domain, the user can still manually enter a valid
+  email address for that domain.
+- GitHub Username fields can auto-fill from the logged-in GitHub identity and are validated server-side.
+- Full Name fields normalize to title-case on submit (e.g., `john wick` → `John Wick`).
+
+## Deletion policy
+- User deletes account via `DELETE /api/me`:
+  - Soft-deletes the user and all related submissions/files.
+  - Clears auth cookie immediately.
+  - Login is blocked for deleted users until an admin restores the account.
+- Admin can restore or permanently delete users via the trash tools.
+- Soft-deleted items are visible in the Trash tab; admin can restore or purge.
+
+## Builder workflow (admin)
+- Use the Builder tab to create or edit forms/templates.
+- Toggle **New** vs **Edit**:
+  - **New**: enter slug/title/template and status fields, then create.
+  - **Edit**: select an existing item and update schema/settings.
+- Field builder supports: text, textarea, number, date, email, GitHub username, full name,
+  select, checkbox, and file fields.
+- File fields: configure extensions, max size, and max files; rules are stored per field.
+- Use drag handles to reorder fields; ordering is saved in schema JSON.
+
+## Admin submissions access
+- Admin can open any submission detail at `/#/me/submissions/:id`.
+- Recent submissions list links each submission ID to that detail view.
+
+## Secrets checklist
+- Never commit `.env`, `.env.local`, or `.dev.vars` files with real secrets.
+- Keep OAuth client secrets, JWT secrets, and Cloudflare tokens in GitHub Secrets or local env files.
+- Verify example files (`.env.example`, `apps/api/.dev.vars.example`) contain no real credentials.
+
+## Web env vars
+- `VITE_API_BASE` (optional): API base URL override.
+- `VITE_WEB_BASE` (optional): Base path for GitHub Pages (default `/forms/`).
+
+## API env vars (uploads + Drive)
+- `VT_API_KEY` (optional): VirusTotal API key for scanning.
+- `VT_STRICT` (optional): `true` to block finalization when scans are pending or malicious.
+- `DRIVE_SERVICE_ACCOUNT_JSON`: Service account JSON (shared drive access required).
+- `DRIVE_PARENT_FOLDER_ID`: Shared drive folder ID where form folders are created.
+
+## Drive setup notes
+- Ensure the service account has access to the shared drive (add it as a member).
+- Use the shared drive folder ID (starts with `0A`) for `DRIVE_PARENT_FOLDER_ID`.
+- The API creates folders as `<root>/<formSlug>/<username>` for finalized uploads.
+
+## Build
+- `npm run build:web`
+
+## Environment
+- Copy `.env.example` to `.env` for web app config.
+- Copy `apps/api/.dev.vars.example` to `apps/api/.dev.vars` for Wrangler local vars.
+- Copy `apps/web/.env.example` to `apps/web/.env.local` for web app overrides.

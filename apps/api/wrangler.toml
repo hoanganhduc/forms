@@ -1,0 +1,23 @@
+name = "form-app-api"
+main = "src/index.ts"
+compatibility_date = "2024-10-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "form_app_db"
+database_id = "1f969f14-f056-4988-b705-7952d8116d63"
+
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "328e5f67b83f4e4a92d0830d2ea917be"
+
+[[r2_buckets]]
+binding = "form_app_files"
+bucket_name = "form-app-files"
+
+[vars]
+BASE_URL_API = "https://form-app-api.hoanganhduc.workers.dev"
+BASE_URL_WEB = "https://hoanganhduc.github.io/forms/"
+ALLOWED_ORIGIN = "http://localhost:5173,http://127.0.0.1:5173,https://hoanganhduc.github.io"
+DRIVE_PARENT_FOLDER_ID = "0AOpdQiTr35VfUk9PVA"
+GIT_COMMIT = ""
