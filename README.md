@@ -21,7 +21,7 @@ with VirusTotal scanning, and optional Google Drive finalization.
 - Admin UI (after login): `http://localhost:5173/forms/#/admin`
 - Builder UI (admin): `http://localhost:5173/forms/#/admin/builder` (create/edit forms & templates)
 - Public fill route: `http://localhost:5173/forms/#/f/hus-demo-1`
-- Docs stub: `http://localhost:5173/forms/#/docs`
+- Docs: `http://localhost:5173/forms/#/docs`
 - File upload test: choose a file on the form page and submit; API stores in R2.
 - Form runtime test:
   - Open `http://localhost:5173/forms/#/f/hus-demo-1`
@@ -34,6 +34,7 @@ with VirusTotal scanning, and optional Google Drive finalization.
   - Sign in and open `http://localhost:5173/forms/#/me`
   - Verify the form appears after at least one submission.
 - Clean local caches (keeps env files): `clean.bat`
+- Theme: dark is default; the toggle persists in localStorage.
 
 ## Migrations
 - `npm run migrate:local -w apps/api`
@@ -93,6 +94,8 @@ with VirusTotal scanning, and optional Google Drive finalization.
 - `GET /api/forms`
 - `GET /api/forms/:slug`
 - `POST /api/submissions`
+- `GET /api/me`
+- `GET /api/me/identities`
 - `GET /api/me/submissions`
 - `GET /api/me/submissions/:id`
 - `GET /api/me/submission?formSlug=...`
@@ -121,6 +124,7 @@ with VirusTotal scanning, and optional Google Drive finalization.
   - `/#/me` dashboard
   - `/#/me/submissions/:id` submission detail
   - `/#/account` linked identities + delete account
+  - `/#/canvas` user Canvas info
 - Admin:
   - `/#/admin` dashboard
 

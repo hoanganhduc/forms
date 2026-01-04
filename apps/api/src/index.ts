@@ -237,6 +237,18 @@ function toBoolean(value: number | null): boolean {
   return value ? value !== 0 : false;
 }
 
+async function hasColumn(env: Env, table: string, column: string): Promise<boolean> {
+  if (!/^[a-zA-Z0-9_]+$/.test(table) || !/^[a-zA-Z0-9_]+$/.test(column)) {
+    return false;
+  }
+  const row = await env.DB.prepare(
+    `SELECT 1 FROM pragma_table_info('${table}') WHERE name=? LIMIT 1`
+  )
+    .bind(column)
+    .first<{ "1": number }>();
+  return Boolean(row);
+}
+
 async function parseJsonBody<T>(request: Request): Promise<T> {
   return (await request.json()) as T;
 }
@@ -4872,6 +4884,73 @@ async function getUserIdentities(env: Env, userId: string) {
   }));
 }
 
+async function ensureIdentityFromAuthPayload(env: Env, authPayload: JwtPayload) {
+  const userId = authPayload.userId;
+  if (!userId || !authPayload.provider || !authPayload.sub) return;
+
+  const userRow = await env.DB.prepare("SELECT id, deleted_at FROM users WHERE id=?")
+    .bind(userId)
+    .first<{ id: string; deleted_at: string | null }>();
+  if (!userRow) {
+    await env.DB.prepare("INSERT INTO users (id, is_admin) VALUES (?, ?)")
+      .bind(userId, authPayload.isAdmin ? 1 : 0)
+      .run();
+  } else if (userRow.deleted_at) {
+    return;
+  }
+
+  const existingByUser = await env.DB.prepare(
+    "SELECT id FROM user_identities WHERE user_id=? AND provider=? LIMIT 1"
+  )
+    .bind(userId, authPayload.provider)
+    .first<{ id: string }>();
+
+  if (existingByUser?.id) return;
+
+  if (authPayload.provider === "google") {
+    const existingBySub = await env.DB.prepare(
+      "SELECT user_id FROM user_identities WHERE provider='google' AND provider_sub=? LIMIT 1"
+    )
+      .bind(authPayload.sub)
+      .first<{ user_id: string }>();
+    if (existingBySub?.user_id && existingBySub.user_id !== userId) {
+      console.warn("[identity_repair_skip]", {
+        provider: "google",
+        userId,
+        existingUserId: existingBySub.user_id
+      });
+      return;
+    }
+    await env.DB.prepare(
+      "INSERT INTO user_identities (id, user_id, provider, provider_sub, email) VALUES (?, ?, 'google', ?, ?)"
+    )
+      .bind(crypto.randomUUID(), userId, authPayload.sub, authPayload.email ?? null)
+      .run();
+    return;
+  }
+
+  if (authPayload.provider === "github") {
+    const existingByLogin = await env.DB.prepare(
+      "SELECT user_id FROM user_identities WHERE provider='github' AND provider_login=? LIMIT 1"
+    )
+      .bind(authPayload.sub)
+      .first<{ user_id: string }>();
+    if (existingByLogin?.user_id && existingByLogin.user_id !== userId) {
+      console.warn("[identity_repair_skip]", {
+        provider: "github",
+        userId,
+        existingUserId: existingByLogin.user_id
+      });
+      return;
+    }
+    await env.DB.prepare(
+      "INSERT INTO user_identities (id, user_id, provider, provider_sub, provider_login, email) VALUES (?, ?, 'github', NULL, ?, ?)"
+    )
+      .bind(crypto.randomUUID(), userId, authPayload.sub, authPayload.email ?? null)
+      .run();
+  }
+}
+
 async function requireAdmin(request: Request, env: Env): Promise<JwtPayload | null> {
   const payload = await getAuthPayload(request, env);
   if (!payload || !payload.isAdmin) return null;
@@ -6800,27 +6879,51 @@ export default {
         const templateMatch = url.pathname.match(/^\/api\/admin\/templates\/([^/]+)$/);
         if (templateMatch) {
           const key = decodeURIComponent(templateMatch[1]);
-          let body: {
-            name?: string;
-            schema_json?: string;
-          } | null = null;
+            let body: {
+              newKey?: string;
+              name?: string;
+              schema_json?: string;
+            } | null = null;
           try {
             body = await parseJsonBody(request);
           } catch (error) {
             return errorResponse(400, "invalid_json", requestId, corsHeaders);
           }
 
-          const updates: string[] = [];
-          const params: Array<string | number | null> = [];
-          let canvasWarning: string | null = null;
+            const updates: string[] = [];
+            const params: Array<string | number | null> = [];
+            let canvasWarning: string | null = null;
+            if (body?.newKey !== undefined) {
+              if (typeof body.newKey !== "string" || !body.newKey.trim()) {
+                return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                  field: "newKey",
+                  message: "expected_string"
+                });
+              }
+              const nextKey = body.newKey.trim();
+              if (nextKey !== key) {
+                const existing = await env.DB.prepare(
+                  "SELECT id FROM templates WHERE key=? AND deleted_at IS NULL"
+                )
+                  .bind(nextKey)
+                  .first<{ id: string }>();
+                if (existing?.id) {
+                  return errorResponse(409, "conflict", requestId, corsHeaders, {
+                    message: "key_exists"
+                  });
+                }
+                updates.push("key=?");
+                params.push(nextKey);
+              }
+            }
           if (body?.name && typeof body.name === "string") {
             updates.push("name=?");
             params.push(body.name.trim());
           }
-          if (body?.schema_json && typeof body.schema_json === "string") {
-            let parsedSchema: unknown = null;
-            try {
-              parsedSchema = JSON.parse(body.schema_json);
+            if (body?.schema_json && typeof body.schema_json === "string") {
+              let parsedSchema: unknown = null;
+              try {
+                parsedSchema = JSON.parse(body.schema_json);
             } catch (error) {
               return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
                 field: "schema_json",
@@ -7791,12 +7894,13 @@ export default {
         const formMatch = url.pathname.match(/^\/api\/admin\/forms\/([^/]+)$/);
         if (formMatch) {
           const slug = decodeURIComponent(formMatch[1]);
-          let body: {
-            title?: string;
-            description?: string | null;
-            is_public?: boolean;
-            is_locked?: boolean;
-            auth_policy?: string;
+            let body: {
+              newSlug?: string;
+              title?: string;
+              description?: string | null;
+              is_public?: boolean;
+              is_locked?: boolean;
+              auth_policy?: string;
             templateKey?: string;
             schema_json?: string;
             canvasEnabled?: boolean;
@@ -7810,13 +7914,45 @@ export default {
             return errorResponse(400, "invalid_json", requestId, corsHeaders);
           }
 
-          const updates: string[] = [];
-          const params: Array<string | number | null> = [];
+            const updates: string[] = [];
+            const params: Array<string | number | null> = [];
+            let canvasWarning: string | null = null;
+            const formRow = await env.DB.prepare(
+              "SELECT id, slug FROM forms WHERE slug=? AND deleted_at IS NULL"
+            )
+              .bind(slug)
+              .first<{ id: string; slug: string }>();
+            if (!formRow) {
+              return errorResponse(404, "not_found", requestId, corsHeaders);
+            }
+            let newSlug: string | null = null;
+            if (body?.newSlug !== undefined) {
+              if (typeof body.newSlug !== "string" || !body.newSlug.trim()) {
+                return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                  field: "newSlug",
+                  message: "expected_string"
+                });
+              }
+              const candidate = body.newSlug.trim();
+              if (candidate !== slug) {
+                const existing = await env.DB.prepare(
+                  "SELECT id, deleted_at FROM forms WHERE slug=?"
+                )
+                  .bind(candidate)
+                  .first<{ id: string; deleted_at: string | null }>();
+                if (existing?.id && existing.id !== formRow.id) {
+                  return errorResponse(409, "conflict", requestId, corsHeaders, {
+                    message: existing.deleted_at ? "slug_in_trash" : "slug_exists"
+                  });
+                }
+                newSlug = candidate;
+              }
+            }
 
-          if (body?.title && typeof body.title === "string") {
-            updates.push("title=?");
-            params.push(body.title.trim());
-          }
+            if (body?.title && typeof body.title === "string") {
+              updates.push("title=?");
+              params.push(body.title.trim());
+            }
           if (body?.description !== undefined) {
             updates.push("description=?");
             params.push(body.description ?? null);
@@ -8035,28 +8171,100 @@ export default {
             )
               .bind(JSON.stringify(parsedSchema), formId)
               .run();
-            const mirroredRules = buildFileRulesJsonFromSchema(body.schema_json);
-            updates.push("file_rules_json=?");
-            params.push(mirroredRules);
-          }
+              const mirroredRules = buildFileRulesJsonFromSchema(body.schema_json);
+              updates.push("file_rules_json=?");
+              params.push(mirroredRules);
+            }
+            if (newSlug) {
+              updates.push("slug=?");
+              params.push(newSlug);
+            }
 
-          if (updates.length === 0) {
-            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-              message: "no_fields_to_update"
-            });
+            if (updates.length === 0) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                message: "no_fields_to_update"
+              });
           }
 
           params.push(slug);
-          await env.DB.prepare(
-            `UPDATE forms SET ${updates.join(", ")}, updated_at=datetime('now') WHERE slug=? AND deleted_at IS NULL`
-          )
-            .bind(...params)
-            .run();
+            await env.DB.prepare(
+              `UPDATE forms SET ${updates.join(", ")}, updated_at=datetime('now') WHERE slug=? AND deleted_at IS NULL`
+            )
+              .bind(...params)
+              .run();
+            if (newSlug) {
+              if (await hasColumn(env, "submissions", "form_slug")) {
+                try {
+                  await env.DB.prepare("UPDATE submissions SET form_slug=? WHERE form_id=?")
+                    .bind(newSlug, formRow.id)
+                    .run();
+                } catch (error) {
+                  if (!isMissingColumn(error, "form_slug")) {
+                    throw error;
+                  }
+                }
+              }
+              if (await hasColumn(env, "submission_file_items", "form_slug")) {
+                try {
+                  await env.DB.prepare("UPDATE submission_file_items SET form_slug=? WHERE form_id=?")
+                    .bind(newSlug, formRow.id)
+                    .run();
+                } catch (error) {
+                  if (!isMissingColumn(error, "form_slug")) {
+                    throw error;
+                  }
+                }
+              }
+              if (await hasColumn(env, "submission_upload_sessions", "form_slug")) {
+                try {
+                  await env.DB.prepare("UPDATE submission_upload_sessions SET form_slug=? WHERE form_id=?")
+                    .bind(newSlug, formRow.id)
+                    .run();
+                } catch (error) {
+                  if (!isMissingColumn(error, "form_slug")) {
+                    throw error;
+                  }
+                }
+              }
+              if (await hasColumn(env, "drive_folders", "form_slug")) {
+                try {
+                  await env.DB.prepare("UPDATE drive_folders SET form_slug=? WHERE form_slug=?")
+                    .bind(newSlug, slug)
+                    .run();
+                } catch (error) {
+                  if (!isMissingColumn(error, "form_slug")) {
+                    throw error;
+                  }
+                }
+              }
+              if (await hasColumn(env, "drive_user_folders", "form_slug")) {
+                try {
+                  await env.DB.prepare("UPDATE drive_user_folders SET form_slug=? WHERE form_slug=?")
+                    .bind(newSlug, slug)
+                    .run();
+                } catch (error) {
+                  if (!isMissingColumn(error, "form_slug")) {
+                    throw error;
+                  }
+                }
+              }
+              if (await hasColumn(env, "email_logs", "form_slug")) {
+                try {
+                  await env.DB.prepare("UPDATE email_logs SET form_slug=? WHERE form_slug=?")
+                    .bind(newSlug, slug)
+                    .run();
+                } catch (error) {
+                  if (!isMissingColumn(error, "form_slug")) {
+                    throw error;
+                  }
+                }
+              }
+            }
 
-          return jsonResponse(
-            200,
-            { ok: true, warning: canvasWarning ? { code: canvasWarning } : null, requestId },
-            requestId,
+            return jsonResponse(
+              200,
+              { ok: true, warning: canvasWarning ? { code: canvasWarning } : null, requestId },
+              requestId,
             corsHeaders
           );
         }
@@ -9834,6 +10042,7 @@ export default {
       if (!authPayload) {
         return errorResponse(401, "auth_required", requestId, corsHeaders);
       }
+      await ensureIdentityFromAuthPayload(env, authPayload);
       const identities = await getUserIdentities(env, authPayload.userId);
       let canvasInfo: {
         user_id: string | null;
@@ -9923,6 +10132,7 @@ export default {
       if (!authPayload) {
         return errorResponse(401, "auth_required", requestId, corsHeaders);
       }
+      await ensureIdentityFromAuthPayload(env, authPayload);
       const identities = await getUserIdentities(env, authPayload.userId);
       return jsonResponse(200, { data: identities, requestId }, requestId, corsHeaders);
     }

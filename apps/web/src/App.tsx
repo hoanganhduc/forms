@@ -3,6 +3,9 @@ import { HashRouter, Link, Route, Routes, useLocation, useNavigate, useParams } 
 import { APP_INFO } from "./config";
 import { apiFetch, clearToken, setToken } from "./auth";
 
+const LICENSE_URL = `${APP_INFO.repoUrl}/blob/master/LICENSE`;
+const THEME_KEY = "form_app_theme";
+
 type FormSummary = {
   slug: string;
   title: string;
@@ -193,6 +196,12 @@ function pickNameFromData(data: Record<string, unknown> | null) {
 function getAuthPolicyLabel(policy?: string) {
   const value = policy || "optional";
   return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function getUserDisplayName(user: UserInfo | null): string {
+  if (!user) return "n/a";
+  if (user.provider === "github" && user.username) return user.username;
+  return user.email || user.userId;
 }
 
 function getAuthPolicyIcon(policy?: string) {
@@ -1170,7 +1179,7 @@ function AuthBar({
           <div className="auth-user">
             <div className="auth-user-title">Signed in</div>
           <div className="auth-user-meta">
-            {user.email || user.userId} -{" "}
+            {getUserDisplayName(user)} -{" "}
             {providerIcon ? <i className={`bi ${providerIcon}`} aria-hidden="true" /> : null}{" "}
             {providerLabel}
           </div>
@@ -1224,7 +1233,7 @@ function AuthStatus({ user }: { user: UserInfo | null }) {
       {user ? (
         <div>
           <div>Authenticated</div>
-          <div className="muted">{user.email || user.userId}</div>
+          <div className="muted">{getUserDisplayName(user)}</div>
           <div className="muted">
             Provider:{" "}
             {providerIcon ? <i className={`bi ${providerIcon}`} aria-hidden="true" /> : null}{" "}
@@ -1333,7 +1342,10 @@ function HomePage({
             </li>
             <li>
               <i className="bi bi-file-earmark-text me-2" aria-hidden="true" />
-              <strong>License:</strong> {APP_INFO.license}
+              <strong>License:</strong>{" "}
+              <a href={LICENSE_URL} target="_blank" rel="noreferrer">
+                {APP_INFO.license}
+              </a>
             </li>
             <li>
               <i className="bi bi-github me-2" aria-hidden="true" />
@@ -2763,7 +2775,7 @@ function DocsPage() {
             <strong>User:</strong> <code>/#/me</code>, <code>/#/me/submissions/&lt;id&gt;</code>
           </li>
           <li>
-            <strong>Account:</strong> <code>/#/account</code>
+            <strong>Account:</strong> <code>/#/account</code>, <code>/#/canvas</code>
           </li>
           <li>
             <strong>Admin:</strong> <code>/#/admin</code>
@@ -2788,6 +2800,9 @@ function DocsPage() {
           </li>
           <li>
             <strong>Admin:</strong> manage forms/templates, review submissions, export CSV/TXT.
+          </li>
+          <li>
+            <strong>Account:</strong> linked identities, deletion flow, and user-level canvas info.
           </li>
         </ul>
       </div>
@@ -2948,6 +2963,14 @@ function DocsPage() {
         <ul className="list-unstyled mb-0">
           <li>User deletion is soft-delete plus immediate logout.</li>
           <li>Only admin can restore or permanently delete users.</li>
+        </ul>
+      </div>
+
+      <div className="panel panel--compact">
+        <h3>Theme</h3>
+        <ul className="list-unstyled mb-0">
+          <li>Dark theme is the default.</li>
+          <li>The theme toggle persists in localStorage.</li>
         </ul>
       </div>
 
@@ -3265,7 +3288,20 @@ function AccountPage({
         setLoading(false);
         return;
       }
-      setIdentities(Array.isArray(payload?.identities) ? payload.identities : []);
+      let nextIdentities: any[] = [];
+      if (Array.isArray(payload?.identities)) {
+        nextIdentities = payload.identities;
+      } else if (Array.isArray(payload?.data)) {
+        nextIdentities = payload.data;
+      }
+      if (nextIdentities.length === 0) {
+        const identitiesRes = await apiFetch(`${API_BASE}/api/me/identities`);
+        const identitiesPayload = await identitiesRes.json().catch(() => null);
+        if (identitiesRes.ok && Array.isArray(identitiesPayload?.data)) {
+          nextIdentities = identitiesPayload.data;
+        }
+      }
+      setIdentities(nextIdentities);
       setHasCanvasInfo(Boolean(payload?.canvas?.course_id || payload?.canvas?.user_id));
       setError(null);
       setLoading(false);
@@ -3335,8 +3371,8 @@ function AccountPage({
         {user ? (
           <span className="badge">
             {user.provider === "github"
-              ? user.username || user.email || user.userId
-              : user.email || user.userId}
+              ? getUserDisplayName(user)
+              : getUserDisplayName(user)}
           </span>
         ) : null}
       </div>
@@ -4883,7 +4919,7 @@ function AdminPage({
     <section className="panel">
       <div className="panel-header">
         <h2>Admin</h2>
-        {user ? <span className="badge">{user.email || user.userId}</span> : null}
+        {user ? <span className="badge">{getUserDisplayName(user)}</span> : null}
       </div>
       {bulkStatus ? (
         <div className="alert alert-info">
@@ -6088,7 +6124,7 @@ function AdminCanvasPage({
     <section className="panel">
       <div className="panel-header">
         <h2>Canvas</h2>
-        {user ? <span className="badge">{user.email || user.userId}</span> : null}
+        {user ? <span className="badge">{getUserDisplayName(user)}</span> : null}
       </div>
       {error ? <div className="alert alert-warning">{error}</div> : null}
       {actionError ? <div className="alert alert-warning">{actionError}</div> : null}
@@ -6590,7 +6626,7 @@ function AdminEmailsPage({
     <section className="panel">
       <div className="panel-header">
         <h2>Emails</h2>
-        {user ? <span className="badge">{user.email || user.userId}</span> : null}
+        {user ? <span className="badge">{getUserDisplayName(user)}</span> : null}
       </div>
       {actionStatus ? (
         <div className={`alert alert-${actionStatus.type === "success" ? "success" : "warning"}`}>
@@ -7171,7 +7207,7 @@ function TrashPage({
     <section className="panel">
       <div className="panel-header">
         <h2>Trash</h2>
-        {user ? <span className="badge">{user.email || user.userId}</span> : null}
+        {user ? <span className="badge">{getUserDisplayName(user)}</span> : null}
       </div>
       {bulkStatus ? (
         <div className="alert alert-info">
@@ -7681,6 +7717,7 @@ function BuilderPage({
   const [templates, setTemplates] = useState<any[]>([]);
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
   const [templateEditorKey, setTemplateEditorKey] = useState("");
+  const [templateEditorOriginalKey, setTemplateEditorOriginalKey] = useState("");
   const [templateEditorName, setTemplateEditorName] = useState("");
   const [templateEditorSchema, setTemplateEditorSchema] = useState("");
   const [templateEditorStatus, setTemplateEditorStatus] = useState<string | null>(null);
@@ -7707,6 +7744,7 @@ function BuilderPage({
   const [templateFileEditId, setTemplateFileEditId] = useState("");
   const [templateFileDragOverId, setTemplateFileDragOverId] = useState<string | null>(null);
   const [formBuilderSlug, setFormBuilderSlug] = useState("");
+  const [formBuilderSlugEdit, setFormBuilderSlugEdit] = useState("");
   const [formBuilderSchema, setFormBuilderSchema] = useState("");
   const [formBuilderStatus, setFormBuilderStatus] = useState<string | null>(null);
   const [formBuilderDescription, setFormBuilderDescription] = useState("");
@@ -7952,6 +7990,7 @@ function BuilderPage({
     }
     const template = payload?.data;
     setTemplateEditorKey(template?.key || key);
+    setTemplateEditorOriginalKey(template?.key || key);
     setTemplateEditorName(template?.name || "");
     setTemplateEditorSchema(
       template?.schema_json ? JSON.stringify(JSON.parse(template.schema_json), null, 2) : ""
@@ -7998,6 +8037,10 @@ function BuilderPage({
       setTemplateEditorStatus("Select a template and provide schema.");
       return;
     }
+    if (!templateEditorOriginalKey) {
+      setTemplateEditorStatus("Select a template to update.");
+      return;
+    }
     const parsed = parseSchemaText(templateEditorSchema);
     if ((parsed as any).error) {
       setTemplateEditorStatus((parsed as any).error);
@@ -8009,11 +8052,15 @@ function BuilderPage({
       return;
     }
     const response = await apiFetch(
-      `${API_BASE}/api/admin/templates/${encodeURIComponent(templateEditorKey)}`,
+      `${API_BASE}/api/admin/templates/${encodeURIComponent(templateEditorOriginalKey)}`,
       {
         method: "PATCH",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
+          newKey:
+            templateEditorKey !== templateEditorOriginalKey
+              ? templateEditorKey
+              : undefined,
           name: templateEditorName || undefined,
           schema_json: templateEditorSchema
         })
@@ -8025,6 +8072,9 @@ function BuilderPage({
       return;
     }
     setTemplateEditorStatus("Template updated.");
+    if (templateEditorKey !== templateEditorOriginalKey) {
+      setTemplateEditorOriginalKey(templateEditorKey);
+    }
     await loadBuilder();
   }
 
@@ -8225,8 +8275,10 @@ function BuilderPage({
       setFormBuilderCanvasCourseId("");
       setFormBuilderCanvasAllowedSections(null);
       setFormBuilderCanvasPosition("bottom");
+      setFormBuilderSlugEdit("");
       return;
     }
+    setFormBuilderSlugEdit(slug);
     const response = await apiFetch(`${API_BASE}/api/forms/${encodeURIComponent(slug)}`);
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
@@ -8283,6 +8335,11 @@ function BuilderPage({
       setFormBuilderStatus("Select a form to update.");
       return;
     }
+    const normalizedSlugEdit = formBuilderSlugEdit.trim();
+    const nextSlug =
+      normalizedSlugEdit && normalizedSlugEdit !== formBuilderSlug
+        ? normalizedSlugEdit
+        : null;
     if (!formBuilderSchema.trim()) {
       setFormBuilderStatus("Schema JSON is required.");
       return;
@@ -8300,24 +8357,33 @@ function BuilderPage({
     const response = await apiFetch(`${API_BASE}/api/admin/forms/${encodeURIComponent(formBuilderSlug)}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ schema_json: formBuilderSchema })
+      body: JSON.stringify({
+        schema_json: formBuilderSchema,
+        newSlug: nextSlug || undefined
+      })
     });
     const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      const detailMessage =
-        payload?.detail?.message ||
-        payload?.detail?.field ||
-        (typeof payload?.detail === "string" ? payload.detail : null);
-      setFormBuilderStatus(
-        detailMessage
-          ? `${payload?.error || "Failed to update form"}: ${detailMessage}`
-          : payload?.error || "Failed to update form."
-      );
-      return;
+      if (!response.ok) {
+        const detailMessage =
+          payload?.detail?.message ||
+          payload?.detail?.field ||
+          (typeof payload?.detail === "string" ? payload.detail : null);
+        setFormBuilderStatus(
+          detailMessage
+            ? `${payload?.error || "Failed to update form"}: ${detailMessage}`
+            : payload?.error || "Failed to update form."
+        );
+        onNotice("Failed to update form schema.", "error");
+        return;
+      }
+      if (nextSlug) {
+        setFormBuilderSlug(nextSlug);
+        setFormBuilderSlugEdit(nextSlug);
+      }
+      setFormBuilderStatus("Form schema updated.");
+      onNotice("Form schema updated.", "success");
+      await loadBuilder();
     }
-    setFormBuilderStatus("Form schema updated.");
-    await loadBuilder();
-  }
 
   async function handleUpdateFormSettings() {
     setFormBuilderStatus(null);
@@ -8325,6 +8391,11 @@ function BuilderPage({
       setFormBuilderStatus("Select a form to update.");
       return;
     }
+    const normalizedSlugEdit = formBuilderSlugEdit.trim();
+    const nextSlug =
+      normalizedSlugEdit && normalizedSlugEdit !== formBuilderSlug
+        ? normalizedSlugEdit
+        : null;
     if (formBuilderCanvasEnabled && !formBuilderCanvasCourseId) {
       setFormBuilderStatus("Select a Canvas course or disable Canvas enrollment.");
       return;
@@ -8340,24 +8411,33 @@ function BuilderPage({
     const canvasAllowedSectionIds = Array.isArray(formBuilderCanvasAllowedSections)
       ? formBuilderCanvasAllowedSections
       : undefined;
-    const response = await apiFetch(`${API_BASE}/api/admin/forms/${encodeURIComponent(formBuilderSlug)}`, {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        description: formBuilderDescription || null,
-        is_public: formBuilderPublic,
-        is_locked: formBuilderLocked,
-        auth_policy: formBuilderAuthPolicy,
-        canvasEnabled: formBuilderCanvasEnabled,
-        canvasCourseId: formBuilderCanvasEnabled ? formBuilderCanvasCourseId || null : null,
-        ...(formBuilderCanvasEnabled && canvasAllowedSectionIds
-          ? { canvasAllowedSectionIds }
-          : {}),
-        canvasFieldsPosition: formBuilderCanvasPosition
-      })
-    });
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
+    let response: Response | null = null;
+    let payload: any = null;
+    try {
+      response = await apiFetch(`${API_BASE}/api/admin/forms/${encodeURIComponent(formBuilderSlug)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          newSlug: nextSlug || undefined,
+          description: formBuilderDescription || null,
+          is_public: formBuilderPublic,
+          is_locked: formBuilderLocked,
+          auth_policy: formBuilderAuthPolicy,
+          canvasEnabled: formBuilderCanvasEnabled,
+          canvasCourseId: formBuilderCanvasEnabled ? formBuilderCanvasCourseId || null : null,
+          ...(formBuilderCanvasEnabled && canvasAllowedSectionIds
+            ? { canvasAllowedSectionIds }
+            : {}),
+          canvasFieldsPosition: formBuilderCanvasPosition
+        })
+      });
+      payload = await response.json().catch(() => null);
+    } catch (error) {
+      setFormBuilderStatus("Failed to update form settings.");
+      onNotice("Failed to update form settings.", "error");
+      return;
+    }
+    if (!response || !response.ok) {
       const detailMessage =
         payload?.detail?.message ||
         payload?.detail?.field ||
@@ -8367,11 +8447,17 @@ function BuilderPage({
           ? `${payload?.error || "Failed to update form settings"}: ${detailMessage}`
           : payload?.error || "Failed to update form settings."
       );
+      onNotice("Failed to update form settings.", "error");
       return;
     }
+    if (nextSlug) {
+      setFormBuilderSlug(nextSlug);
+      setFormBuilderSlugEdit(nextSlug);
+    }
     setFormBuilderStatus("Form settings updated.");
+    onNotice("Form settings updated.", "success");
     await loadBuilder();
-  }
+    }
 
   function handleCopyFormLink() {
     if (!formBuilderSlug) {
@@ -8829,7 +8915,7 @@ function BuilderPage({
     <section className="panel">
       <div className="panel-header">
         <h2>Builder</h2>
-        {user ? <span className="badge">{user.email || user.userId}</span> : null}
+        {user ? <span className="badge">{getUserDisplayName(user)}</span> : null}
       </div>
       <div className="d-flex align-items-center gap-2 mb-3">
         <button type="button" className="btn btn-outline-primary btn-sm" onClick={() => loadBuilder()}>
@@ -8846,12 +8932,13 @@ function BuilderPage({
                 <button
                   type="button"
                   className={`btn ${formBuilderMode === "create" ? "btn-primary" : "btn-outline-primary"}`}
-                  onClick={() => {
-                    setFormBuilderMode("create");
-                    setFormBuilderSlug("");
-                    setFormBuilderSchema("");
-                    setFormBuilderStatus(null);
-                    setFormCreateCanvasEnabled(false);
+                    onClick={() => {
+                      setFormBuilderMode("create");
+                      setFormBuilderSlug("");
+                      setFormBuilderSlugEdit("");
+                      setFormBuilderSchema("");
+                      setFormBuilderStatus(null);
+                      setFormCreateCanvasEnabled(false);
                     setFormCreateCanvasCourseId("");
                     setFormCreateCanvasAllowedSections(null);
                     setFormCreateCanvasPosition("bottom");
@@ -8979,39 +9066,48 @@ function BuilderPage({
                 </div>
               </div>
             ) : null}
-            {formBuilderMode === "edit" ? (
-              <div>
-                <div className="row g-3">
-              <div className="col-md-4">
-                <label className="form-label">Form</label>
-                <select
-                  className="form-select"
-                  value={formBuilderSlug}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setFormBuilderSlug(value);
-                    handleLoadFormSchema(value);
-                  }}
-                >
-                  <option value="">Select form</option>
-                  {safeForms
-                    .filter((form) => typeof form.slug === "string")
-                    .map((form) => (
-                      <option key={form.slug} value={form.slug}>
-                        {form.title} ({form.slug})
-                      </option>
-                    ))}
-                </select>
-              </div>
-              <div className="col-md-4">
-                <label className="form-label">Description</label>
-                <input
-                  className="form-control"
-                  value={formBuilderDescription}
-                  onChange={(event) => setFormBuilderDescription(event.target.value)}
-                  disabled={!formBuilderSlug}
-                />
-              </div>
+              {formBuilderMode === "edit" ? (
+                <div>
+                  <div className="row g-3">
+                    <div className="col-md-4">
+                      <label className="form-label">Form</label>
+                      <select
+                        className="form-select"
+                        value={formBuilderSlug}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setFormBuilderSlug(value);
+                          handleLoadFormSchema(value);
+                        }}
+                      >
+                        <option value="">Select form</option>
+                        {safeForms
+                          .filter((form) => typeof form.slug === "string")
+                          .map((form) => (
+                            <option key={form.slug} value={form.slug}>
+                              {form.title} ({form.slug})
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                    <div className="col-md-4">
+                      <label className="form-label">Slug</label>
+                      <input
+                        className="form-control"
+                        value={formBuilderSlugEdit}
+                        onChange={(event) => setFormBuilderSlugEdit(event.target.value)}
+                        disabled={!formBuilderSlug}
+                      />
+                    </div>
+                    <div className="col-md-4">
+                  <label className="form-label">Description</label>
+                  <input
+                    className="form-control"
+                    value={formBuilderDescription}
+                    onChange={(event) => setFormBuilderDescription(event.target.value)}
+                    disabled={!formBuilderSlug}
+                  />
+                </div>
               <div className="col-md-4">
                 <label className="form-label">Auth policy</label>
                 <select
@@ -9419,13 +9515,14 @@ function BuilderPage({
                 <button
                   type="button"
                   className={`btn ${templateBuilderMode === "create" ? "btn-primary" : "btn-outline-primary"}`}
-                  onClick={() => {
-                    setTemplateBuilderMode("create");
-                    setTemplateEditorKey("");
-                    setTemplateEditorName("");
-                    setTemplateEditorSchema("");
-                    setTemplateEditorStatus(null);
-                  }}
+                    onClick={() => {
+                      setTemplateBuilderMode("create");
+                      setTemplateEditorKey("");
+                      setTemplateEditorOriginalKey("");
+                      setTemplateEditorName("");
+                      setTemplateEditorSchema("");
+                      setTemplateEditorStatus(null);
+                    }}
                 >
                   <i className="bi bi-plus-circle" aria-hidden="true" /> New template
                 </button>
@@ -9772,18 +9869,22 @@ function BuilderPage({
   );
 }
 
-function AppShell() {
-  const [forms, setForms] = useState<FormSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<ApiError | null>(null);
-  const [user, setUser] = useState<UserInfo | null>(null);
-  const [routeKey, setRouteKey] = useState(0);
-  const [toasts, setToasts] = useState<ToastNotice[]>([]);
-  const navigate = useNavigate();
-  const location = useLocation();
+  function AppShell() {
+    const [forms, setForms] = useState<FormSummary[]>([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<ApiError | null>(null);
+    const [user, setUser] = useState<UserInfo | null>(null);
+    const [routeKey, setRouteKey] = useState(0);
+    const [toasts, setToasts] = useState<ToastNotice[]>([]);
+    const [theme, setTheme] = useState<"dark" | "light">(() => {
+      const saved = localStorage.getItem(THEME_KEY);
+      return saved === "light" || saved === "dark" ? saved : "dark";
+    });
+    const navigate = useNavigate();
+    const location = useLocation();
 
-  useEffect(() => {
-    async function loadUser() {
+    useEffect(() => {
+      async function loadUser() {
       const response = await apiFetch(`${API_BASE}/auth/me`);
       const payload = await response.json().catch(() => null);
       if (payload?.authenticated) {
@@ -9794,7 +9895,12 @@ function AppShell() {
     }
 
     loadUser();
-  }, [routeKey]);
+    }, [routeKey]);
+
+    useEffect(() => {
+      document.documentElement.setAttribute("data-theme", theme);
+      localStorage.setItem(THEME_KEY, theme);
+    }, [theme]);
 
   function pushNotice(message: string, type: NoticeType = "info") {
     const id = crypto.randomUUID();
@@ -9888,17 +9994,21 @@ function AppShell() {
     window.location.assign(loginUrl);
   }
 
-  function handleLogout(silent: boolean = false) {
-    apiFetch(`${API_BASE}/auth/logout`).finally(() => {
-      clearToken();
-      setUser(null);
-      setRouteKey((prev) => prev + 1);
-      if (!silent) {
-        pushNotice("Logged out successfully.", "success");
-      }
-      navigate("/", { replace: true });
-    });
-  }
+    function handleLogout(silent: boolean = false) {
+      apiFetch(`${API_BASE}/auth/logout`).finally(() => {
+        clearToken();
+        setUser(null);
+        setRouteKey((prev) => prev + 1);
+        if (!silent) {
+          pushNotice("Logged out successfully.", "success");
+        }
+        navigate("/", { replace: true });
+      });
+    }
+
+    function toggleTheme() {
+      setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+    }
 
   return (
     <div className="app">
@@ -9931,8 +10041,8 @@ function AppShell() {
           ))}
         </div>
       ) : null}
-      <nav className="navbar navbar-expand navbar-light bg-light rounded px-3 mb-4">
-        <div className="navbar-nav me-auto">
+      <nav className="navbar navbar-expand navbar-light bg-light rounded px-3 mb-3">
+        <div className="navbar-nav me-auto align-items-center">
           <Link className="nav-link" to="/">
             Home
           </Link>
@@ -9979,6 +10089,17 @@ function AppShell() {
         </div>
         <AuthBar user={user} onLogin={handleLogin} onLogout={handleLogout} />
       </nav>
+      <div className="d-flex justify-content-end mb-3">
+        <button
+          type="button"
+          className="btn btn-outline-secondary btn-sm"
+          onClick={toggleTheme}
+          title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+        >
+          <i className={`bi ${theme === "dark" ? "bi-sun" : "bi-moon"}`} aria-hidden="true" />{" "}
+          {theme === "dark" ? "Light" : "Dark"}
+        </button>
+      </div>
 
       <Routes>
         <Route path="/" element={<HomePage forms={forms} loading={loading} error={error} user={user} />} />
@@ -10052,7 +10173,12 @@ function AppShell() {
         <div>{APP_INFO.title}</div>
         <div>{APP_INFO.description}</div>
         <div>
-          (c) {new Date().getFullYear()} {APP_INFO.author}. {APP_INFO.license}.{" "}
+          (c) {new Date().getFullYear()} {APP_INFO.author}.{" "}
+          License:{" "}
+          <a href={LICENSE_URL} target="_blank" rel="noreferrer">
+            {APP_INFO.license}
+          </a>
+          .{" "}
           <a href={APP_INFO.repoUrl} target="_blank" rel="noreferrer">
             Source
           </a>
