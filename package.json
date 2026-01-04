@@ -11,6 +11,7 @@
     "build:web": "npm run build -w apps/web",
     "preview:web": "npm run preview -w apps/web",
     "smoke:api": "node apps/api/scripts/smoke.mjs",
+    "smoke:canvas": "node apps/api/scripts/smoke-canvas.mjs",
     "lint": "echo \"lint not configured\"",
     "format": "echo \"format not configured\""
   },

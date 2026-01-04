@@ -12,6 +12,8 @@ interface Env {
   GOOGLE_CLIENT_SECRET?: string;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
+  GMAIL_REFRESH_TOKEN?: string;
+  GMAIL_SENDER_EMAIL?: string;
   ADMIN_GOOGLE_SUB?: string;
   ADMIN_EMAIL?: string;
   ADMIN_GITHUB?: string;
@@ -24,6 +26,9 @@ interface Env {
   DRIVE_SERVICE_ACCOUNT_JSON?: string;
   DRIVE_PARENT_FOLDER_ID?: string;
   DRIVE_SHARED_DRIVE_ID?: string;
+  CANVAS_BASE_URL?: string;
+  CANVAS_ACCOUNT_ID?: string;
+  CANVAS_API_TOKEN?: string;
   DB: D1Database;
   OAUTH_KV: KVNamespace;
   form_app_files?: R2Bucket;
@@ -34,6 +39,9 @@ type FormListRow = {
   title: string;
   is_locked: number;
   is_public: number;
+  auth_policy?: string | null;
+  canvas_enabled?: number | null;
+  canvas_course_id?: string | null;
 };
 
 type FormDetailRow = {
@@ -48,6 +56,9 @@ type FormDetailRow = {
   schema_json: string | null;
   template_file_rules_json?: string | null;
   form_file_rules_json?: string | null;
+  canvas_enabled?: number | null;
+  canvas_course_id?: string | null;
+  canvas_allowed_section_ids_json?: string | null;
 };
 
 type FormSubmissionRow = {
@@ -66,6 +77,9 @@ type AdminFormRow = {
   is_public: number;
   auth_policy: string;
   templateKey: string | null;
+  canvas_enabled?: number | null;
+  canvas_course_id?: string | null;
+  canvas_allowed_section_ids_json?: string | null;
 };
 
 type TemplateRow = {
@@ -689,9 +703,15 @@ async function handleSubmissionUploadInit(
   if (!submissionId) {
     submissionId = crypto.randomUUID();
     await env.DB.prepare(
-      "INSERT INTO submissions (id, form_id, user_id, payload_json) VALUES (?, ?, ?, ?)"
+      "INSERT INTO submissions (id, form_id, user_id, payload_json, canvas_course_id) VALUES (?, ?, ?, ?, ?)"
     )
-      .bind(submissionId, formRow.id, userId, JSON.stringify({ data: {} }))
+      .bind(
+        submissionId,
+        formRow.id,
+        userId,
+        JSON.stringify({ data: {} }),
+        formRow.canvas_course_id ?? null
+      )
       .run();
   }
 
@@ -822,7 +842,7 @@ async function getGithubLoginForUser(env: Env, userId: string): Promise<string |
 
 async function getFormWithRules(env: Env, slug: string) {
   return env.DB.prepare(
-    "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,t.key as templateKey,fv.schema_json,t.file_rules_json as template_file_rules_json,f.file_rules_json as form_file_rules_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+    "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,t.key as templateKey,fv.schema_json,t.file_rules_json as template_file_rules_json,f.file_rules_json as form_file_rules_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
   )
     .bind(slug)
     .first<
@@ -853,6 +873,2015 @@ function buildEffectiveRules(row: {
     }
   }
   return mergeRules(templateRules, formRules);
+}
+
+type CanvasCourse = {
+  id: string;
+  name: string;
+  course_code?: string | null;
+  workflow_state?: string | null;
+  account_id?: string | null;
+  term_id?: string | null;
+};
+
+type CanvasSection = {
+  id: string;
+  course_id: string;
+  name: string;
+};
+
+type CanvasCourseUser = {
+  id: string;
+  name?: string | null;
+  loginId?: string | null;
+  shortName?: string | null;
+  sortableName?: string | null;
+  pronouns?: string | null;
+  email?: string | null;
+  error?: string | null;
+};
+
+type RoutineTaskRow = {
+  id: string;
+  name: string;
+  cron: string;
+  enabled: number;
+  last_run_at: string | null;
+  last_status: string | null;
+  last_error: string | null;
+  last_log_id: string | null;
+};
+
+function getCanvasBaseUrl(env: Env): string {
+  return env.CANVAS_BASE_URL?.trim() || "https://canvas.instructure.com";
+}
+
+function getCanvasAccountId(env: Env): string | null {
+  const value = env.CANVAS_ACCOUNT_ID?.trim();
+  if (value) {
+    return value;
+  }
+  const base = getCanvasBaseUrl(env);
+  if (base.includes("canvas.instructure.com")) {
+    return "10";
+  }
+  return "1";
+}
+
+function parseLinkHeader(header: string | null): Record<string, string> {
+  if (!header) return {};
+  const parts = header.split(",");
+  const links: Record<string, string> = {};
+  for (const part of parts) {
+    const match = part.match(/<([^>]+)>;\s*rel="([^"]+)"/);
+    if (match) {
+      links[match[2]] = match[1];
+    }
+  }
+  return links;
+}
+
+function maskEmail(email: string): string {
+  const trimmed = email.trim();
+  const at = trimmed.indexOf("@");
+  if (at <= 1) {
+    return "***";
+  }
+  return `${trimmed[0]}***${trimmed.slice(at - 1)}`;
+}
+
+function cronFieldMatches(expr: string, value: number): boolean {
+  const trimmed = expr.trim();
+  if (trimmed === "*") return true;
+  if (trimmed.includes(",")) {
+    return trimmed
+      .split(",")
+      .map((part) => part.trim())
+      .some((part) => cronFieldMatches(part, value));
+  }
+  if (trimmed.startsWith("*/")) {
+    const step = Number(trimmed.slice(2));
+    if (!Number.isFinite(step) || step <= 0) return false;
+    return value % step === 0;
+  }
+  const num = Number(trimmed);
+  if (!Number.isFinite(num)) return false;
+  return value === num;
+}
+
+function cronMatchesNow(cron: string, now: Date): boolean {
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length !== 5) return false;
+  const [min, hour, dom, month, dow] = parts;
+  const utc = new Date(now.toISOString());
+  const minute = utc.getUTCMinutes();
+  const hourVal = utc.getUTCHours();
+  const domVal = utc.getUTCDate();
+  const monthVal = utc.getUTCMonth() + 1;
+  const dowVal = utc.getUTCDay();
+  return (
+    cronFieldMatches(min, minute) &&
+    cronFieldMatches(hour, hourVal) &&
+    cronFieldMatches(dom, domVal) &&
+    cronFieldMatches(month, monthVal) &&
+    cronFieldMatches(dow, dowVal)
+  );
+}
+
+async function updateRoutineStatus(
+  env: Env,
+  id: string,
+  status: string,
+  errorMessage: string | null
+) {
+  await env.DB.prepare(
+    "UPDATE routine_tasks SET last_run_at=datetime('now'), last_status=?, last_error=?, updated_at=datetime('now') WHERE id=?"
+  )
+    .bind(status, errorMessage, id)
+    .run();
+}
+
+async function recordRoutineRun(
+  env: Env,
+  taskId: string,
+  status: string,
+  message: string | null
+) {
+  const runId = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO routine_task_runs (id, task_id, status, message) VALUES (?, ?, ?, ?)"
+  )
+    .bind(runId, taskId, status, message)
+    .run();
+  await env.DB.prepare(
+    "UPDATE routine_tasks SET last_log_id=? WHERE id=?"
+  )
+    .bind(runId, taskId)
+    .run();
+  await env.DB.prepare(
+    "DELETE FROM routine_task_runs WHERE task_id=? AND run_at < datetime('now','-30 days')"
+  )
+    .bind(taskId)
+    .run();
+  await env.DB.prepare(
+    "DELETE FROM routine_task_runs WHERE task_id=? AND id NOT IN (SELECT id FROM routine_task_runs WHERE task_id=? ORDER BY run_at DESC LIMIT 100)"
+  )
+    .bind(taskId, taskId)
+    .run();
+}
+
+async function recordHealthStatus(
+  env: Env,
+  service: string,
+  status: string,
+  message: string | null
+) {
+  await env.DB.prepare(
+    "INSERT INTO health_status_logs (id, service, status, message) VALUES (?, ?, ?, ?)"
+  )
+    .bind(crypto.randomUUID(), service, status, message)
+    .run();
+}
+
+function shouldRetryCanvasError(error: string | null | undefined): boolean {
+  if (!error) return false;
+  const lower = error.toLowerCase();
+  if (lower.includes("timeout")) return true;
+  if (lower.includes("canvas_request_failed:429")) return true;
+  const match = lower.match(/canvas_request_failed:(\d{3})/);
+  if (match) {
+    const code = Number(match[1]);
+    if (code >= 500 && code <= 599) return true;
+  }
+  if (lower.includes("enroll_failed") && lower.includes("retry")) return true;
+  return false;
+}
+
+async function enqueueCanvasRetry(
+  env: Env,
+  submissionId: string,
+  formId: string,
+  courseId: string,
+  sectionId: string | null,
+  submitterName: string | null,
+  submitterEmail: string | null,
+  errorMessage: string
+) {
+  const existing = await env.DB.prepare(
+    "SELECT id, attempts FROM canvas_enroll_queue WHERE submission_id=?"
+  )
+    .bind(submissionId)
+    .first<{ id: string; attempts: number }>();
+  const nextRunAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  if (existing?.id) {
+    await env.DB.prepare(
+      "UPDATE canvas_enroll_queue SET attempts=?, last_error=?, next_run_at=?, updated_at=datetime('now') WHERE id=?"
+    )
+      .bind(existing.attempts + 1, errorMessage, nextRunAt, existing.id)
+      .run();
+    return;
+  }
+  await env.DB.prepare(
+    "INSERT INTO canvas_enroll_queue (id, submission_id, form_id, course_id, section_id, submitter_name, submitter_email, attempts, last_error, next_run_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  )
+    .bind(
+      crypto.randomUUID(),
+      submissionId,
+      formId,
+      courseId,
+      sectionId,
+      submitterName,
+      submitterEmail,
+      0,
+      errorMessage,
+      nextRunAt
+    )
+    .run();
+}
+
+async function processCanvasRetryQueue(env: Env, limit = 10) {
+  if (!env.CANVAS_API_TOKEN) {
+    return { processed: 0, failed: 0, deadlettered: 0 };
+  }
+  const { results } = await env.DB.prepare(
+    "SELECT id, submission_id, form_id, course_id, section_id, submitter_name, submitter_email, attempts FROM canvas_enroll_queue WHERE next_run_at <= datetime('now') ORDER BY next_run_at ASC LIMIT ?"
+  )
+    .bind(limit)
+    .all<{
+      id: string;
+      submission_id: string;
+      form_id: string;
+      course_id: string;
+      section_id: string | null;
+      submitter_name: string | null;
+      submitter_email: string | null;
+      attempts: number;
+    }>();
+  let processed = 0;
+  let failed = 0;
+  let deadlettered = 0;
+  for (const row of results) {
+    processed += 1;
+    const form = await env.DB.prepare(
+      "SELECT id, slug, title, canvas_course_id, canvas_enabled FROM forms WHERE id=? AND deleted_at IS NULL"
+    )
+      .bind(row.form_id)
+      .first<FormRow>();
+    if (!form || !form.canvas_enabled || !form.canvas_course_id) {
+      await env.DB.prepare("DELETE FROM canvas_enroll_queue WHERE id=?").bind(row.id).run();
+      continue;
+    }
+    const enrollment = await handleCanvasEnrollment(
+      env,
+      form,
+      row.submitter_name || "",
+      row.submitter_email || "",
+      row.section_id
+    );
+    if (enrollment.status === "invited") {
+      await env.DB.prepare(
+        "UPDATE submissions SET canvas_enroll_status=?, canvas_enroll_error=?, canvas_course_id=?, canvas_section_id=?, canvas_enrolled_at=?, canvas_user_id=?, canvas_user_name=? WHERE id=?"
+      )
+        .bind(
+          enrollment.status,
+          enrollment.error,
+          form.canvas_course_id,
+          enrollment.sectionId,
+          enrollment.enrolledAt,
+          enrollment.canvasUserId ?? null,
+          enrollment.canvasUserName ?? null,
+          row.submission_id
+        )
+        .run();
+      await env.DB.prepare("DELETE FROM canvas_enroll_queue WHERE id=?").bind(row.id).run();
+      continue;
+    }
+    failed += 1;
+    const attempts = row.attempts + 1;
+    const error = enrollment.error || "canvas_retry_failed";
+    if (attempts >= 5) {
+      await env.DB.prepare(
+        "INSERT INTO canvas_enroll_deadletters (id, submission_id, course_id, section_id, submitter_email, error, attempts) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(
+          crypto.randomUUID(),
+          row.submission_id,
+          row.course_id,
+          row.section_id,
+          row.submitter_email,
+          error,
+          attempts
+        )
+        .run();
+      await env.DB.prepare("DELETE FROM canvas_enroll_queue WHERE id=?").bind(row.id).run();
+      deadlettered += 1;
+    } else {
+      const backoffMinutes = Math.min(60, 5 * attempts);
+      const nextRunAt = new Date(Date.now() + backoffMinutes * 60 * 1000).toISOString();
+      await env.DB.prepare(
+        "UPDATE canvas_enroll_queue SET attempts=?, last_error=?, next_run_at=?, updated_at=datetime('now') WHERE id=?"
+      )
+        .bind(attempts, error, nextRunAt, row.id)
+        .run();
+    }
+  }
+  return { processed, failed, deadlettered };
+}
+
+async function runRoutineTaskById(env: Env, taskId: string) {
+  if (taskId === "canvas_sync") {
+    if (!env.CANVAS_API_TOKEN) {
+      await updateRoutineStatus(env, taskId, "skipped", "canvas_token_missing");
+      await recordRoutineRun(env, taskId, "skipped", "canvas_token_missing");
+      await recordHealthStatus(env, "canvas_sync", "skipped", "canvas_token_missing");
+      return;
+    }
+    const courseCount = await syncCanvasCourses(env);
+    const { results } = await env.DB.prepare(
+      "SELECT DISTINCT canvas_course_id as course_id FROM forms WHERE canvas_enabled=1 AND canvas_course_id IS NOT NULL AND deleted_at IS NULL"
+    ).all<{ course_id: string | null }>();
+    const courseIds = results.map((row) => row.course_id).filter(Boolean) as string[];
+    let sectionsSynced = 0;
+    for (const courseId of courseIds) {
+      sectionsSynced += await syncCanvasSections(env, courseId);
+    }
+    const message = `courses ${courseCount}, sections ${sectionsSynced}`;
+    await updateRoutineStatus(env, taskId, "ok", message);
+    await recordRoutineRun(env, taskId, "ok", message);
+    await recordHealthStatus(env, "canvas_sync", "ok", message);
+    return;
+  }
+  if (taskId === "canvas_name_mismatch") {
+    if (!env.CANVAS_API_TOKEN) {
+      await updateRoutineStatus(env, taskId, "skipped", "canvas_token_missing");
+      await recordRoutineRun(env, taskId, "skipped", "canvas_token_missing");
+      await recordHealthStatus(env, "canvas_name_mismatch", "skipped", "canvas_token_missing");
+      return;
+    }
+    const summary = await runCanvasNameMismatchChecks(env);
+    const message = `checked ${summary.checked}, mismatched ${summary.mismatched}, resolved ${summary.resolved}, skipped ${summary.skipped}`;
+    await updateRoutineStatus(env, taskId, "ok", message);
+    await recordRoutineRun(env, taskId, "ok", message);
+    await recordHealthStatus(env, "canvas_name_mismatch", "ok", message);
+    return;
+  }
+  if (taskId === "canvas_retry_queue") {
+    if (!env.CANVAS_API_TOKEN) {
+      await updateRoutineStatus(env, taskId, "skipped", "canvas_token_missing");
+      await recordRoutineRun(env, taskId, "skipped", "canvas_token_missing");
+      await recordHealthStatus(env, "canvas_retry_queue", "skipped", "canvas_token_missing");
+      return;
+    }
+    try {
+      const result = await processCanvasRetryQueue(env, 20);
+      const message = `processed ${result.processed}, failed ${result.failed}, deadlettered ${result.deadlettered}`;
+      await updateRoutineStatus(env, taskId, "ok", message);
+      await recordRoutineRun(env, taskId, "ok", message);
+      await recordHealthStatus(env, "canvas_retry_queue", "ok", message);
+    } catch (error) {
+      const message = String((error as Error | undefined)?.message || error);
+      await updateRoutineStatus(env, taskId, "error", message);
+      await recordRoutineRun(env, taskId, "error", message);
+      await recordHealthStatus(env, "canvas_retry_queue", "error", message);
+    }
+    return;
+  }
+  if (taskId === "backup_forms_templates") {
+    try {
+      const key = await backupFormsAndTemplates(env);
+      const message = `saved:${key}`;
+      await updateRoutineStatus(env, taskId, "ok", message);
+      await recordRoutineRun(env, taskId, "ok", message);
+      await recordHealthStatus(env, "backup_forms_templates", "ok", message);
+    } catch (error) {
+      const message = String((error as Error | undefined)?.message || error);
+      await updateRoutineStatus(env, taskId, "error", message);
+      await recordRoutineRun(env, taskId, "error", message);
+      await recordHealthStatus(env, "backup_forms_templates", "error", message);
+    }
+    return;
+  }
+  if (taskId === "empty_trash") {
+    const counts = await emptyAllTrash(env);
+    const message = `forms ${counts.forms}, templates ${counts.templates}, users ${counts.users}, submissions ${counts.submissions}, files ${counts.files}, emails ${counts.emails}`;
+    await updateRoutineStatus(env, taskId, "ok", message);
+    await recordRoutineRun(env, taskId, "ok", message);
+    await recordHealthStatus(env, "empty_trash", "ok", message);
+    return;
+  }
+  if (taskId === "test_notice") {
+    await updateRoutineStatus(env, taskId, "ok", "notice_triggered");
+    await recordRoutineRun(env, taskId, "ok", "notice_triggered");
+    await recordHealthStatus(env, "test_notice", "ok", "notice_triggered");
+    return;
+  }
+  await updateRoutineStatus(env, taskId, "skipped", "unknown_task");
+  await recordRoutineRun(env, taskId, "skipped", "unknown_task");
+  await recordHealthStatus(env, "routine_unknown", "skipped", "unknown_task");
+}
+
+async function backupFormsAndTemplates(env: Env) {
+  if (!env.form_app_files) {
+    throw new Error("r2_not_configured");
+  }
+  if (!env.DRIVE_PARENT_FOLDER_ID || !getDriveCredentials(env)) {
+    throw new Error("drive_not_configured");
+  }
+  const accessToken = await getDriveAccessToken(env);
+  if (!accessToken) {
+    throw new Error("drive_access_failed");
+  }
+  const { results: formRows } = await env.DB.prepare(
+    "SELECT f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.template_id,t.key as templateKey,f.file_rules_json,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.deleted_at IS NULL"
+  ).all<Record<string, unknown>>();
+  const { results: templateRows } = await env.DB.prepare(
+    "SELECT key,name,schema_json,file_rules_json FROM templates WHERE deleted_at IS NULL"
+  ).all<Record<string, unknown>>();
+  const timestamp = new Date().toISOString();
+  const formsPayload = {
+    type: "forms_backup",
+    generated_at: timestamp,
+    forms: formRows.map((row) => ({
+      slug: row.slug,
+      title: row.title,
+      description: row.description ?? null,
+      is_locked: Boolean(row.is_locked),
+      is_public: Boolean(row.is_public),
+      auth_policy: row.auth_policy,
+      templateKey: row.templateKey,
+      file_rules_json: row.file_rules_json ?? null,
+      schema_json: row.form_schema_json ? JSON.parse(String(row.form_schema_json)) : null,
+      canvas_enabled: Boolean(row.canvas_enabled),
+      canvas_course_id: row.canvas_course_id ?? null,
+      canvas_allowed_section_ids_json: row.canvas_allowed_section_ids_json ?? null,
+      canvas_fields_position: row.canvas_fields_position ?? null
+    }))
+  };
+  const templatesPayload = {
+    type: "templates_backup",
+    generated_at: timestamp,
+    templates: templateRows.map((row) => ({
+      key: row.key,
+      name: row.name,
+      schema_json: row.schema_json,
+      file_rules_json: row.file_rules_json ?? null
+    }))
+  };
+  const safeTimestamp = timestamp.replace(/[:.]/g, "-");
+  const formsKey = `backups/forms-${safeTimestamp}.json`;
+  const templatesKey = `backups/templates-${safeTimestamp}.json`;
+  const formsBody = JSON.stringify(formsPayload, null, 2);
+  const templatesBody = JSON.stringify(templatesPayload, null, 2);
+  await env.form_app_files.put(formsKey, formsBody, {
+    httpMetadata: { contentType: "application/json" }
+  });
+  await env.form_app_files.put(templatesKey, templatesBody, {
+    httpMetadata: { contentType: "application/json" }
+  });
+  const backupsFolder = await getOrCreateFolder(
+    env,
+    accessToken,
+    env.DRIVE_PARENT_FOLDER_ID,
+    "backups"
+  );
+  if (!backupsFolder.id) {
+    throw new Error("drive_backups_folder_failed");
+  }
+  const formsFolder = await getOrCreateFolder(env, accessToken, backupsFolder.id, "forms");
+  const templatesFolder = await getOrCreateFolder(env, accessToken, backupsFolder.id, "templates");
+  if (!formsFolder.id || !templatesFolder.id) {
+    throw new Error("drive_backups_subfolder_failed");
+  }
+  const formsBytes = new TextEncoder().encode(formsBody);
+  const templatesBytes = new TextEncoder().encode(templatesBody);
+  const driveForms = await uploadFileToDrive(
+    env,
+    accessToken,
+    formsFolder.id,
+    `forms-${safeTimestamp}.json`,
+    "application/json",
+    formsBytes
+  );
+  const driveTemplates = await uploadFileToDrive(
+    env,
+    accessToken,
+    templatesFolder.id,
+    `templates-${safeTimestamp}.json`,
+    "application/json",
+    templatesBytes
+  );
+  if (!driveForms?.id || !driveTemplates?.id) {
+    throw new Error("drive_upload_failed");
+  }
+  return `${formsKey},${templatesKey}`;
+}
+
+async function emptyAllTrash(env: Env): Promise<{
+  forms: number;
+  templates: number;
+  users: number;
+  submissions: number;
+  files: number;
+  emails: number;
+}> {
+  const counts = { forms: 0, templates: 0, users: 0, submissions: 0, files: 0, emails: 0 };
+  const { results: forms } = await env.DB.prepare("SELECT slug FROM forms WHERE deleted_at IS NOT NULL")
+    .all<{ slug: string }>();
+  for (const row of forms) {
+    if (row?.slug) await hardDeleteForm(env, row.slug);
+  }
+  counts.forms = forms.length;
+  const { results: templates } = await env.DB.prepare(
+    "SELECT key FROM templates WHERE deleted_at IS NOT NULL"
+  ).all<{ key: string }>();
+  for (const row of templates) {
+    if (row?.key) await hardDeleteTemplate(env, row.key);
+  }
+  counts.templates = templates.length;
+  const { results: users } = await env.DB.prepare("SELECT id FROM users WHERE deleted_at IS NOT NULL")
+    .all<{ id: string }>();
+  for (const row of users) {
+    if (row?.id) await hardDeleteUser(env, row.id);
+  }
+  counts.users = users.length;
+  const { results: submissions } = await env.DB.prepare(
+    "SELECT id FROM submissions WHERE deleted_at IS NOT NULL"
+  ).all<{ id: string }>();
+  for (const row of submissions) {
+    if (row?.id) await hardDeleteSubmission(env, row.id);
+  }
+  counts.submissions = submissions.length;
+  const { results: files } = await env.DB.prepare(
+    "SELECT id FROM submission_file_items WHERE deleted_at IS NOT NULL"
+  ).all<{ id: string }>();
+  for (const row of files) {
+    if (row?.id) await hardDeleteFileItem(env, row.id);
+  }
+  counts.files = files.length;
+  const { results: emails } = await env.DB.prepare(
+    "SELECT id FROM email_logs WHERE deleted_at IS NOT NULL"
+  ).all<{ id: string }>();
+  for (const row of emails) {
+    if (row?.id) {
+      await env.DB.prepare("DELETE FROM email_logs WHERE id=?").bind(row.id).run();
+    }
+  }
+  counts.emails = emails.length;
+  return counts;
+}
+
+async function canvasFetch(
+  env: Env,
+  url: string,
+  init?: RequestInit
+): Promise<Response> {
+  if (!env.CANVAS_API_TOKEN) {
+    throw new Error("canvas_not_configured");
+  }
+  const headers = new Headers(init?.headers || {});
+  headers.set("Authorization", `Bearer ${env.CANVAS_API_TOKEN}`);
+  return fetch(url, { ...init, headers });
+}
+
+async function canvasFetchAll<T>(env: Env, url: string): Promise<T[]> {
+  const results: T[] = [];
+  let nextUrl: string | null = url;
+  while (nextUrl) {
+    const response = await canvasFetch(env, nextUrl);
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(`canvas_request_failed:${response.status}:${text}`);
+    }
+    const batch = (await response.json()) as T[];
+    if (Array.isArray(batch)) {
+      results.push(...batch);
+    }
+    const links = parseLinkHeader(response.headers.get("link"));
+    nextUrl = links.next || null;
+  }
+  return results;
+}
+
+async function syncCanvasCourses(env: Env): Promise<number> {
+  const base = getCanvasBaseUrl(env);
+  const url = `${base}/api/v1/courses?enrollment_state=active&state[]=available&per_page=100`;
+  const courses = await canvasFetchAll<CanvasCourse & Record<string, unknown>>(env, url);
+  const now = new Date().toISOString();
+  for (const course of courses) {
+    if (!course?.id) continue;
+    await env.DB.prepare(
+      "INSERT INTO canvas_courses_cache (id, name, code, workflow_state, account_id, term_id, updated_at, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, code=excluded.code, workflow_state=excluded.workflow_state, account_id=excluded.account_id, term_id=excluded.term_id, updated_at=excluded.updated_at, raw_json=excluded.raw_json"
+    )
+      .bind(
+        String(course.id),
+        String(course.name ?? ""),
+        course.course_code ?? null,
+        course.workflow_state ?? null,
+        course.account_id ? String(course.account_id) : null,
+        course.term_id ? String(course.term_id) : null,
+        now,
+        JSON.stringify(course)
+      )
+      .run();
+  }
+  return courses.length;
+}
+
+async function syncCanvasSections(env: Env, courseId: string): Promise<number> {
+  const base = getCanvasBaseUrl(env);
+  const url = `${base}/api/v1/courses/${encodeURIComponent(courseId)}/sections?per_page=100`;
+  const sections = await canvasFetchAll<CanvasSection & Record<string, unknown>>(env, url);
+  const now = new Date().toISOString();
+  for (const section of sections) {
+    if (!section?.id) continue;
+    await env.DB.prepare(
+      "INSERT INTO canvas_sections_cache (id, course_id, name, updated_at, raw_json) VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET course_id=excluded.course_id, name=excluded.name, updated_at=excluded.updated_at, raw_json=excluded.raw_json"
+    )
+      .bind(
+        String(section.id),
+        courseId,
+        String(section.name ?? ""),
+        now,
+        JSON.stringify(section)
+      )
+      .run();
+  }
+  return sections.length;
+}
+
+async function getCanvasAllowedSections(
+  env: Env,
+  courseId: string,
+  allowedIds: string[] | null
+): Promise<Array<{ id: string; name: string }>> {
+  const { results } = await env.DB.prepare(
+    "SELECT id, name FROM canvas_sections_cache WHERE course_id=? ORDER BY name"
+  )
+    .bind(courseId)
+    .all<{ id: string; name: string }>();
+  let sections = results.map((row) => ({ id: String(row.id), name: row.name }));
+  if (allowedIds && allowedIds.length > 0) {
+    const allowed = new Set(allowedIds);
+    sections = sections.filter((section) => allowed.has(section.id));
+  }
+  return sections;
+}
+
+async function canvasFindUserByEmail(
+  env: Env,
+  email: string,
+  accountIdOverride?: string | null
+): Promise<{ id: string | null; name?: string | null; loginId?: string | null; error?: string | null }> {
+  const base = getCanvasBaseUrl(env);
+  const target = email.toLowerCase();
+  const urls = [
+    `${base}/api/v1/accounts/self/users?search_term=${encodeURIComponent(email)}&per_page=100`
+  ];
+  const accountId = accountIdOverride || getCanvasAccountId(env);
+  if (accountId) {
+    urls.push(
+      `${base}/api/v1/accounts/${encodeURIComponent(accountId)}/users?search_term=${encodeURIComponent(
+        email
+      )}&per_page=100`
+    );
+  }
+  let lastError: string | null = null;
+  for (const url of urls) {
+    try {
+      const res = await canvasFetch(env, url);
+      if (!res.ok) {
+        lastError = `${res.status}:${await res.text().catch(() => "")}`;
+        continue;
+      }
+      const users = (await res.json()) as Array<{
+        id?: string | number;
+        login_id?: string;
+        email?: string;
+        sis_user_id?: string;
+      }>;
+      if (Array.isArray(users) && users.length > 0) {
+        const match = users.find((user) => {
+          const loginId = user?.login_id?.toLowerCase();
+          const userEmail = user?.email?.toLowerCase();
+          const sis = user?.sis_user_id?.toLowerCase();
+          return loginId === target || userEmail === target || sis === target;
+        });
+        if (match?.id !== undefined && match?.id !== null) {
+          return { id: String(match.id), name: match?.name ?? null, loginId: match?.login_id ?? null };
+        }
+        if (users.length === 1 && users[0]?.id !== undefined && users[0]?.id !== null) {
+          return {
+            id: String(users[0].id),
+            name: (users[0] as any)?.name ?? null,
+            loginId: (users[0] as any)?.login_id ?? null
+          };
+        }
+      }
+    } catch (error) {
+      lastError = String((error as Error | undefined)?.message || error);
+      continue;
+    }
+  }
+  return { id: null, error: lastError };
+}
+
+async function canvasFindUserByEmailInCourse(
+  env: Env,
+  courseId: string,
+  email: string
+): Promise<CanvasCourseUser> {
+  const base = getCanvasBaseUrl(env);
+  const url = `${base}/api/v1/courses/${encodeURIComponent(
+    courseId
+  )}/users?search_term=${encodeURIComponent(email)}&per_page=100&include[]=email&include[]=sis_user_id`;
+  try {
+    const res = await canvasFetch(env, url);
+    if (!res.ok) {
+      return { id: null, error: `${res.status}:${await res.text().catch(() => "")}` };
+    }
+    const users = (await res.json()) as Array<{
+      id?: string | number;
+      name?: string;
+      login_id?: string;
+      short_name?: string;
+      sortable_name?: string;
+      pronouns?: string;
+      email?: string;
+      sis_user_id?: string;
+    }>;
+    if (Array.isArray(users) && users.length > 0) {
+      const target = email.toLowerCase();
+      const match = users.find((user) => {
+        const loginId = user?.login_id?.toLowerCase();
+        const userEmail = user?.email?.toLowerCase();
+        const sis = user?.sis_user_id?.toLowerCase();
+        return loginId === target || userEmail === target || sis === target;
+      });
+      const hit = match ?? users[0];
+      if (hit?.id !== undefined && hit?.id !== null) {
+        return {
+          id: String(hit.id),
+          name: hit?.name ?? null,
+          loginId: hit?.login_id ?? null,
+          shortName: hit?.short_name ?? null,
+          sortableName: hit?.sortable_name ?? null,
+          pronouns: hit?.pronouns ?? null,
+          email: hit?.email ?? null
+        };
+      }
+    }
+    return { id: null, error: "not_found" };
+  } catch (error) {
+    return { id: null, error: String((error as Error | undefined)?.message || error) };
+  }
+}
+
+async function canvasCreateUser(
+  env: Env,
+  name: string,
+  email: string,
+  accountIdOverride?: string | null
+): Promise<{ id: string | null; error?: string | null }> {
+  const accountId = accountIdOverride || getCanvasAccountId(env);
+  if (!accountId) {
+    return { id: null, error: "canvas_account_id_missing" };
+  }
+  const base = getCanvasBaseUrl(env);
+  const nameParts = name.trim().split(/\s+/).filter(Boolean);
+  const firstName = nameParts[0] || name;
+  const lastName = nameParts.length > 1 ? nameParts[nameParts.length - 1] : name;
+  const shortName = `${firstName} ${lastName}`.trim();
+  const sortableName = `${lastName}, ${firstName}`.trim();
+  const createPayload = {
+    user: {
+      name,
+      short_name: shortName || name,
+      sortable_name: sortableName || name,
+      terms_of_use: true
+    },
+    pseudonym: {
+      unique_id: email,
+      force_self_registration: true
+    }
+  };
+  const res = await canvasFetch(env, `${base}/api/v1/accounts/${accountId}/users`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(createPayload)
+  });
+  if (res.status === 400) {
+    const text = await res.text().catch(() => "");
+    const lower = text.toLowerCase();
+    if (lower.includes("already belongs to a user") || lower.includes("id already in use")) {
+      const existing = await canvasFindUserByEmail(env, email, accountId);
+      return { id: existing?.id || null, error: existing?.id ? null : "user_exists_but_not_found" };
+    }
+    return { id: null, error: text || "canvas_user_create_failed" };
+  }
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return { id: null, error: text || `canvas_user_create_failed:${res.status}` };
+  }
+  const responsePayload = (await res.json()) as {
+    id?: string | number;
+    user?: { id?: string | number };
+  };
+  const userId = responsePayload?.id ?? responsePayload?.user?.id;
+  if (userId === undefined || userId === null) {
+    return { id: null, error: "canvas_user_create_missing_id" };
+  }
+  return { id: String(userId) };
+}
+
+async function canvasEnrollUser(
+  env: Env,
+  courseId: string,
+  userId: string,
+  sectionId: string | null,
+  enrollmentState = "active"
+): Promise<{ ok: boolean; status: number; error?: string }> {
+  const trimmedUserId = `${userId}`.trim();
+  const isSpecialId =
+    trimmedUserId.startsWith("sis_login_id:") ||
+    trimmedUserId.startsWith("login_id:") ||
+    trimmedUserId.startsWith("sis_user_id:");
+  if (!trimmedUserId || trimmedUserId === "null" || trimmedUserId === "undefined") {
+    return { ok: false, status: 400, error: "missing_user_id" };
+  }
+  if (!isSpecialId && !/^\d+$/.test(trimmedUserId)) {
+    return { ok: false, status: 400, error: "invalid_user_id" };
+  }
+  const base = getCanvasBaseUrl(env);
+  const params = new URLSearchParams();
+  params.set("enrollment[type]", "StudentEnrollment");
+  params.set("enrollment[enrollment_state]", enrollmentState);
+  params.set("enrollment[notify]", "true");
+  params.set("enrollment[user_id]", trimmedUserId);
+  if (sectionId) {
+    params.set("enrollment[course_section_id]", sectionId);
+    params.set("enrollment[limit_privileges_to_course_section]", "true");
+  }
+  const res = await canvasFetch(env, `${base}/api/v1/courses/${courseId}/enrollments`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: params
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return { ok: false, status: res.status, error: text || "enroll_failed" };
+  }
+  return { ok: true, status: res.status };
+}
+
+async function canvasFindEnrollment(
+  env: Env,
+  courseId: string,
+  canvasUserId: string
+): Promise<{ id: string | null; error?: string | null }> {
+  const base = getCanvasBaseUrl(env);
+  const params = new URLSearchParams();
+  params.set("user_id", canvasUserId);
+  params.set("per_page", "100");
+  params.append("type[]", "StudentEnrollment");
+  ["active", "invited", "completed", "inactive"].forEach((state) => {
+    params.append("state[]", state);
+  });
+  const url = `${base}/api/v1/courses/${encodeURIComponent(courseId)}/enrollments?${params.toString()}`;
+  const enrollments = await canvasFetchAll<any>(env, url);
+  const match = enrollments.find((enrollment) => enrollment?.id);
+  if (!match?.id) {
+    return { id: null, error: "enrollment_not_found" };
+  }
+  return { id: String(match.id) };
+}
+
+async function canvasFindEnrollmentByEmail(
+  env: Env,
+  courseId: string,
+  email: string
+): Promise<{ id: string | null; state?: string | null; canvasUserId?: string | null; error?: string | null }> {
+  const base = getCanvasBaseUrl(env);
+  const params = new URLSearchParams();
+  params.set("per_page", "100");
+  params.append("type[]", "StudentEnrollment");
+  params.append("include[]", "user");
+  ["active", "invited", "completed", "inactive"].forEach((state) => {
+    params.append("state[]", state);
+  });
+  const url = `${base}/api/v1/courses/${encodeURIComponent(courseId)}/enrollments?${params.toString()}`;
+  try {
+    const enrollments = await canvasFetchAll<any>(env, url);
+    const target = email.toLowerCase();
+    const match = enrollments.find((enrollment) => {
+      const loginId = enrollment?.user?.login_id;
+      return typeof loginId === "string" && loginId.toLowerCase() === target;
+    });
+    if (!match?.id) {
+      return { id: null, error: "enrollment_not_found" };
+    }
+    return {
+      id: String(match.id),
+      state: match?.enrollment_state ?? match?.state ?? null,
+      canvasUserId: match?.user?.id ? String(match.user.id) : null
+    };
+  } catch (error) {
+    return { id: null, error: String((error as Error | undefined)?.message || error) };
+  }
+}
+
+async function canvasApplyEnrollmentTask(
+  env: Env,
+  courseId: string,
+  enrollmentId: string,
+  task: "deactivate" | "delete" | "reactivate"
+): Promise<{ ok: boolean; error?: string | null }> {
+  const base = getCanvasBaseUrl(env);
+  const url = `${base}/api/v1/courses/${encodeURIComponent(courseId)}/enrollments/${encodeURIComponent(
+    enrollmentId
+  )}?task=${task}`;
+  const res = await canvasFetch(env, url, { method: "DELETE" });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return { ok: false, error: text || `enrollment_${task}_failed` };
+  }
+  return { ok: true };
+}
+
+async function canvasReactivateEnrollment(
+  env: Env,
+  courseId: string,
+  enrollmentId: string
+): Promise<{ ok: boolean; error?: string | null }> {
+  const base = getCanvasBaseUrl(env);
+  const url = `${base}/api/v1/courses/${encodeURIComponent(courseId)}/enrollments/${encodeURIComponent(
+    enrollmentId
+  )}/reactivate`;
+  const res = await canvasFetch(env, url, { method: "PUT" });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return { ok: false, error: text || "enrollment_reactivate_failed" };
+  }
+  return { ok: true };
+}
+
+async function canvasApplyEnrollmentTaskByEmail(
+  env: Env,
+  courseId: string,
+  email: string,
+  task: "deactivate" | "delete" | "reactivate"
+): Promise<{ ok: boolean; error?: string | null; canvasUserId?: string | null }> {
+  if (!env.CANVAS_API_TOKEN) {
+    return { ok: false, error: "canvas_not_configured" };
+  }
+  const lookup = await canvasFindUserByEmail(env, email);
+  let canvasUserId = lookup?.id || null;
+  let lookupError = lookup?.error || null;
+  if (!canvasUserId) {
+    const courseLookup = await canvasFindUserByEmailInCourse(env, courseId, email);
+    canvasUserId = courseLookup?.id || null;
+    if (!canvasUserId) {
+      const courseError = courseLookup?.error || "not_found";
+      const combined = lookupError ? `${lookupError}|${courseError}` : courseError;
+      const enrollmentByEmail = await canvasFindEnrollmentByEmail(env, courseId, email);
+      if (enrollmentByEmail.id) {
+        const result = await canvasApplyEnrollmentTask(env, courseId, enrollmentByEmail.id, task);
+        if (!result.ok) {
+          return { ok: false, error: result.error || `enrollment_${task}_failed` };
+        }
+        return { ok: true, canvasUserId: enrollmentByEmail.canvasUserId ?? null };
+      }
+      return { ok: false, error: `user_lookup_failed:${combined}` };
+    }
+  }
+  let enrollment = await canvasFindEnrollment(env, courseId, canvasUserId);
+  if (!enrollment.id) {
+    const enrollmentByEmail = await canvasFindEnrollmentByEmail(env, courseId, email);
+    if (enrollmentByEmail.id) {
+      enrollment = { id: enrollmentByEmail.id };
+      canvasUserId = enrollmentByEmail.canvasUserId ?? canvasUserId;
+    }
+  }
+  if (!enrollment.id) {
+    return { ok: false, error: enrollment.error || "enrollment_not_found" };
+  }
+  const result = await canvasApplyEnrollmentTask(env, courseId, enrollment.id, task);
+  if (!result.ok) {
+    return { ok: false, error: result.error || `enrollment_${task}_failed` };
+  }
+  return { ok: true, canvasUserId };
+}
+
+async function canvasReactivateByEmail(
+  env: Env,
+  courseId: string,
+  email: string
+): Promise<{ ok: boolean; error?: string | null; canvasUserId?: string | null }> {
+  if (!env.CANVAS_API_TOKEN) {
+    return { ok: false, error: "canvas_not_configured" };
+  }
+  const enrollment = await canvasFindEnrollmentByEmail(env, courseId, email);
+  if (!enrollment.id) {
+    return { ok: false, error: enrollment.error || "enrollment_not_found" };
+  }
+  const result = await canvasReactivateEnrollment(env, courseId, enrollment.id);
+  if (!result.ok) {
+    return { ok: false, error: result.error || "enrollment_reactivate_failed" };
+  }
+  return { ok: true, canvasUserId: enrollment.canvasUserId ?? null };
+}
+
+async function canvasSendMessage(
+  env: Env,
+  recipientId: string,
+  subject: string,
+  body: string
+): Promise<{ ok: boolean; error?: string | null }> {
+  const base = getCanvasBaseUrl(env);
+  const params = new URLSearchParams();
+  params.append("recipients[]", recipientId);
+  params.set("subject", subject);
+  params.set("body", body);
+  const res = await canvasFetch(env, `${base}/api/v1/conversations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    return { ok: false, error: text || `message_failed:${res.status}` };
+  }
+  return { ok: true };
+}
+
+async function ensureCanvasNameCheckRow(env: Env, userId: string, courseId: string) {
+  if (!userId || !courseId) return;
+  await env.DB.prepare(
+    "INSERT INTO canvas_name_checks (user_id, course_id, first_submission_at) VALUES (?, ?, datetime('now')) ON CONFLICT(user_id, course_id) DO NOTHING"
+  )
+    .bind(userId, courseId)
+    .run();
+}
+
+async function runCanvasNameMismatchChecks(
+  env: Env
+): Promise<{ checked: number; mismatched: number; resolved: number; skipped: number }> {
+  if (!env.CANVAS_API_TOKEN) {
+    return { checked: 0, mismatched: 0, resolved: 0, skipped: 0 };
+  }
+  const { results } = await env.DB.prepare(
+    "SELECT user_id, course_id, first_submission_at, last_alert_at, resolved_at FROM canvas_name_checks WHERE resolved_at IS NULL"
+  ).all<{
+    user_id: string;
+    course_id: string;
+    first_submission_at: string;
+    last_alert_at: string | null;
+    resolved_at: string | null;
+  }>();
+  if (!Array.isArray(results) || results.length === 0) {
+    return { checked: 0, mismatched: 0, resolved: 0, skipped: 0 };
+  }
+  const now = Date.now();
+  const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+  let checked = 0;
+  let mismatched = 0;
+  let resolved = 0;
+  let skipped = 0;
+  for (const row of results) {
+    const firstAt = Date.parse(row.first_submission_at);
+    if (!Number.isFinite(firstAt)) {
+      skipped += 1;
+      continue;
+    }
+    if (now - firstAt < sevenDaysMs) {
+      skipped += 1;
+      continue;
+    }
+    if (row.last_alert_at) {
+      const lastAlertAt = Date.parse(row.last_alert_at);
+      if (Number.isFinite(lastAlertAt) && now - lastAlertAt < sevenDaysMs) {
+        skipped += 1;
+        continue;
+      }
+    }
+    checked += 1;
+    const submission = await env.DB.prepare(
+      "SELECT s.id,s.payload_json,s.submitter_email,f.slug as form_slug,f.title as form_title FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.user_id=? AND s.canvas_course_id=? AND s.deleted_at IS NULL AND f.deleted_at IS NULL ORDER BY COALESCE(s.updated_at, s.created_at) DESC LIMIT 1"
+    )
+      .bind(row.user_id, row.course_id)
+      .first<{
+        id: string;
+        payload_json: string;
+        submitter_email: string | null;
+        form_slug: string | null;
+        form_title: string | null;
+      }>();
+    if (!submission) {
+      skipped += 1;
+      continue;
+    }
+    let payloadData: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(submission.payload_json) as { data?: Record<string, unknown> };
+      if (parsed?.data && typeof parsed.data === "object") {
+        payloadData = parsed.data as Record<string, unknown>;
+      }
+    } catch {
+      payloadData = null;
+    }
+    const submittedName = pickNameFromPayload(payloadData);
+    if (!submittedName) {
+      await env.DB.prepare(
+        "UPDATE canvas_name_checks SET last_checked_at=datetime('now') WHERE user_id=? AND course_id=?"
+      )
+        .bind(row.user_id, row.course_id)
+        .run();
+      skipped += 1;
+      continue;
+    }
+    let email =
+      (typeof payloadData?.email === "string" && payloadData.email.trim()) ||
+      submission.submitter_email ||
+      null;
+    if (!email) {
+      const emailRow = await env.DB.prepare(
+        "SELECT email FROM user_identities WHERE user_id=? AND email IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+      )
+        .bind(row.user_id)
+        .first<{ email: string | null }>();
+      email = emailRow?.email ?? null;
+    }
+    if (!email) {
+      await env.DB.prepare(
+        "UPDATE canvas_name_checks SET last_checked_at=datetime('now') WHERE user_id=? AND course_id=?"
+      )
+        .bind(row.user_id, row.course_id)
+        .run();
+      skipped += 1;
+      continue;
+    }
+    const canvasUser = await canvasFindUserByEmailInCourse(env, row.course_id, email);
+    const canvasDisplayName = canvasUser ? getCanvasDisplayName(canvasUser) : null;
+    if (
+      canvasDisplayName &&
+      normalizeNameForCompare(canvasDisplayName) === normalizeNameForCompare(submittedName)
+    ) {
+      await env.DB.prepare(
+        "UPDATE canvas_name_checks SET resolved_at=datetime('now'), last_checked_at=datetime('now') WHERE user_id=? AND course_id=?"
+      )
+        .bind(row.user_id, row.course_id)
+        .run();
+      resolved += 1;
+      continue;
+    }
+    mismatched += 1;
+    const baseWeb = env.BASE_URL_WEB ? String(env.BASE_URL_WEB).replace(/\/$/, "") : "";
+    const formLink =
+      baseWeb && submission.form_slug ? `${baseWeb}/#/f/${submission.form_slug}` : null;
+    const message = buildCanvasNameAlertMessage({
+      submittedName,
+      canvasName: canvasDisplayName,
+      formLink
+    });
+    const result = await sendGmailMessage(env, {
+      to: email,
+      subject: message.subject,
+      body: message.body
+    });
+    await logEmailSend(env, {
+      to: email,
+      subject: message.subject,
+      body: message.body,
+      status: result.ok ? "sent" : "failed",
+      error: result.ok ? null : result.error || "send_failed",
+      submissionId: submission.id,
+      formSlug: submission.form_slug ?? null,
+      formTitle: submission.form_title ?? null,
+      canvasCourseId: row.course_id,
+      triggeredBy: row.user_id,
+      triggerSource: "auto_alert"
+    });
+    await env.DB.prepare(
+      "UPDATE canvas_name_checks SET last_alert_at=datetime('now'), last_checked_at=datetime('now') WHERE user_id=? AND course_id=?"
+    )
+      .bind(row.user_id, row.course_id)
+      .run();
+  }
+  return { checked, mismatched, resolved, skipped };
+}
+
+function normalizeNameForCompare(value: string): string {
+  return value
+    .normalize("NFKC")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function getCanvasDisplayName(user: CanvasCourseUser): string | null {
+  return user.shortName?.trim() || user.name?.trim() || null;
+}
+
+function pickFirstStringValue(
+  data: Record<string, unknown> | null,
+  keys: string[]
+): string | null {
+  if (!data) return null;
+  for (const key of keys) {
+    const value = data[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+function joinLines(lines: Array<string | null | undefined>): string {
+  return lines
+    .filter((line): line is string => line !== null && line !== undefined)
+    .join("\n");
+}
+
+function buildCanvasNameAlertMessage(input: {
+  submittedName: string;
+  canvasName: string | null;
+  formLink?: string | null;
+}): { subject: string; body: string } {
+  const subject =
+    "Update your Canvas display name (C\u1eadp nh\u1eadt t\u00ean hi\u1ec3n th\u1ecb tr\u00ean Canvas)";
+  const submittedName = input.submittedName.trim();
+  const canvasName = input.canvasName?.trim() || "n/a";
+  const englishLines = [
+    "Hello,",
+    "",
+    "Your Canvas display name is missing or does not match the name you registered through the form.",
+    "Please update your Canvas display name.",
+    "Please check your email for the Canvas invitation.",
+    "",
+    `Name in form: ${submittedName}`,
+    `Name in Canvas: ${canvasName}`,
+    "",
+    input.formLink ? `Form link: ${input.formLink}` : null,
+    "",
+    "This message was sent automatically."
+  ];
+  const vietnameseLines = [
+    "Xin ch\u00e0o,",
+    "",
+    "T\u00ean hi\u1ec3n th\u1ecb tr\u00ean Canvas c\u1ee7a b\u1ea1n \u0111ang b\u1ecb thi\u1ebfu ho\u1eb7c ch\u01b0a kh\u1edbp v\u1edbi t\u00ean b\u1ea1n \u0111\u0103ng k\u00fd th\u00f4ng qua form.",
+    "Vui l\u00f2ng c\u1eadp nh\u1eadt t\u00ean hi\u1ec3n th\u1ecb tr\u00ean Canvas.",
+    "Vui l\u00f2ng ki\u1ec3m tra email \u0111\u1ec3 nh\u1eadn l\u1eddi m\u1eddi t\u1eeb Canvas.",
+    "",
+    `T\u00ean \u0111\u00e3 \u0111i\u1ec1n trong form: ${submittedName}`,
+    `T\u00ean hi\u1ec3n th\u1ecb tr\u00ean Canvas: ${canvasName}`,
+    "",
+    input.formLink ? `Link form: ${input.formLink}` : null,
+    "",
+    "Th\u00f4ng b\u00e1o n\u00e0y \u0111\u01b0\u1ee3c g\u1eedi t\u1ef1 \u0111\u1ed9ng."
+  ];
+  return {
+    subject,
+    body: joinLines([...englishLines, "", ...vietnameseLines])
+  };
+}
+
+function buildCanvasWelcomeMessage(input: {
+  formTitle?: string | null;
+  courseLabel?: string | null;
+  sectionLabel?: string | null;
+}): { subject: string; body: string } {
+  const subject = "Welcome to the course (Ch\u00e0o m\u1eebng b\u1ea1n)";
+  const englishLines = [
+    "Hello,",
+    "",
+    "Welcome!",
+    "We received your information.",
+    "Please check your email for the Canvas invitation.",
+    "",
+    input.formTitle ? `Form: ${input.formTitle}` : null,
+    input.courseLabel ? `Course: ${input.courseLabel}` : null,
+    input.sectionLabel
+      ? `Section (L\u1edbp h\u1ecdc ph\u1ea7n): ${input.sectionLabel}`
+      : null,
+    "",
+    "This message was sent automatically."
+  ];
+  const vietnameseLines = [
+    "Xin ch\u00e0o,",
+    "",
+    "Ch\u00e0o m\u1eebng b\u1ea1n!",
+    "Ch\u00fang t\u00f4i \u0111\u00e3 nh\u1eadn \u0111\u01b0\u1ee3c th\u00f4ng tin t\u1eeb b\u1ea1n.",
+    "Vui l\u00f2ng ki\u1ec3m tra email \u0111\u1ec3 nh\u1eadn l\u1eddi m\u1eddi t\u1eeb Canvas.",
+    "",
+    input.formTitle ? `Form: ${input.formTitle}` : null,
+    input.courseLabel ? `M\u00f4n h\u1ecdc: ${input.courseLabel}` : null,
+    input.sectionLabel ? `L\u1edbp h\u1ecdc ph\u1ea7n: ${input.sectionLabel}` : null,
+    "",
+    "Th\u00f4ng b\u00e1o n\u00e0y \u0111\u01b0\u1ee3c g\u1eedi t\u1ef1 \u0111\u1ed9ng."
+  ];
+  return {
+    subject,
+    body: joinLines([...englishLines, "", ...vietnameseLines])
+  };
+}
+
+function buildCanvasInformMessage(input: {
+  formTitle?: string | null;
+  courseLabel?: string | null;
+  sectionLabel?: string | null;
+  submittedName: string;
+  submittedEmail?: string | null;
+  studentId?: string | null;
+  className?: string | null;
+  dob?: string | null;
+  formLink?: string | null;
+}): { subject: string; body: string } {
+  const subject = "Submission updated (C\u1eadp nh\u1eadt th\u00f4ng tin)";
+  const submittedName = input.submittedName.trim();
+  const submittedEmail = input.submittedEmail?.trim() || "n/a";
+  const studentId = input.studentId?.trim() || "n/a";
+  const className = input.className?.trim() || "n/a";
+  const dob = input.dob?.trim() || "n/a";
+  const englishLines = [
+    "Hello,",
+    "",
+    "We received your latest updated information.",
+    "",
+    "Your latest submission summary:",
+    `- Form: ${input.formTitle || "n/a"}`,
+    `- Course: ${input.courseLabel || "n/a"}`,
+    `- Section (L\u1edbp h\u1ecdc ph\u1ea7n): ${input.sectionLabel || "n/a"}`,
+    `- Full name: ${submittedName}`,
+    `- Email: ${submittedEmail}`,
+    `- Student ID: ${studentId}`,
+    `- Class: ${className}`,
+    `- Date of birth: ${dob}`,
+    "",
+    input.formLink ? `Form link: ${input.formLink}` : null,
+    "",
+    "This message was sent automatically."
+  ];
+  const vietnameseLines = [
+    "Xin ch\u00e0o,",
+    "",
+    "Ch\u00fang t\u00f4i \u0111\u00e3 nh\u1eadn \u0111\u01b0\u1ee3c th\u00f4ng tin c\u1eadp nh\u1eadt m\u1edbi nh\u1ea5t t\u1eeb b\u1ea1n.",
+    "",
+    "T\u00f3m t\u1eaft th\u00f4ng tin m\u1edbi nh\u1ea5t:",
+    `- Form: ${input.formTitle || "n/a"}`,
+    `- M\u00f4n h\u1ecdc: ${input.courseLabel || "n/a"}`,
+    `- L\u1edbp h\u1ecdc ph\u1ea7n: ${input.sectionLabel || "n/a"}`,
+    `- H\u1ecd v\u00e0 t\u00ean: ${submittedName}`,
+    `- Email: ${submittedEmail}`,
+    `- M\u00e3 sinh vi\u00ean: ${studentId}`,
+    `- L\u1edbp: ${className}`,
+    `- Ng\u00e0y sinh: ${dob}`,
+    "",
+    input.formLink ? `Link form: ${input.formLink}` : null,
+    "",
+    "Th\u00f4ng b\u00e1o n\u00e0y \u0111\u01b0\u1ee3c g\u1eedi t\u1ef1 \u0111\u1ed9ng."
+  ];
+  return {
+    subject,
+    body: joinLines([...englishLines, "", ...vietnameseLines])
+  };
+}
+
+function buildAccountGoodbyeMessage(): { subject: string; body: string } {
+  const subject = "Account deleted (T\u00e0i kho\u1ea3n \u0111\u00e3 b\u1ecb x\u00f3a)";
+  const englishLines = [
+    "Hello,",
+    "",
+    "Your account has been deleted and your form submission has been moved to trash.",
+    "If you want to restore your account, please contact an admin.",
+    "",
+    "Delete policy:",
+    "- Your account is soft-deleted (moved to trash).",
+    "- Your form submission content and uploaded files are moved to trash.",
+    "- The Canvas account you registered with us will be deactivated in the course.",
+    "- Restoration is only possible by an admin.",
+    "",
+    "This message was sent automatically."
+  ];
+  const vietnameseLines = [
+    "Xin ch\u00e0o,",
+    "",
+    "T\u00e0i kho\u1ea3n c\u1ee7a b\u1ea1n \u0111\u00e3 b\u1ecb x\u00f3a v\u00e0 c\u00e1c n\u1ed9i dung \u0111i\u1ec1n form \u0111\u00e3 \u0111\u01b0\u1ee3c chuy\u1ec3n v\u00e0o th\u00f9ng r\u00e1c.",
+    "N\u1ebfu b\u1ea1n mu\u1ed1n kh\u00f4i ph\u1ee5c t\u00e0i kho\u1ea3n, vui l\u00f2ng li\u00ean h\u1ec7 qu\u1ea3n tr\u1ecb vi\u00ean.",
+    "",
+    "Ch\u00ednh s\u00e1ch x\u00f3a:",
+    "- T\u00e0i kho\u1ea3n c\u1ee7a b\u1ea1n ch\u1ec9 b\u1ecb x\u00f3a m\u1ec1m (chuy\u1ec3n v\u00e0o th\u00f9ng r\u00e1c).",
+    "- C\u00e1c n\u1ed9i dung \u0111i\u1ec1n form v\u00e0 t\u1ec7p \u0111\u00e3 t\u1ea3i l\u00ean \u0111\u01b0\u1ee3c chuy\u1ec3n v\u00e0o th\u00f9ng r\u00e1c.",
+    "- T\u00e0i kho\u1ea3n Canvas b\u1ea1n \u0111\u0103ng k\u00fd v\u1edbi ch\u00fang t\u00f4i s\u1ebd b\u1ecb v\u00f4 hi\u1ec7u h\u00f3a trong kh\u00f3a h\u1ecdc.",
+    "- Vi\u1ec7c kh\u00f4i ph\u1ee5c ch\u1ec9 c\u00f3 th\u1ec3 th\u1ef1c hi\u1ec7n b\u1edfi qu\u1ea3n tr\u1ecb vi\u00ean.",
+    "",
+    "Th\u00f4ng b\u00e1o n\u00e0y \u0111\u01b0\u1ee3c g\u1eedi t\u1ef1 \u0111\u1ed9ng."
+  ];
+  return {
+    subject,
+    body: joinLines([...englishLines, "", ...vietnameseLines])
+  };
+}
+function base64UrlFromBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64FromBytes(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary);
+}
+
+function encodeEmailHeader(value: string): string {
+  const encoded = base64FromBytes(new TextEncoder().encode(value));
+  return `=?UTF-8?B?${encoded}?=`;
+}
+
+async function sendGmailMessage(
+  env: Env,
+  input: { to: string; subject: string; body: string }
+): Promise<{ ok: boolean; error?: string | null }> {
+  if (!env.GMAIL_REFRESH_TOKEN || !env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+    await recordHealthStatus(env, "gmail_send", "skipped", "gmail_not_configured");
+    return { ok: false, error: "gmail_not_configured" };
+  }
+  const sender = env.GMAIL_SENDER_EMAIL?.trim();
+  if (!sender) {
+    await recordHealthStatus(env, "gmail_send", "skipped", "gmail_sender_missing");
+    return { ok: false, error: "gmail_sender_missing" };
+  }
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: env.GOOGLE_CLIENT_ID,
+      client_secret: env.GOOGLE_CLIENT_SECRET,
+      refresh_token: env.GMAIL_REFRESH_TOKEN,
+      grant_type: "refresh_token"
+    })
+  });
+  if (!tokenResponse.ok) {
+    const text = await tokenResponse.text();
+    await recordHealthStatus(env, "gmail_send", "error", text || "gmail_token_failed");
+    return { ok: false, error: text || "gmail_token_failed" };
+  }
+  const tokenPayload = (await tokenResponse.json()) as { access_token?: string };
+  if (!tokenPayload.access_token) {
+    await recordHealthStatus(env, "gmail_send", "error", "gmail_token_missing");
+    return { ok: false, error: "gmail_token_missing" };
+  }
+  const subjectHeader = encodeEmailHeader(input.subject);
+  const mime = [
+    `From: ${sender}`,
+    `To: ${input.to}`,
+    `Subject: ${subjectHeader}`,
+    'Content-Type: text/plain; charset="UTF-8"',
+    "Content-Transfer-Encoding: 8bit",
+    "",
+    input.body
+  ].join("\r\n");
+  const raw = base64UrlFromBytes(new TextEncoder().encode(mime));
+  const sendResponse = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${tokenPayload.access_token}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ raw })
+  });
+  if (!sendResponse.ok) {
+    const text = await sendResponse.text();
+    await recordHealthStatus(env, "gmail_send", "error", text || "gmail_send_failed");
+    return { ok: false, error: text || "gmail_send_failed" };
+  }
+  await recordHealthStatus(env, "gmail_send", "ok", "sent");
+  return { ok: true };
+}
+
+async function logEmailSend(
+  env: Env,
+  input: {
+    to: string;
+    subject: string;
+    body: string;
+    status: "sent" | "failed";
+    error?: string | null;
+    submissionId?: string | null;
+    formId?: string | null;
+    formSlug?: string | null;
+    formTitle?: string | null;
+    canvasCourseId?: string | null;
+    canvasSectionId?: string | null;
+    triggeredBy?: string | null;
+    triggerSource?: "manual" | "auto";
+  }
+): Promise<void> {
+  try {
+    await env.DB.prepare(
+      "INSERT INTO email_logs (id, to_email, subject, body, status, error, submission_id, form_id, form_slug, form_title, canvas_course_id, canvas_section_id, triggered_by, trigger_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+      .bind(
+        crypto.randomUUID(),
+        input.to,
+        input.subject,
+        input.body,
+        input.status,
+        input.error || null,
+        input.submissionId ?? null,
+        input.formId ?? null,
+        input.formSlug ?? null,
+        input.formTitle ?? null,
+        input.canvasCourseId ?? null,
+        input.canvasSectionId ?? null,
+        input.triggeredBy ?? null,
+        input.triggerSource ?? null
+      )
+      .run();
+  } catch (error) {
+    console.error("email_log_failed", String((error as Error | undefined)?.message || error));
+  }
+}
+
+async function getUserPrimaryEmail(env: Env, userId: string): Promise<string | null> {
+  const row = await env.DB.prepare(
+    "SELECT email FROM user_identities WHERE user_id=? AND email IS NOT NULL ORDER BY CASE provider WHEN 'google' THEN 0 ELSE 1 END, created_at ASC LIMIT 1"
+  )
+    .bind(userId)
+    .first<{ email: string | null }>();
+  return row?.email ?? null;
+}
+
+async function canvasApplyTaskForUserCourses(
+  env: Env,
+  userId: string,
+  task: "deactivate" | "delete" | "reactivate"
+) {
+  const email = await getUserPrimaryEmail(env, userId);
+  if (!email) return;
+  const { results } = await env.DB.prepare(
+    "SELECT DISTINCT canvas_course_id as course_id FROM submissions WHERE user_id=? AND canvas_course_id IS NOT NULL"
+  )
+    .bind(userId)
+    .all<{ course_id: string }>();
+  for (const row of results) {
+    if (!row?.course_id) continue;
+    try {
+      if (task === "reactivate") {
+        const result = await canvasReactivateByEmail(env, String(row.course_id), email);
+        if (!result.ok) {
+          await handleCanvasEnrollment(
+            env,
+            { canvas_enabled: 1, canvas_course_id: String(row.course_id) },
+            titleCaseFromEmail(email),
+            email,
+            null
+          );
+        }
+      } else {
+        await canvasApplyEnrollmentTaskByEmail(env, String(row.course_id), email, task);
+      }
+    } catch {
+      // Best effort; do not block deletion flows.
+    }
+  }
+  await env.DB.prepare(
+    "UPDATE submissions SET canvas_enroll_status=?, canvas_enroll_error=? WHERE user_id=? AND canvas_course_id IS NOT NULL"
+  )
+    .bind(
+      task === "delete" ? "deleted" : task === "reactivate" ? "invited" : "deactivated",
+      task === "reactivate" ? "user_restored" : "user_deleted",
+      userId
+    )
+    .run();
+}
+
+function titleCaseFromEmail(email: string) {
+  const local = email.split("@")[0] || "";
+  const parts = local.replace(/[._-]+/g, " ").split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "User";
+  return parts
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function pickNameFromPayload(payload: Record<string, unknown> | null): string | null {
+  if (!payload) return null;
+  const preferredKeys = ["full_name", "fullName", "fullname", "full-name", "name"];
+  for (const key of preferredKeys) {
+    const value = payload[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  const nameKey = Object.keys(payload).find((key) => key.toLowerCase().includes("name"));
+  if (nameKey) {
+    const value = payload[nameKey];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+async function getSubmissionCanvasInfo(
+  env: Env,
+  submissionId: string
+): Promise<{
+  email: string | null;
+  name: string | null;
+  courseId: string | null;
+  sectionId: string | null;
+  userId: string | null;
+}> {
+  const row = await env.DB.prepare(
+    "SELECT s.id,s.user_id,s.payload_json,s.canvas_course_id,s.canvas_section_id,s.submitter_email,f.canvas_course_id as form_canvas_course_id FROM submissions s LEFT JOIN forms f ON f.id=s.form_id WHERE s.id=?"
+  )
+    .bind(submissionId)
+    .first<{
+      user_id: string | null;
+      payload_json: string;
+      canvas_course_id: string | null;
+      canvas_section_id: string | null;
+      submitter_email: string | null;
+      form_canvas_course_id: string | null;
+    }>();
+  if (!row) {
+    return { email: null, name: null, courseId: null, sectionId: null, userId: null };
+  }
+  let payloadData: Record<string, unknown> | null = null;
+  try {
+    const payload = JSON.parse(row.payload_json) as { data?: Record<string, unknown> };
+    if (payload?.data && typeof payload.data === "object") {
+      payloadData = payload.data as Record<string, unknown>;
+    }
+  } catch {
+    payloadData = null;
+  }
+  const email =
+    (typeof payloadData?.email === "string" && payloadData.email.trim()) ||
+    row.submitter_email ||
+    (row.user_id ? await getUserPrimaryEmail(env, row.user_id) : null) ||
+    null;
+  const name = pickNameFromPayload(payloadData);
+  const courseId = row.canvas_course_id || row.form_canvas_course_id || null;
+  return {
+    email,
+    name,
+    courseId,
+    sectionId: row.canvas_section_id ?? null,
+    userId: row.user_id ?? null
+  };
+}
+
+async function deactivateCanvasForSubmission(
+  env: Env,
+  submissionId: string
+): Promise<{ ok: boolean; attempted: boolean; error?: string | null }> {
+  try {
+    const info = await getSubmissionCanvasInfo(env, submissionId);
+    if (!info.courseId || !info.email) return { ok: true, attempted: false };
+    const result = await canvasApplyEnrollmentTaskByEmail(env, info.courseId, info.email, "deactivate");
+    if (!result.ok) {
+      return { ok: false, attempted: true, error: result.error || "canvas_deactivate_failed" };
+    }
+    await env.DB.prepare(
+      "UPDATE submissions SET canvas_enroll_status=?, canvas_enroll_error=? WHERE id=?"
+    )
+      .bind("deactivated", "submission_deleted", submissionId)
+      .run();
+    return { ok: true, attempted: true };
+  } catch (error) {
+    return {
+      ok: false,
+      attempted: true,
+      error: error instanceof Error ? error.message : "canvas_deactivate_failed"
+    };
+  }
+}
+
+async function reactivateCanvasForSubmission(
+  env: Env,
+  submissionId: string
+): Promise<{ ok: boolean; attempted: boolean; status?: string | null; error?: string | null }> {
+  try {
+    const info = await getSubmissionCanvasInfo(env, submissionId);
+    if (!info.courseId || !info.email) {
+      return { ok: true, attempted: false, status: "skipped" };
+    }
+    const reactivate = await canvasReactivateByEmail(env, info.courseId, info.email);
+    if (!reactivate.ok) {
+      await handleCanvasEnrollment(
+        env,
+        { canvas_enabled: 1, canvas_course_id: info.courseId },
+        info.name || (info.email ? titleCaseFromEmail(info.email) : "User"),
+        info.email,
+        info.sectionId
+      );
+    }
+    await env.DB.prepare(
+      "UPDATE submissions SET canvas_enroll_status=?, canvas_enroll_error=? WHERE id=?"
+    )
+      .bind("invited", "submission_restored", submissionId)
+      .run();
+    return {
+      ok: true,
+      attempted: true,
+      status: reactivate.ok ? "reactivated" : "invited"
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      attempted: true,
+      status: "failed",
+      error: error instanceof Error ? error.message : "canvas_reactivate_failed"
+    };
+  }
+}
+
+async function unenrollCanvasForSubmission(env: Env, submissionId: string) {
+  try {
+    const info = await getSubmissionCanvasInfo(env, submissionId);
+    if (!info.courseId || !info.email) return;
+    await canvasApplyEnrollmentTaskByEmail(env, info.courseId, info.email, "delete");
+    await env.DB.prepare(
+      "UPDATE submissions SET canvas_enroll_status=?, canvas_enroll_error=? WHERE id=?"
+    )
+      .bind("deleted", "submission_hard_deleted", submissionId)
+      .run();
+  } catch {
+    // Best effort.
+  }
+}
+
+async function getCanvasCourseAccountId(env: Env, courseId: string): Promise<string | null> {
+  const base = getCanvasBaseUrl(env);
+  const res = await canvasFetch(env, `${base}/api/v1/courses/${courseId}`);
+  if (!res.ok) return null;
+  const payload = (await res.json()) as { account_id?: number | string };
+  if (!payload?.account_id) return null;
+  return String(payload.account_id);
+}
+
+async function canvasIsUserEnrolled(
+  env: Env,
+  courseId: string,
+  email: string
+): Promise<boolean> {
+  const base = getCanvasBaseUrl(env);
+  const url = `${base}/api/v1/courses/${courseId}/enrollments?type[]=StudentEnrollment&include[]=user&per_page=100`;
+  try {
+    const enrollments = await canvasFetchAll<any>(env, url);
+    const target = email.toLowerCase();
+    return enrollments.some((enrollment) => {
+      const loginId = enrollment?.user?.login_id;
+      return typeof loginId === "string" && loginId.toLowerCase() === target;
+    });
+  } catch (error) {
+    return false;
+  }
+}
+
+async function handleCanvasEnrollment(
+  env: Env,
+  form: { canvas_enabled?: number | null; canvas_course_id?: string | null },
+  name: string,
+  email: string,
+  sectionId: string | null
+): Promise<{
+  status: string;
+  error: string | null;
+  enrolledAt: string | null;
+  sectionId: string | null;
+  canvasUserId: string | null;
+  canvasUserName: string | null;
+}> {
+  if (!toBoolean(form.canvas_enabled) || !form.canvas_course_id) {
+    return {
+      status: "skipped",
+      error: null,
+      enrolledAt: null,
+      sectionId: null,
+      canvasUserId: null,
+      canvasUserName: null
+    };
+  }
+  if (!env.CANVAS_API_TOKEN) {
+    return {
+      status: "failed",
+      error: "canvas_not_configured",
+      enrolledAt: null,
+      sectionId,
+      canvasUserId: null,
+      canvasUserName: null
+    };
+  }
+  const debugContext = {
+    courseId: form.canvas_course_id,
+    sectionId: sectionId ?? null,
+    email: maskEmail(email)
+  };
+
+  console.info("[canvas_enroll]", { ...debugContext, stage: "lookup_start" });
+  let accountIdOverride: string | null = null;
+  const user = await canvasFindUserByEmail(env, email);
+  let canvasUserId = user?.id || null;
+  let createError: string | null = null;
+  let canvasUserName = user?.name || null;
+  console.info("[canvas_enroll]", {
+    ...debugContext,
+    stage: "lookup_result",
+    found: Boolean(canvasUserId),
+    lookupError: user?.error ?? null
+  });
+  const alreadyEnrolled = await canvasIsUserEnrolled(env, form.canvas_course_id, email);
+  if (alreadyEnrolled) {
+    console.info("[canvas_enroll]", { ...debugContext, stage: "already_enrolled" });
+    return {
+      status: "invited",
+      error: null,
+      enrolledAt: new Date().toISOString(),
+      sectionId,
+      canvasUserId,
+      canvasUserName
+    };
+  }
+  if (!canvasUserId) {
+    accountIdOverride = await getCanvasCourseAccountId(env, form.canvas_course_id);
+    console.info("[canvas_enroll]", {
+      ...debugContext,
+      stage: "create_user_start",
+      accountIdOverride
+    });
+    const created = await canvasCreateUser(env, name, email, accountIdOverride);
+    canvasUserId = created?.id || null;
+    createError = created?.error || user?.error || null;
+    console.info("[canvas_enroll]", {
+      ...debugContext,
+      stage: "create_user_result",
+      created: Boolean(canvasUserId),
+      createError
+    });
+  }
+  if (!canvasUserId) {
+    if (accountIdOverride) {
+      const retry = await canvasFindUserByEmail(env, email, accountIdOverride);
+      if (retry?.id) {
+        canvasUserId = retry.id;
+        canvasUserName = retry.name ?? canvasUserName;
+        console.info("[canvas_enroll]", {
+          ...debugContext,
+          stage: "lookup_retry_success",
+          accountIdOverride
+        });
+      } else if (retry?.error) {
+        createError = `${createError || "user_lookup_failed"}:${retry.error}`;
+        console.info("[canvas_enroll]", {
+          ...debugContext,
+          stage: "lookup_retry_failed",
+          accountIdOverride,
+          retryError: retry.error
+        });
+      }
+    }
+  }
+  if (!canvasUserId) {
+    const courseLookup = await canvasFindUserByEmailInCourse(
+      env,
+      form.canvas_course_id,
+      email
+    );
+    if (courseLookup?.id) {
+      canvasUserId = courseLookup.id;
+      canvasUserName = courseLookup.name ?? canvasUserName;
+      console.info("[canvas_enroll]", {
+        ...debugContext,
+        stage: "course_lookup_success"
+      });
+    } else if (courseLookup?.error) {
+      createError = `${createError || "user_lookup_failed"}:${courseLookup.error}`;
+      console.info("[canvas_enroll]", {
+        ...debugContext,
+        stage: "course_lookup_failed",
+        error: courseLookup.error
+      });
+    }
+  }
+  if (!canvasUserId) {
+    if (
+      createError &&
+      createError.includes("403") &&
+      createError.toLowerCase().includes("not authorized")
+    ) {
+      const fallbackId = `sis_login_id:${email}`;
+      console.info("[canvas_enroll]", {
+        ...debugContext,
+        stage: "enroll_fallback_sis_login"
+      });
+      let fallbackEnroll = await canvasEnrollUser(env, form.canvas_course_id, fallbackId, sectionId);
+      if (!fallbackEnroll.ok && sectionId) {
+        fallbackEnroll = await canvasEnrollUser(env, form.canvas_course_id, fallbackId, null);
+      }
+      if (fallbackEnroll.ok) {
+        console.info("[canvas_enroll]", { ...debugContext, stage: "enroll_fallback_ok" });
+        return {
+          status: "invited",
+          error: null,
+          enrolledAt: new Date().toISOString(),
+          sectionId,
+          canvasUserId: null,
+          canvasUserName
+        };
+      }
+      console.info("[canvas_enroll]", {
+        ...debugContext,
+        stage: "enroll_fallback_failed",
+        error: fallbackEnroll.error ?? null
+      });
+      return {
+        status: "failed",
+        error: fallbackEnroll.error || "enroll_failed",
+        enrolledAt: null,
+        sectionId,
+        canvasUserId: null,
+        canvasUserName
+      };
+    }
+    console.info("[canvas_enroll]", {
+      ...debugContext,
+      stage: "lookup_failed",
+      error: createError ? `user_lookup_failed:${createError}` : "user_lookup_failed"
+    });
+    return {
+      status: "failed",
+      error: createError ? `user_lookup_failed:${createError}` : "user_lookup_failed",
+      enrolledAt: null,
+      sectionId,
+      canvasUserId: null,
+      canvasUserName
+    };
+  }
+  if (!/^\d+$/.test(String(canvasUserId))) {
+    console.info("[canvas_enroll]", {
+      ...debugContext,
+      stage: "invalid_user_id",
+      userId: String(canvasUserId)
+    });
+    return {
+      status: "failed",
+      error: "user_lookup_failed:invalid_user_id",
+      enrolledAt: null,
+      sectionId,
+      canvasUserId: null,
+      canvasUserName
+    };
+  }
+
+  console.info("[canvas_enroll]", {
+    ...debugContext,
+    stage: "enroll_start",
+    userId: String(canvasUserId)
+  });
+  let enrollment = await canvasEnrollUser(env, form.canvas_course_id, canvasUserId, sectionId);
+  if (!enrollment.ok && sectionId) {
+    console.info("[canvas_enroll]", {
+      ...debugContext,
+      stage: "enroll_retry_no_section",
+      error: enrollment.error ?? null
+    });
+    enrollment = await canvasEnrollUser(env, form.canvas_course_id, canvasUserId, null);
+  }
+  if (!enrollment.ok) {
+    console.info("[canvas_enroll]", {
+      ...debugContext,
+      stage: "enroll_failed",
+      error: enrollment.error ?? null
+    });
+    return {
+      status: "failed",
+      error: enrollment.error || "enroll_failed",
+      enrolledAt: null,
+      sectionId,
+      canvasUserId,
+      canvasUserName
+    };
+  }
+  console.info("[canvas_enroll]", { ...debugContext, stage: "enroll_ok" });
+  return {
+    status: "invited",
+    error: null,
+    enrolledAt: new Date().toISOString(),
+    sectionId,
+    canvasUserId,
+    canvasUserName
+  };
 }
 
 function isMissingDeletedReasonColumn(error: unknown) {
@@ -1011,6 +3040,7 @@ async function softDeleteUser(
   reason: string
 ) {
   // Soft-delete user and cascade soft-delete to their submissions and uploads.
+  await canvasApplyTaskForUserCourses(env, userId, "deactivate");
   const result = await env.DB.prepare(
     "UPDATE users SET deleted_at=datetime('now'), deleted_by=?, deleted_reason=? WHERE id=? AND deleted_at IS NULL"
   )
@@ -1043,7 +3073,34 @@ async function softDeleteSubmissionForUser(
   userId: string,
   deletedBy: string | null,
   reason: string
-) {
+): Promise<{
+  ok: boolean;
+  error?: string | null;
+  canvas?: { attempted: number; failed: number };
+}> {
+  const { results: submissions } = await env.DB.prepare(
+    "SELECT id FROM submissions WHERE form_id=? AND user_id=? AND deleted_at IS NULL"
+  )
+    .bind(formId, userId)
+    .all<{ id: string }>();
+  let attempted = 0;
+  let failed = 0;
+  for (const row of submissions) {
+    if (row?.id) {
+      const result = await deactivateCanvasForSubmission(env, row.id);
+      if (result.attempted) {
+        attempted += 1;
+      }
+      if (!result.ok) {
+        failed += 1;
+        return {
+          ok: false,
+          error: result.error || "canvas_deactivate_failed",
+          canvas: { attempted, failed }
+        };
+      }
+    }
+  }
   await updateSubmissionsSoftDelete(env, "form_id=? AND user_id=?", [formId, userId], deletedBy, reason);
   await updateSoftDeleteTable(
     env,
@@ -1069,6 +3126,7 @@ async function softDeleteSubmissionForUser(
     deletedBy,
     reason
   );
+  return { ok: true, canvas: { attempted, failed } };
 }
 
 async function softDeleteSubmissionById(
@@ -1077,6 +3135,7 @@ async function softDeleteSubmissionById(
   deletedBy: string | null,
   reason: string
 ) {
+  await deactivateCanvasForSubmission(env, submissionId);
   await updateSubmissionsSoftDelete(env, "id=?", [submissionId], deletedBy, reason);
   await updateSoftDeleteTable(env, "submission_file_items", "submission_id=?", [submissionId], deletedBy, reason);
   await updateSoftDeleteTable(env, "submission_uploads", "submission_id=?", [submissionId], deletedBy, reason);
@@ -1134,15 +3193,24 @@ async function restoreUser(env: Env, userId: string) {
     "submission_id IN (SELECT id FROM submissions WHERE user_id=?)",
     [userId]
   );
+  await canvasApplyTaskForUserCourses(env, userId, "reactivate");
   return result.success !== false;
 }
 
-async function restoreSubmission(env: Env, submissionId: string) {
+async function restoreSubmission(
+  env: Env,
+  submissionId: string
+): Promise<{ ok: boolean; canvasError?: string | null; canvasStatus?: string | null }> {
   await updateSubmissionsRestore(env, "id=?", [submissionId]);
   await updateRestoreTable(env, "submission_file_items", "submission_id=?", [submissionId]);
   await updateRestoreTable(env, "submission_uploads", "submission_id=?", [submissionId]);
   await updateRestoreTable(env, "submission_files", "submission_id=?", [submissionId]);
-  return true;
+  const canvasResult = await reactivateCanvasForSubmission(env, submissionId);
+  return {
+    ok: true,
+    canvasError: canvasResult.ok ? null : canvasResult.error || null,
+    canvasStatus: canvasResult.status || null
+  };
 }
 
 async function restoreFileItem(env: Env, fileId: string) {
@@ -1262,6 +3330,7 @@ async function hardDeleteTemplate(env: Env, key: string) {
 
 async function hardDeleteUser(env: Env, userId: string) {
   const accessToken = await getDriveAccessToken(env);
+  await canvasApplyTaskForUserCourses(env, userId, "delete");
   if (accessToken) {
     const userKeys = await getUserDriveKeys(env, userId);
     if (userKeys.length > 0) {
@@ -1372,6 +3441,7 @@ async function hardDeleteFileItem(env: Env, fileId: string) {
 }
 
 async function hardDeleteSubmission(env: Env, submissionId: string) {
+  await unenrollCanvasForSubmission(env, submissionId);
   const accessToken = await getDriveAccessToken(env);
   if (accessToken) {
     await deleteDriveFilesForSubmission(env, submissionId, accessToken);
@@ -2516,9 +4586,17 @@ async function uploadFileToDrive(
       body
     }
   );
-  if (!uploadRes.ok) return null;
+  if (!uploadRes.ok) {
+    const text = await uploadRes.text().catch(() => "");
+    await recordHealthStatus(env, "drive_upload", "error", text || "drive_upload_failed");
+    return null;
+  }
   const payload = (await uploadRes.json()) as { id?: string; webViewLink?: string | null };
-  if (!payload.id) return null;
+  if (!payload.id) {
+    await recordHealthStatus(env, "drive_upload", "error", "drive_upload_missing_id");
+    return null;
+  }
+  await recordHealthStatus(env, "drive_upload", "ok", fileName);
   return { id: payload.id, webViewLink: payload.webViewLink ?? null };
 }
 
@@ -3518,9 +5596,966 @@ export default {
         );
       }
 
+      if (request.method === "GET" && url.pathname === "/api/admin/health/summary") {
+        const { results } = await env.DB.prepare(
+          "SELECT h1.service,h1.status,h1.message,h1.checked_at FROM health_status_logs h1 JOIN (SELECT service, MAX(checked_at) as max_checked FROM health_status_logs GROUP BY service) h2 ON h1.service=h2.service AND h1.checked_at=h2.max_checked ORDER BY h1.service"
+        ).all<{
+          service: string;
+          status: string;
+          message: string | null;
+          checked_at: string;
+        }>();
+        return jsonResponse(200, { data: results, requestId }, requestId, corsHeaders);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/admin/health/history") {
+        const service = (url.searchParams.get("service") || "").trim();
+        const limit = Math.min(Math.max(toNumber(url.searchParams.get("limit"), 50), 1), 200);
+        let query = "SELECT id,service,status,message,created_at FROM health_status_logs";
+        const params: unknown[] = [];
+        if (service) {
+          query += " WHERE service=?";
+          params.push(service);
+        }
+        query = query.replace("created_at", "checked_at");
+        query += " ORDER BY checked_at DESC LIMIT ?";
+        params.push(limit);
+        const { results } = await env.DB.prepare(query)
+          .bind(...params)
+          .all<{
+            id: string;
+            service: string;
+            status: string;
+            message: string | null;
+            checked_at: string;
+          }>();
+        return jsonResponse(200, { data: results, requestId }, requestId, corsHeaders);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/health/clear") {
+        let service: string | null = null;
+        try {
+          const body = await parseJsonBody<{ service?: string }>(request);
+          if (typeof body?.service === "string" && body.service.trim()) {
+            service = body.service.trim();
+          }
+        } catch {
+          service = null;
+        }
+        if (service) {
+          await env.DB.prepare("DELETE FROM health_status_logs WHERE service=?")
+            .bind(service)
+            .run();
+        } else {
+          await env.DB.prepare("DELETE FROM health_status_logs").run();
+        }
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/admin/canvas/courses") {
+        const q = (url.searchParams.get("q") || "").trim();
+        const page = Math.max(toNumber(url.searchParams.get("page"), 1), 1);
+        const pageSize = Math.min(Math.max(toNumber(url.searchParams.get("pageSize"), 50), 1), 200);
+        const limit = pageSize;
+        const offset = (page - 1) * pageSize;
+        const like = `%${q}%`;
+        const totalRow = await env.DB.prepare(
+          "SELECT COUNT(1) as total FROM canvas_courses_cache WHERE (workflow_state IS NULL OR workflow_state NOT IN ('completed','concluded','deleted')) AND (?='' OR name LIKE ? OR code LIKE ?)"
+        )
+          .bind(q, like, like)
+          .first<{ total: number }>();
+        const total = totalRow?.total ?? 0;
+        const { results } = await env.DB.prepare(
+          "SELECT id,name,code,workflow_state,account_id,term_id,updated_at FROM canvas_courses_cache WHERE (workflow_state IS NULL OR workflow_state NOT IN ('completed','concluded','deleted')) AND (?='' OR name LIKE ? OR code LIKE ?) ORDER BY name LIMIT ? OFFSET ?"
+        )
+          .bind(q, like, like, limit, offset)
+          .all();
+        return jsonResponse(
+          200,
+          { data: results, page, pageSize, total, needsSync: total === 0, requestId },
+          requestId,
+          corsHeaders
+        );
+      }
+
+
+      if (request.method === "GET" && url.pathname === "/api/admin/canvas/overview") {
+        const { results: courses } = await env.DB.prepare(
+          "SELECT id,name,code,workflow_state,updated_at FROM canvas_courses_cache WHERE (workflow_state IS NULL OR workflow_state NOT IN ('completed','concluded','deleted')) ORDER BY name"
+        ).all<{
+          id: string;
+          name: string;
+          code: string | null;
+          workflow_state: string | null;
+          updated_at: string | null;
+        }>();
+
+        if (!courses.length) {
+          return jsonResponse(200, { data: [], requestId }, requestId, corsHeaders);
+        }
+
+        const courseIds = courses.map((course) => String(course.id));
+        const placeholders = courseIds.map(() => "?").join(",");
+        const { results: sectionRows } = await env.DB.prepare(
+          `SELECT id,course_id,name FROM canvas_sections_cache WHERE course_id IN (${placeholders})`
+        )
+          .bind(...courseIds)
+          .all<{ id: string; course_id: string; name: string }>();
+        const sectionNameMap = new Map<string, Map<string, string>>();
+        sectionRows.forEach((row) => {
+          const courseId = String(row.course_id);
+          if (!sectionNameMap.has(courseId)) {
+            sectionNameMap.set(courseId, new Map());
+          }
+          sectionNameMap.get(courseId)!.set(String(row.id), row.name);
+        });
+
+        const { results: submissions } = await env.DB.prepare(
+          `SELECT s.id,s.user_id,s.payload_json,s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,s.created_at,s.updated_at,s.deleted_at as submission_deleted,f.slug as form_slug,f.title as form_title,COALESCE(s.submitter_email,(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_email,COALESCE(s.submitter_github_username,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_github_username FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.deleted_at IS NULL AND f.deleted_at IS NULL AND s.canvas_course_id IN (${placeholders}) ORDER BY COALESCE(s.canvas_enrolled_at, s.updated_at, s.created_at) DESC`
+        )
+          .bind(...courseIds)
+          .all<{
+            id: string;
+            user_id: string | null;
+            payload_json: string;
+            canvas_enroll_status: string | null;
+            canvas_enroll_error: string | null;
+            canvas_course_id: string | null;
+            canvas_section_id: string | null;
+            canvas_enrolled_at: string | null;
+            canvas_user_id: string | null;
+            canvas_user_name: string | null;
+            created_at: string | null;
+            updated_at: string | null;
+            submission_deleted: string | null;
+            form_slug: string;
+            form_title: string;
+            submitter_email: string | null;
+            submitter_github_username: string | null;
+          }>();
+
+        const submissionsByCourse = new Map<string, any[]>();
+        submissions.forEach((row) => {
+          if (!row.canvas_course_id) return;
+          const courseId = String(row.canvas_course_id);
+          const sectionId = row.canvas_section_id ? String(row.canvas_section_id) : null;
+          let payloadData: Record<string, unknown> | null = null;
+          try {
+            const payload = JSON.parse(row.payload_json) as { data?: Record<string, unknown> };
+            if (payload?.data && typeof payload.data === "object") {
+              payloadData = payload.data as Record<string, unknown>;
+            }
+          } catch {
+            payloadData = null;
+          }
+          const displayName = pickNameFromPayload(payloadData);
+          const dataEmail =
+            typeof payloadData?.email === "string" && payloadData.email.trim()
+              ? payloadData.email.trim()
+              : null;
+          const status = row.canvas_enroll_status || "not_invited";
+          const sectionName =
+            sectionId && sectionNameMap.get(courseId)
+              ? sectionNameMap.get(courseId)!.get(sectionId) || null
+              : null;
+          const entry = {
+            submission_id: row.id,
+            submission_link: `/forms/#/me/submissions/${row.id}`,
+            submission_deleted: Boolean(row.submission_deleted),
+            user_id: row.user_id,
+            name: displayName,
+            email: dataEmail || row.submitter_email,
+            github_username: row.submitter_github_username,
+            status,
+            error: row.canvas_enroll_error,
+            enrolled_at: row.canvas_enrolled_at,
+            section_id: sectionId,
+            section_name: sectionName,
+            canvas_user_id: row.canvas_user_id,
+            canvas_user_name: row.canvas_user_name,
+            form_slug: row.form_slug,
+            form_title: row.form_title
+          };
+          if (!submissionsByCourse.has(courseId)) {
+            submissionsByCourse.set(courseId, []);
+          }
+          submissionsByCourse.get(courseId)!.push(entry);
+        });
+
+        const data = courses.map((course) => ({
+          id: String(course.id),
+          name: course.name,
+          code: course.code ?? null,
+          workflow_state: course.workflow_state ?? null,
+          updated_at: course.updated_at ?? null,
+          registrations: submissionsByCourse.get(String(course.id)) ?? []
+        }));
+
+        return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/admin/canvas/retry-queue") {
+        const limit = Math.min(Math.max(toNumber(url.searchParams.get("limit"), 50), 1), 200);
+        const { results: queue } = await env.DB.prepare(
+          "SELECT q.id,q.submission_id,q.course_id,q.section_id,q.submitter_email,q.attempts,q.last_error,q.next_run_at,q.created_at,s.form_id,f.slug as form_slug,f.title as form_title FROM canvas_enroll_queue q LEFT JOIN submissions s ON s.id=q.submission_id LEFT JOIN forms f ON f.id=s.form_id ORDER BY q.next_run_at ASC LIMIT ?"
+        )
+          .bind(limit)
+          .all();
+        const { results: deadletters } = await env.DB.prepare(
+          "SELECT id,submission_id,course_id,section_id,submitter_email,error,attempts,created_at FROM canvas_enroll_deadletters ORDER BY created_at DESC LIMIT ?"
+        )
+          .bind(limit)
+          .all();
+        return jsonResponse(200, { queue, deadletters, requestId }, requestId, corsHeaders);
+      }
+
+      const retryMatch = url.pathname.match(/^\/api\/admin\/canvas\/retry-queue\/([^/]+)\/retry$/);
+      if (request.method === "POST" && retryMatch) {
+        const entryId = decodeURIComponent(retryMatch[1]);
+        const source = (url.searchParams.get("source") || "queue").trim();
+        if (source === "deadletter") {
+          const deadletter = await env.DB.prepare(
+            "SELECT id,submission_id,course_id,section_id,submitter_email FROM canvas_enroll_deadletters WHERE id=?"
+          )
+            .bind(entryId)
+            .first<{
+              id: string;
+              submission_id: string;
+              course_id: string;
+              section_id: string | null;
+              submitter_email: string | null;
+            }>();
+          if (!deadletter) {
+            return errorResponse(404, "not_found", requestId, corsHeaders);
+          }
+          const submission = await env.DB.prepare(
+            "SELECT form_id,payload_json FROM submissions WHERE id=?"
+          )
+            .bind(deadletter.submission_id)
+            .first<{ form_id: string; payload_json: string }>();
+          if (!submission) {
+            return errorResponse(404, "not_found", requestId, corsHeaders);
+          }
+          let payloadData: Record<string, unknown> | null = null;
+          try {
+            const payload = JSON.parse(submission.payload_json) as { data?: Record<string, unknown> };
+            if (payload?.data && typeof payload.data === "object") {
+              payloadData = payload.data as Record<string, unknown>;
+            }
+          } catch {
+            payloadData = null;
+          }
+          const submitterName = pickNameFromPayload(payloadData);
+          await env.DB.prepare(
+            "INSERT INTO canvas_enroll_queue (id, submission_id, form_id, course_id, section_id, submitter_name, submitter_email, attempts, last_error, next_run_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"
+          )
+            .bind(
+              crypto.randomUUID(),
+              deadletter.submission_id,
+              submission.form_id,
+              deadletter.course_id,
+              deadletter.section_id,
+              submitterName,
+              deadletter.submitter_email,
+              0,
+              "retry_from_deadletter"
+            )
+            .run();
+          await env.DB.prepare("DELETE FROM canvas_enroll_deadletters WHERE id=?")
+            .bind(entryId)
+            .run();
+          return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+        }
+
+        const updated = await env.DB.prepare(
+          "UPDATE canvas_enroll_queue SET next_run_at=datetime('now') WHERE id=?"
+        )
+          .bind(entryId)
+          .run();
+        if (updated.meta.changes === 0) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+
+      const dropMatch = url.pathname.match(/^\/api\/admin\/canvas\/retry-queue\/([^/]+)\/drop$/);
+      if (request.method === "POST" && dropMatch) {
+        const entryId = decodeURIComponent(dropMatch[1]);
+        const source = (url.searchParams.get("source") || "queue").trim();
+        const table = source === "deadletter" ? "canvas_enroll_deadletters" : "canvas_enroll_queue";
+        const result = await env.DB.prepare(`DELETE FROM ${table} WHERE id=?`)
+          .bind(entryId)
+          .run();
+        if (result.meta.changes === 0) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/admin/canvas/user-lookup") {
+        const email = (url.searchParams.get("email") || "").trim();
+        const courseId = (url.searchParams.get("courseId") || "").trim();
+        if (!email) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "email",
+            message: "required"
+          });
+        }
+        if (!courseId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "courseId",
+            message: "required"
+          });
+        }
+        const user = await canvasFindUserByEmailInCourse(env, courseId, email);
+        if (!user.id) {
+          return errorResponse(404, "not_found", requestId, corsHeaders, {
+            message: user.error || "not_found"
+          });
+        }
+        return jsonResponse(
+          200,
+          {
+            ok: true,
+            requestId,
+            user: {
+              id: user.id,
+              full_name: user.name ?? null,
+              display_name: user.shortName ?? null,
+              sortable_name: user.sortableName ?? null,
+              pronouns: user.pronouns ?? null,
+              email: user.email ?? null
+            }
+          },
+          requestId,
+          corsHeaders
+        );
+      }
+      if (request.method === "GET" && url.pathname === "/api/admin/routines") {
+        const { results } = await env.DB.prepare(
+          "SELECT id,name,cron,enabled,last_run_at,last_status,last_error,last_log_id FROM routine_tasks ORDER BY id"
+        ).all<RoutineTaskRow>();
+        return jsonResponse(200, { data: results, requestId }, requestId, corsHeaders);
+      }
+      if (request.method === "GET" && url.pathname === "/api/admin/routines/logs") {
+        const taskId = url.searchParams.get("taskId")?.trim() || "";
+        const limit = Math.min(Math.max(toNumber(url.searchParams.get("limit"), 20), 1), 200);
+        if (!taskId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "taskId is required"
+          });
+        }
+        const { results } = await env.DB.prepare(
+          "SELECT id,task_id,run_at,status,message FROM routine_task_runs WHERE task_id=? ORDER BY run_at DESC LIMIT ?"
+        )
+          .bind(taskId, limit)
+          .all();
+        return jsonResponse(200, { data: results, requestId }, requestId, corsHeaders);
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/routines/logs/clear") {
+        let body: { taskId?: string } | null = null;
+        try {
+          body = await parseJsonBody(request);
+        } catch (error) {
+          return errorResponse(400, "invalid_json", requestId, corsHeaders);
+        }
+        const taskId = body?.taskId?.trim();
+        if (!taskId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "taskId is required"
+          });
+        }
+        await env.DB.prepare("DELETE FROM routine_task_runs WHERE task_id=?")
+          .bind(taskId)
+          .run();
+        await env.DB.prepare(
+          "UPDATE routine_tasks SET last_log_id=NULL, last_run_at=NULL, last_status=NULL, last_error=NULL WHERE id=?"
+        )
+          .bind(taskId)
+          .run();
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/routines") {
+        let body: { id?: string; cron?: string; enabled?: boolean } | null = null;
+        try {
+          body = await parseJsonBody(request);
+        } catch (error) {
+          return errorResponse(400, "invalid_json", requestId, corsHeaders);
+        }
+        const id = body?.id?.trim();
+        const cron = typeof body?.cron === "string" ? body?.cron.trim() : "";
+        if (!id || !cron) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "id and cron are required"
+          });
+        }
+        const enabled = body?.enabled === false ? 0 : 1;
+        const existing = await env.DB.prepare("SELECT id FROM routine_tasks WHERE id=?")
+          .bind(id)
+          .first<{ id: string }>();
+        if (!existing?.id) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        await env.DB.prepare(
+          "UPDATE routine_tasks SET cron=?, enabled=?, updated_at=datetime('now') WHERE id=?"
+        )
+          .bind(cron, enabled, id)
+          .run();
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/routines/run") {
+        let body: { id?: string } | null = null;
+        try {
+          body = await parseJsonBody(request);
+        } catch (error) {
+          return errorResponse(400, "invalid_json", requestId, corsHeaders);
+        }
+        const id = body?.id?.trim();
+        if (!id) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "id is required"
+          });
+        }
+        const existing = await env.DB.prepare("SELECT id FROM routine_tasks WHERE id=?")
+          .bind(id)
+          .first<{ id: string }>();
+        if (!existing?.id) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        await runRoutineTaskById(env, id);
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+
+      const canvasRegistrationMatch = url.pathname.match(
+        /^\/api\/admin\/canvas\/registrations\/([^/]+)\/(deactivate|delete|reactivate)$/
+      );
+      if (request.method === "POST" && canvasRegistrationMatch) {
+        const submissionId = decodeURIComponent(canvasRegistrationMatch[1] || "").trim();
+        const task = canvasRegistrationMatch[2] as "deactivate" | "delete" | "reactivate";
+        if (!submissionId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "submissionId",
+            message: "required"
+          });
+        }
+        const submission = await env.DB.prepare(
+          "SELECT s.id,s.form_id,s.user_id,s.payload_json,s.canvas_course_id,s.canvas_section_id,COALESCE(s.submitter_email,(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_email,f.canvas_enabled,f.canvas_course_id as form_canvas_course_id FROM submissions s LEFT JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL"
+        )
+          .bind(submissionId)
+          .first<{
+            id: string;
+            form_id: string | null;
+            user_id: string | null;
+            payload_json: string;
+            canvas_course_id: string | null;
+            canvas_section_id: string | null;
+            submitter_email: string | null;
+            canvas_enabled: number | null;
+            form_canvas_course_id: string | null;
+          }>();
+        if (!submission) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        const courseId = submission.canvas_course_id || submission.form_canvas_course_id || null;
+        if (!courseId && task !== "delete") {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        let payloadData: Record<string, unknown> | null = null;
+        try {
+          const payload = JSON.parse(submission.payload_json) as { data?: Record<string, unknown> };
+          if (payload?.data && typeof payload.data === "object") {
+            payloadData = payload.data as Record<string, unknown>;
+          }
+        } catch {
+          payloadData = null;
+        }
+        const email =
+          (typeof payloadData?.email === "string" && payloadData.email.trim()) ||
+          submission.submitter_email ||
+          null;
+        if (!email) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "email",
+            message: "required"
+          });
+        }
+        if (task === "reactivate") {
+          const enrollment = await canvasFindEnrollmentByEmail(env, courseId, email);
+          if (!enrollment.id) {
+            return errorResponse(500, "canvas_update_failed", requestId, corsHeaders, {
+              message: enrollment.error || "enrollment_not_found"
+            });
+          }
+          const result = await canvasReactivateEnrollment(env, courseId, enrollment.id);
+          if (!result.ok) {
+            return errorResponse(500, "canvas_update_failed", requestId, corsHeaders, {
+              message: result.error || "canvas_update_failed"
+            });
+          }
+          await env.DB.prepare(
+            "UPDATE submissions SET canvas_enroll_status=?, canvas_enroll_error=?, canvas_user_id=? WHERE id=?"
+          )
+            .bind("invited", "canvas_reactivate", enrollment.canvasUserId ?? null, submissionId)
+            .run();
+          return jsonResponse(
+            200,
+            { ok: true, status: "invited", requestId },
+            requestId,
+            corsHeaders
+          );
+        }
+        if (task === "delete" && !courseId) {
+          await updateSubmissionsSoftDelete(env, "id=?", [submissionId], authPayload?.userId ?? null, "user_deleted");
+          return jsonResponse(
+            200,
+            { ok: true, status: "deleted", requestId },
+            requestId,
+            corsHeaders
+          );
+        }
+        const result = await canvasApplyEnrollmentTaskByEmail(env, courseId, email, task);
+        if (!result.ok) {
+          return errorResponse(500, "canvas_update_failed", requestId, corsHeaders, {
+            message: result.error || "canvas_update_failed"
+          });
+        }
+        await env.DB.prepare(
+          "UPDATE submissions SET canvas_enroll_status=?, canvas_enroll_error=? WHERE id=?"
+        )
+          .bind(task === "delete" ? "deleted" : "deactivated", `canvas_${task}`, submissionId)
+          .run();
+        return jsonResponse(
+          200,
+          {
+            ok: true,
+            status: task === "delete" ? "deleted" : "deactivated",
+            requestId
+          },
+          requestId,
+          corsHeaders
+        );
+      }
+
+      const canvasSubmissionDeleteMatch = url.pathname.match(
+        /^\/api\/admin\/canvas\/registrations\/([^/]+)\/submission-delete$/
+      );
+      if (request.method === "POST" && canvasSubmissionDeleteMatch) {
+        const submissionId = decodeURIComponent(canvasSubmissionDeleteMatch[1] || "").trim();
+        if (!submissionId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "submissionId",
+            message: "required"
+          });
+        }
+        await softDeleteSubmissionById(env, submissionId, authPayload?.userId ?? null, "admin_delete");
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+
+      const canvasReinviteMatch = url.pathname.match(
+        /^\/api\/admin\/canvas\/registrations\/([^/]+)\/reinvite$/
+      );
+      if (request.method === "POST" && canvasReinviteMatch) {
+        const submissionId = decodeURIComponent(canvasReinviteMatch[1] || "").trim();
+        if (!submissionId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "submissionId",
+            message: "required"
+          });
+        }
+        const submission = await env.DB.prepare(
+          "SELECT s.id,s.form_id,s.user_id,s.payload_json,s.canvas_course_id,s.canvas_section_id,s.submitter_email,f.canvas_enabled,f.canvas_course_id as form_canvas_course_id FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL"
+        )
+          .bind(submissionId)
+          .first<{
+            id: string;
+            form_id: string;
+            user_id: string | null;
+            payload_json: string;
+            canvas_course_id: string | null;
+            canvas_section_id: string | null;
+            submitter_email: string | null;
+            canvas_enabled: number | null;
+            form_canvas_course_id: string | null;
+          }>();
+        if (!submission) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        const courseId = submission.canvas_course_id || submission.form_canvas_course_id;
+        if (!toBoolean(submission.canvas_enabled) || !courseId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "canvas_not_configured"
+          });
+        }
+        let payloadData: Record<string, unknown> | null = null;
+        try {
+          const payload = JSON.parse(submission.payload_json) as { data?: Record<string, unknown> };
+          if (payload?.data && typeof payload.data === "object") {
+            payloadData = payload.data as Record<string, unknown>;
+          }
+        } catch {
+          payloadData = null;
+        }
+        const nameFromPayload =
+          (typeof payloadData?.full_name === "string" && payloadData.full_name.trim()) ||
+          (typeof payloadData?.name === "string" && payloadData.name.trim()) ||
+          "";
+        let email =
+          typeof payloadData?.email === "string" && payloadData.email.trim()
+            ? payloadData.email.trim()
+            : submission.submitter_email || "";
+        if (!email && submission.user_id) {
+          const primary = await getUserPrimaryEmail(env, submission.user_id);
+          email = primary || "";
+        }
+        const name = nameFromPayload || (email ? titleCaseFromEmail(email) : "");
+        if (!email) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "email",
+            message: "required"
+          });
+        }
+        const form = { canvas_enabled: 1, canvas_course_id: courseId };
+        const enrollment = await handleCanvasEnrollment(
+          env,
+          form,
+          name,
+          email,
+          submission.canvas_section_id ?? null
+        );
+        await env.DB.prepare(
+          "UPDATE submissions SET canvas_enroll_status=?, canvas_enroll_error=?, canvas_course_id=?, canvas_section_id=?, canvas_enrolled_at=?, canvas_user_id=?, canvas_user_name=? WHERE id=?"
+        )
+          .bind(
+            enrollment.status,
+            enrollment.error,
+            courseId,
+            enrollment.sectionId,
+            enrollment.enrolledAt,
+            enrollment.canvasUserId ?? null,
+            enrollment.canvasUserName ?? null,
+            submissionId
+          )
+          .run();
+        return jsonResponse(
+          200,
+          {
+            ok: true,
+            status: enrollment.status,
+            error: enrollment.error,
+            requestId
+          },
+          requestId,
+          corsHeaders
+        );
+      }
+
+      const canvasNotifyMatch = url.pathname.match(
+        /^\/api\/admin\/canvas\/registrations\/([^/]+)\/notify$/
+      );
+      if (request.method === "POST" && canvasNotifyMatch) {
+        const submissionId = decodeURIComponent(canvasNotifyMatch[1] || "").trim();
+        if (!submissionId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "submissionId",
+            message: "required"
+          });
+        }
+        const submission = await env.DB.prepare(
+          "SELECT s.id,s.payload_json,s.canvas_course_id,s.canvas_section_id,s.canvas_user_id,s.canvas_user_name,COALESCE(s.submitter_email,(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_email,f.title as form_title,f.slug as form_slug FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL"
+        )
+          .bind(submissionId)
+          .first<{
+            id: string;
+            payload_json: string;
+            canvas_course_id: string | null;
+            canvas_section_id: string | null;
+            canvas_user_id: string | null;
+            canvas_user_name: string | null;
+            submitter_email: string | null;
+            form_title: string | null;
+            form_slug: string | null;
+          }>();
+        if (!submission) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        let payloadData: Record<string, unknown> | null = null;
+        try {
+          const payload = JSON.parse(submission.payload_json) as { data?: Record<string, unknown> };
+          if (payload?.data && typeof payload.data === "object") {
+            payloadData = payload.data as Record<string, unknown>;
+          }
+        } catch {
+          payloadData = null;
+        }
+        const submittedName = pickNameFromPayload(payloadData);
+        const email =
+          (typeof payloadData?.email === "string" && payloadData.email.trim()) ||
+          submission.submitter_email ||
+          null;
+        if (!email) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "email",
+            message: "required"
+          });
+        }
+        const canvasUserName = submission.canvas_user_name || null;
+        let courseTitle: string | null = null;
+        let courseCode: string | null = null;
+        let sectionName: string | null = null;
+        if (submission.canvas_course_id) {
+          const courseRow = await env.DB.prepare(
+            "SELECT name, code FROM canvas_courses_cache WHERE id=?"
+          )
+            .bind(submission.canvas_course_id)
+            .first<{ name: string | null; code: string | null }>();
+          courseTitle = courseRow?.name ?? null;
+          courseCode = courseRow?.code ?? null;
+        }
+        if (submission.canvas_course_id && submission.canvas_section_id) {
+          const sectionRow = await env.DB.prepare(
+            "SELECT name FROM canvas_sections_cache WHERE id=?"
+          )
+            .bind(submission.canvas_section_id)
+            .first<{ name: string | null }>();
+          sectionName = sectionRow?.name ?? null;
+        }
+        const courseLabel = courseTitle
+          ? `${courseTitle}${courseCode ? ` (${courseCode})` : ""}`
+          : submission.canvas_course_id
+          ? `Course ${submission.canvas_course_id}`
+          : null;
+        const sectionLabel = sectionName
+          ? sectionName
+          : submission.canvas_section_id
+          ? `Section ${submission.canvas_section_id}`
+          : null;
+        const baseWeb = env.BASE_URL_WEB ? String(env.BASE_URL_WEB).replace(/\/$/, "") : "";
+        const formLink =
+          baseWeb && submission.form_slug ? `${baseWeb}/#/f/${submission.form_slug}` : null;
+        const message = buildCanvasNameAlertMessage({
+          submittedName: submittedName || titleCaseFromEmail(email),
+          canvasName: canvasUserName,
+          formLink
+        });
+        const result = await sendGmailMessage(env, {
+          to: email,
+          subject: message.subject,
+          body: message.body
+        });
+        await logEmailSend(env, {
+          to: email,
+          subject: message.subject,
+          body: message.body,
+          status: result.ok ? "sent" : "failed",
+          error: result.ok ? null : result.error || "send_failed",
+          submissionId,
+          formSlug: submission.form_slug ?? null,
+          formTitle: submission.form_title ?? null,
+          canvasCourseId: submission.canvas_course_id ?? null,
+          canvasSectionId: submission.canvas_section_id ?? null,
+          triggeredBy: adminPayload?.userId ?? null,
+          triggerSource: "manual"
+        });
+        if (!result.ok) {
+          return errorResponse(500, "email_send_failed", requestId, corsHeaders, {
+            message: result.error || "send_failed"
+          });
+        }
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/admin/emails") {
+        const page = Math.max(toNumber(url.searchParams.get("page"), 1), 1);
+        const pageSize = Math.min(Math.max(toNumber(url.searchParams.get("pageSize"), 50), 1), 200);
+        const status = (url.searchParams.get("status") || "").trim();
+        const email = (url.searchParams.get("email") || "").trim();
+        const submissionId = (url.searchParams.get("submissionId") || "").trim();
+        const includeBody = url.searchParams.get("includeBody") === "1";
+        const where: string[] = [];
+        const params: Array<string | number> = [];
+        if (status) {
+          where.push("status=?");
+          params.push(status);
+        }
+        if (email) {
+          where.push("to_email LIKE ?");
+          params.push(`%${email}%`);
+        }
+        if (submissionId) {
+          where.push("submission_id=?");
+          params.push(submissionId);
+        }
+        where.push("deleted_at IS NULL");
+        const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+        const totalRow = await env.DB.prepare(
+          `SELECT COUNT(1) as total FROM email_logs ${whereClause}`
+        )
+          .bind(...params)
+          .first<{ total: number }>();
+        const total = totalRow?.total ?? 0;
+        const limit = pageSize;
+        const offset = (page - 1) * pageSize;
+        const selectFields = includeBody
+          ? "id,to_email,subject,body,status,error,submission_id,form_slug,form_title,canvas_course_id,canvas_section_id,triggered_by,trigger_source,created_at"
+          : "id,to_email,subject,status,error,submission_id,form_slug,form_title,canvas_course_id,canvas_section_id,triggered_by,trigger_source,created_at";
+        const { results } = await env.DB.prepare(
+          `SELECT ${selectFields} FROM email_logs ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+        )
+          .bind(...params, limit, offset)
+          .all();
+        return jsonResponse(
+          200,
+          { data: results, page, pageSize, total, requestId },
+          requestId,
+          corsHeaders
+        );
+      }
+
+      const adminEmailDeleteMatch = url.pathname.match(/^\/api\/admin\/emails\/([^/]+)$/);
+      if (request.method === "DELETE" && adminEmailDeleteMatch) {
+        const emailId = decodeURIComponent(adminEmailDeleteMatch[1] || "").trim();
+        if (!emailId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "id",
+            message: "required"
+          });
+        }
+        await env.DB.prepare(
+          "UPDATE email_logs SET deleted_at=datetime('now'), deleted_by=?, deleted_reason=? WHERE id=? AND deleted_at IS NULL"
+        )
+          .bind(adminPayload?.userId ?? null, "admin_deleted", emailId)
+          .run();
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/emails/test") {
+        let body: { to?: string; subject?: string; body?: string } | null = null;
+        try {
+          body = await parseJsonBody(request);
+        } catch {
+          body = null;
+        }
+        const to = typeof body?.to === "string" ? body.to.trim() : "";
+        const subject =
+          typeof body?.subject === "string" && body.subject.trim()
+            ? body.subject.trim()
+            : "Test email from Form App";
+        const bodyText =
+          typeof body?.body === "string" && body.body.trim()
+            ? body.body.trim()
+            : "This is a test email from Form App.";
+        if (!to) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "to",
+            message: "required"
+          });
+        }
+        const result = await sendGmailMessage(env, { to, subject, body: bodyText });
+        if (!result.ok) {
+          console.error("email_test_failed", result.error || "send_failed");
+        }
+        await logEmailSend(env, {
+          to,
+          subject,
+          body: bodyText,
+          status: result.ok ? "sent" : "failed",
+          error: result.ok ? null : result.error || "send_failed",
+          triggeredBy: adminPayload?.userId ?? null,
+          triggerSource: "manual"
+        });
+        if (!result.ok) {
+          return errorResponse(500, "email_send_failed", requestId, corsHeaders, {
+            message: result.error || "send_failed"
+          });
+        }
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+
+      const canvasSectionsMatch = url.pathname.match(/^\/api\/admin\/canvas\/courses\/([^/]+)\/sections$/);
+      if (request.method === "GET" && canvasSectionsMatch) {
+        const courseId = decodeURIComponent(canvasSectionsMatch[1] || "").trim();
+        const q = (url.searchParams.get("q") || "").trim();
+        const page = Math.max(toNumber(url.searchParams.get("page"), 1), 1);
+        const pageSize = Math.min(Math.max(toNumber(url.searchParams.get("pageSize"), 50), 1), 200);
+        const limit = pageSize;
+        const offset = (page - 1) * pageSize;
+        const like = `%${q}%`;
+        const totalRow = await env.DB.prepare(
+          "SELECT COUNT(1) as total FROM canvas_sections_cache WHERE course_id=? AND (?='' OR name LIKE ?)"
+        )
+          .bind(courseId, q, like)
+          .first<{ total: number }>();
+        const total = totalRow?.total ?? 0;
+        const { results } = await env.DB.prepare(
+          "SELECT id,course_id,name,updated_at FROM canvas_sections_cache WHERE course_id=? AND (?='' OR name LIKE ?) ORDER BY name LIMIT ? OFFSET ?"
+        )
+          .bind(courseId, q, like, limit, offset)
+          .all();
+        return jsonResponse(
+          200,
+          { data: results, page, pageSize, total, needsSync: total === 0, requestId },
+          requestId,
+          corsHeaders
+        );
+      }
+
+
+      if (request.method === "POST" && url.pathname === "/api/admin/canvas/sync") {
+        let body: { mode?: string; courseId?: string } | null = null;
+        try {
+          body = await parseJsonBody(request);
+        } catch (error) {
+          return errorResponse(400, "invalid_json", requestId, corsHeaders);
+        }
+        const mode = (body?.mode || "").toLowerCase();
+        const courseId = body?.courseId?.trim();
+        if (!env.CANVAS_API_TOKEN) {
+          return errorResponse(500, "canvas_not_configured", requestId, corsHeaders);
+        }
+        let coursesSynced = 0;
+        let sectionsSynced = 0;
+        try {
+          if (mode === "courses") {
+            coursesSynced = await syncCanvasCourses(env);
+          } else if (mode === "course_sections") {
+            if (!courseId) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "courseId",
+                message: "required"
+              });
+            }
+            sectionsSynced = await syncCanvasSections(env, courseId);
+          } else if (mode === "all") {
+            coursesSynced = await syncCanvasCourses(env);
+            const { results } = await env.DB.prepare(
+              "SELECT DISTINCT canvas_course_id as course_id FROM forms WHERE canvas_enabled=1 AND canvas_course_id IS NOT NULL AND deleted_at IS NULL"
+            ).all<{ course_id: string | null }>();
+            const courseIds = results.map((row) => row.course_id).filter(Boolean) as string[];
+            for (const id of courseIds) {
+              sectionsSynced += await syncCanvasSections(env, id);
+            }
+          } else {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "mode",
+              allowed: ["courses", "course_sections", "all"]
+            });
+          }
+        } catch (error) {
+          return errorResponse(500, "canvas_sync_failed", requestId, corsHeaders, {
+            message: String((error as Error | undefined)?.message || error)
+          });
+        }
+        return jsonResponse(
+          200,
+          { ok: true, coursesSynced, sectionsSynced, requestId },
+          requestId,
+          corsHeaders
+        );
+      }
+
       if (request.method === "GET" && url.pathname === "/api/admin/forms") {
         const { results } = await env.DB.prepare(
-          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,t.key as templateKey FROM forms f LEFT JOIN templates t ON t.id=f.template_id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC"
+          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,t.key as templateKey FROM forms f LEFT JOIN templates t ON t.id=f.template_id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC"
         ).all<AdminFormRow>();
 
         const data = results.map((row) => ({
@@ -3531,10 +6566,82 @@ export default {
           is_locked: toBoolean(row.is_locked),
           is_public: toBoolean(row.is_public),
           auth_policy: row.auth_policy,
-          templateKey: row.templateKey
+          templateKey: row.templateKey,
+          canvas_enabled: toBoolean(row.canvas_enabled),
+          canvas_course_id: row.canvas_course_id ?? null,
+          canvas_allowed_section_ids_json: row.canvas_allowed_section_ids_json ?? null,
+          canvas_fields_position: row.canvas_fields_position ?? "bottom"
         }));
 
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
+      }
+
+      const formBackupMatch = url.pathname.match(/^\/api\/admin\/forms\/([^/]+)\/backup$/);
+      if (request.method === "GET" && formBackupMatch) {
+        const slug = decodeURIComponent(formBackupMatch[1]);
+        const formRow = await env.DB.prepare(
+          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.file_rules_json,t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+        )
+          .bind(slug)
+          .first<{
+            id: string;
+            slug: string;
+            title: string;
+            description: string | null;
+            is_locked: number;
+            is_public: number;
+            auth_policy: string | null;
+            canvas_enabled: number | null;
+            canvas_course_id: string | null;
+            canvas_allowed_section_ids_json: string | null;
+            canvas_fields_position: string | null;
+            file_rules_json: string | null;
+            template_key: string | null;
+            template_name: string | null;
+            template_schema_json: string | null;
+            template_file_rules_json: string | null;
+            form_schema_json: string | null;
+          }>();
+        if (!formRow) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        const parseSchema = (value: string | null) => {
+          if (!value) return null;
+          try {
+            return JSON.parse(value);
+          } catch {
+            return value;
+          }
+        };
+        const payload = {
+          type: "form",
+          form: {
+            slug: formRow.slug,
+            title: formRow.title,
+            description: formRow.description ?? null,
+            is_locked: toBoolean(formRow.is_locked),
+            is_public: toBoolean(formRow.is_public),
+            auth_policy: formRow.auth_policy ?? "optional",
+            templateKey: formRow.template_key ?? null,
+            file_rules_json: formRow.file_rules_json ?? null,
+            schema_json: parseSchema(formRow.form_schema_json || formRow.template_schema_json),
+            canvas_enabled: toBoolean(formRow.canvas_enabled),
+            canvas_course_id: formRow.canvas_course_id ?? null,
+            canvas_allowed_section_ids_json: formRow.canvas_allowed_section_ids_json ?? null,
+            canvas_fields_position: formRow.canvas_fields_position ?? "bottom"
+          }
+        };
+        const body = JSON.stringify({ data: payload, requestId });
+        return new Response(body, {
+          status: 200,
+          headers: {
+            ...corsHeaders,
+            "content-type": "application/json; charset=utf-8",
+            "content-disposition": `attachment; filename="${formRow.slug}.form.json"`,
+            "access-control-expose-headers": "Content-Disposition",
+            "x-request-id": requestId
+          }
+        });
       }
 
       if (request.method === "GET" && url.pathname === "/api/admin/templates") {
@@ -3548,6 +6655,45 @@ export default {
           created_at: row.created_at
         }));
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
+      }
+
+      const templateBackupMatch = url.pathname.match(/^\/api\/admin\/templates\/([^/]+)\/backup$/);
+      if (request.method === "GET" && templateBackupMatch) {
+        const key = decodeURIComponent(templateBackupMatch[1]);
+        const template = await env.DB.prepare(
+          "SELECT id,key,name,schema_json,file_rules_json FROM templates WHERE key=? AND deleted_at IS NULL"
+        )
+          .bind(key)
+          .first<{
+            id: string;
+            key: string;
+            name: string;
+            schema_json: string;
+            file_rules_json: string | null;
+          }>();
+        if (!template) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        const payload = {
+          type: "template",
+          template: {
+            key: template.key,
+            name: template.name,
+            schema_json: template.schema_json,
+            file_rules_json: template.file_rules_json ?? "{}"
+          }
+        };
+        const body = JSON.stringify({ data: payload, requestId });
+        return new Response(body, {
+          status: 200,
+          headers: {
+            ...corsHeaders,
+            "content-type": "application/json; charset=utf-8",
+            "content-disposition": `attachment; filename="${template.key}.template.json"`,
+            "access-control-expose-headers": "Content-Disposition",
+            "x-request-id": requestId
+          }
+        });
       }
 
       if (request.method === "POST" && url.pathname === "/api/admin/templates") {
@@ -3666,6 +6812,7 @@ export default {
 
           const updates: string[] = [];
           const params: Array<string | number | null> = [];
+          let canvasWarning: string | null = null;
           if (body?.name && typeof body.name === "string") {
             updates.push("name=?");
             params.push(body.name.trim());
@@ -3748,6 +6895,32 @@ export default {
         }
       }
 
+      const userPromoteMatch = url.pathname.match(/^\/api\/admin\/users\/([^/]+)\/promote$/);
+      if (request.method === "POST" && userPromoteMatch) {
+        const userId = decodeURIComponent(userPromoteMatch[1]);
+        if (!userId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "userId",
+            message: "required"
+          });
+        }
+        const userRow = await env.DB.prepare(
+          "SELECT id, is_admin FROM users WHERE id=? AND deleted_at IS NULL"
+        )
+          .bind(userId)
+          .first<{ id: string; is_admin: number | null }>();
+        if (!userRow) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        if (toBoolean(userRow.is_admin)) {
+          return jsonResponse(200, { ok: true, alreadyAdmin: true, requestId }, requestId, corsHeaders);
+        }
+        await env.DB.prepare("UPDATE users SET is_admin=1 WHERE id=?")
+          .bind(userId)
+          .run();
+        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+
       if (request.method === "GET" && url.pathname === "/api/admin/trash") {
         const type = (url.searchParams.get("type") || "all").toLowerCase();
         const page = Math.max(toNumber(url.searchParams.get("page"), 1), 1);
@@ -3827,6 +7000,20 @@ export default {
           data.files = results;
         }
 
+        if (type === "all" || type === "emails") {
+          const total = await env.DB.prepare(
+            "SELECT COUNT(1) as total FROM email_logs WHERE deleted_at IS NOT NULL"
+          )
+            .first<{ total: number }>();
+          totals.emails = total?.total ?? 0;
+          const { results } = await env.DB.prepare(
+            "SELECT id,to_email,subject,status,error,submission_id,form_slug,form_title,deleted_at,deleted_by,deleted_reason,(SELECT email FROM user_identities ui WHERE ui.user_id=deleted_by ORDER BY ui.created_at DESC LIMIT 1) as deleted_by_email FROM email_logs WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ? OFFSET ?"
+          )
+            .bind(limit, offset)
+            .all();
+          data.emails = results;
+        }
+
         return jsonResponse(200, { data, totals, page, pageSize, requestId }, requestId, corsHeaders);
       }
 
@@ -3845,6 +7032,8 @@ export default {
           });
         }
         let ok = false;
+        let canvasWarning: string | null = null;
+        let canvasAction: string | null = null;
         if (type === "form") {
           ok = await restoreForm(env, id);
         } else if (type === "template") {
@@ -3852,15 +7041,97 @@ export default {
         } else if (type === "user") {
           ok = await restoreUser(env, id);
         } else if (type === "submission") {
-          ok = await restoreSubmission(env, id);
+          const result = await restoreSubmission(env, id);
+          ok = result.ok;
+          canvasWarning = result.canvasError || null;
+          canvasAction = result.canvasStatus || null;
         } else if (type === "file") {
           ok = await restoreFileItem(env, id);
+        } else if (type === "email") {
+          await env.DB.prepare("UPDATE email_logs SET deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?")
+            .bind(id)
+            .run();
+          ok = true;
         } else {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             message: "unsupported_type"
           });
         }
-        return jsonResponse(200, { ok, requestId }, requestId, corsHeaders);
+        return jsonResponse(
+          200,
+          { ok, canvasWarning, canvasAction, requestId },
+          requestId,
+          corsHeaders
+        );
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/templates/restore") {
+        let body: { type?: string; template?: any } | null = null;
+        try {
+          body = await parseJsonBody(request);
+        } catch (error) {
+          return errorResponse(400, "invalid_json", requestId, corsHeaders);
+        }
+        if (!body || body.type !== "template" || !body.template) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "invalid_backup"
+          });
+        }
+        const tpl = body.template;
+        if (!tpl.key || !tpl.name || tpl.schema_json === undefined) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "missing_template_fields"
+          });
+        }
+        let parsedSchema: unknown = null;
+        try {
+          parsedSchema =
+            typeof tpl.schema_json === "string" ? JSON.parse(tpl.schema_json) : tpl.schema_json;
+        } catch (error) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "schema_json",
+            message: "invalid_json"
+          });
+        }
+        const ruleError = validateFileRulesFromSchema(parsedSchema);
+        if (ruleError) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "schema_json",
+            message: "invalid_file_rules",
+            detail: ruleError
+          });
+        }
+        const fileRulesJson = buildFileRulesJsonFromSchema(JSON.stringify(parsedSchema));
+        const existing = await env.DB.prepare(
+          "SELECT id, deleted_at FROM templates WHERE key=?"
+        )
+          .bind(tpl.key)
+          .first<{ id: string; deleted_at: string | null }>();
+        if (existing?.id && existing.deleted_at && !body?.restoreTrash) {
+          return errorResponse(409, "conflict", requestId, corsHeaders, {
+            message: "slug_in_trash"
+          });
+        }
+        if (existing?.id) {
+          await env.DB.prepare(
+            "UPDATE templates SET name=?, schema_json=?, file_rules_json=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+          )
+            .bind(tpl.name, JSON.stringify(parsedSchema), fileRulesJson ?? "{}", existing.id)
+            .run();
+          return jsonResponse(
+            200,
+            { ok: true, updated: true, restored: Boolean(existing.deleted_at), requestId },
+            requestId,
+            corsHeaders
+          );
+        }
+        const templateId = crypto.randomUUID();
+        await env.DB.prepare(
+          "INSERT INTO templates (id, key, name, schema_json, file_rules_json) VALUES (?, ?, ?, ?, ?)"
+        )
+          .bind(templateId, tpl.key, tpl.name, JSON.stringify(parsedSchema), fileRulesJson ?? "{}")
+          .run();
+        return jsonResponse(201, { ok: true, created: true, requestId }, requestId, corsHeaders);
       }
 
       if (request.method === "POST" && url.pathname === "/api/admin/trash/purge") {
@@ -3888,6 +7159,11 @@ export default {
           ok = await hardDeleteSubmission(env, id);
         } else if (type === "file") {
           ok = await hardDeleteFileItem(env, id);
+        } else if (type === "email") {
+          await env.DB.prepare("DELETE FROM email_logs WHERE id=?")
+            .bind(id)
+            .run();
+          ok = true;
         } else {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             message: "unsupported_type"
@@ -3960,7 +7236,339 @@ export default {
             }
           }
         }
+        if (type === "all" || type === "emails") {
+          const { results } = await env.DB.prepare("SELECT id FROM email_logs WHERE deleted_at IS NOT NULL")
+            .all<{ id: string }>();
+          for (const row of results) {
+            if (row?.id) {
+              await env.DB.prepare("DELETE FROM email_logs WHERE id=?")
+                .bind(row.id)
+                .run();
+            }
+          }
+        }
         return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/forms/restore") {
+        let body: { type?: string; form?: any; template?: any } | null = null;
+        try {
+          body = await parseJsonBody(request);
+        } catch (error) {
+          return errorResponse(400, "invalid_json", requestId, corsHeaders);
+        }
+        if (!body || body.type !== "form" || !body.form) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "invalid_backup"
+          });
+        }
+        const form = body.form;
+        if (!form.slug || !form.title || !form.templateKey) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "missing_form_fields"
+          });
+        }
+        let templateId: string | null = null;
+        let templateSchemaJson: string | null = null;
+        let formSchemaJson: string | null = null;
+        let parsedFormSchema: unknown = null;
+        if (form.schema_json !== undefined && form.schema_json !== null) {
+          try {
+            parsedFormSchema =
+              typeof form.schema_json === "string" ? JSON.parse(form.schema_json) : form.schema_json;
+            formSchemaJson = JSON.stringify(parsedFormSchema);
+          } catch (error) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "schema_json",
+              message: "invalid_json"
+            });
+          }
+          const ruleError = validateFileRulesFromSchema(parsedFormSchema);
+          if (ruleError) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "schema_json",
+              message: "invalid_file_rules",
+              detail: ruleError
+            });
+          }
+        }
+        if (body.template?.key) {
+          const tpl = body.template;
+          let parsedSchema: unknown = null;
+          try {
+            parsedSchema =
+              typeof tpl.schema_json === "string" ? JSON.parse(tpl.schema_json) : tpl.schema_json;
+          } catch (error) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "schema_json",
+              message: "invalid_json"
+            });
+          }
+          const ruleError = validateFileRulesFromSchema(parsedSchema);
+          if (ruleError) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "schema_json",
+              message: "invalid_file_rules",
+              detail: ruleError
+            });
+          }
+          const fileRulesJson = buildFileRulesJsonFromSchema(JSON.stringify(parsedSchema));
+          const existingTpl = await env.DB.prepare(
+            "SELECT id FROM templates WHERE key=? AND deleted_at IS NULL"
+          )
+            .bind(tpl.key)
+            .first<{ id: string }>();
+          if (existingTpl?.id) {
+            templateId = existingTpl.id;
+            await env.DB.prepare(
+              "UPDATE templates SET name=?, schema_json=?, file_rules_json=? WHERE id=?"
+            )
+              .bind(
+                tpl.name || tpl.key,
+                JSON.stringify(parsedSchema),
+                fileRulesJson ?? "{}",
+                templateId
+              )
+              .run();
+          } else {
+            templateId = crypto.randomUUID();
+            await env.DB.prepare(
+              "INSERT INTO templates (id, key, name, schema_json, file_rules_json) VALUES (?, ?, ?, ?, ?)"
+            )
+              .bind(
+                templateId,
+                tpl.key,
+                tpl.name || tpl.key,
+                JSON.stringify(parsedSchema),
+                fileRulesJson ?? "{}"
+              )
+              .run();
+          }
+        } else {
+          const existingTpl = await env.DB.prepare(
+            "SELECT id, schema_json FROM templates WHERE key=? AND deleted_at IS NULL"
+          )
+            .bind(form.templateKey)
+            .first<{ id: string; schema_json: string }>();
+          if (existingTpl?.id) {
+            templateId = existingTpl.id;
+            templateSchemaJson = existingTpl.schema_json;
+          } else if (formSchemaJson) {
+            templateId = crypto.randomUUID();
+            await env.DB.prepare(
+              "INSERT INTO templates (id, key, name, schema_json, file_rules_json) VALUES (?, ?, ?, ?, ?)"
+            )
+              .bind(
+                templateId,
+                form.templateKey,
+                form.templateName || form.templateKey,
+                formSchemaJson,
+                buildFileRulesJsonFromSchema(formSchemaJson) ?? "{}"
+              )
+              .run();
+            templateSchemaJson = formSchemaJson;
+          } else {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "templateKey",
+              message: "template_not_found"
+            });
+          }
+        }
+
+        const existingForm = await env.DB.prepare(
+          "SELECT id, deleted_at FROM forms WHERE slug=?"
+        )
+          .bind(form.slug)
+          .first<{ id: string; deleted_at: string | null }>();
+
+        const authPolicy = form.auth_policy ?? "optional";
+        if (!["optional", "google", "github", "either", "required"].includes(authPolicy)) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "auth_policy",
+            allowed: ["optional", "google", "github", "either", "required"]
+          });
+        }
+
+        const isPublic = Boolean(form.is_public);
+        const isLocked = Boolean(form.is_locked);
+        const canvasEnabled = Boolean(form.canvas_enabled);
+        const canvasAllowed =
+          Array.isArray(form.canvas_allowed_section_ids_json)
+            ? JSON.stringify(form.canvas_allowed_section_ids_json)
+            : typeof form.canvas_allowed_section_ids_json === "string"
+            ? form.canvas_allowed_section_ids_json
+            : null;
+        const fileRulesJson = formSchemaJson
+          ? buildFileRulesJsonFromSchema(formSchemaJson)
+          : typeof form.file_rules_json === "string"
+          ? form.file_rules_json
+          : form.file_rules_json
+          ? JSON.stringify(form.file_rules_json)
+          : null;
+        const formVersionSchema = formSchemaJson || templateSchemaJson;
+
+        if (existingForm?.id && existingForm.deleted_at && !body?.restoreTrash) {
+          return errorResponse(409, "conflict", requestId, corsHeaders, {
+            message: "slug_in_trash"
+          });
+        }
+        if (existingForm?.id) {
+          await env.DB.prepare(
+            "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+          )
+            .bind(
+              form.title,
+              form.description ?? null,
+              templateId,
+              isPublic ? 1 : 0,
+              isLocked ? 1 : 0,
+              authPolicy,
+              fileRulesJson,
+              canvasEnabled ? 1 : 0,
+              form.canvas_course_id ?? null,
+              canvasAllowed ?? null,
+              form.canvas_fields_position ?? "bottom",
+              existingForm.id
+            )
+            .run();
+          if (formVersionSchema) {
+            const existingVersion = await env.DB.prepare(
+              "SELECT id FROM form_versions WHERE form_id=? AND version=1"
+            )
+              .bind(existingForm.id)
+              .first<{ id: string }>();
+            if (existingVersion?.id) {
+              await env.DB.prepare("UPDATE form_versions SET schema_json=? WHERE id=?")
+                .bind(formVersionSchema, existingVersion.id)
+                .run();
+            } else {
+              await env.DB.prepare(
+                "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
+              )
+                .bind(crypto.randomUUID(), existingForm.id, formVersionSchema)
+                .run();
+            }
+          }
+          return jsonResponse(
+            200,
+            { ok: true, updated: true, restored: Boolean(existingForm.deleted_at), requestId },
+            requestId,
+            corsHeaders
+          );
+        }
+
+        const formId = crypto.randomUUID();
+        await env.DB.prepare(
+          "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+          .bind(
+            formId,
+            form.slug,
+            form.title,
+            form.description ?? null,
+            templateId,
+            isPublic ? 1 : 0,
+            authPolicy,
+            fileRulesJson,
+            canvasEnabled ? 1 : 0,
+            form.canvas_course_id ?? null,
+            canvasAllowed ?? null,
+            form.canvas_fields_position ?? "bottom"
+          )
+          .run();
+        if (formVersionSchema) {
+          await env.DB.prepare(
+            "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
+          )
+            .bind(crypto.randomUUID(), formId, formVersionSchema)
+            .run();
+        }
+
+        return jsonResponse(201, { ok: true, created: true, requestId }, requestId, corsHeaders);
+      }
+      if (request.method === "POST" && url.pathname === "/api/admin/templates/from-form") {
+        let body: { type?: string; form?: any } | null = null;
+        try {
+          body = await parseJsonBody(request);
+        } catch (error) {
+          return errorResponse(400, "invalid_json", requestId, corsHeaders);
+        }
+        if (!body || body.type !== "form" || !body.form) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "invalid_backup"
+          });
+        }
+        const form = body.form;
+        const templateKey =
+          typeof form.templateKey === "string" && form.templateKey.trim()
+            ? form.templateKey.trim()
+            : typeof form.slug === "string" && form.slug.trim()
+            ? form.slug.trim()
+            : "";
+        if (!templateKey || form.schema_json === undefined || form.schema_json === null) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "missing_form_schema"
+          });
+        }
+        let parsedSchema: unknown = null;
+        try {
+          parsedSchema =
+            typeof form.schema_json === "string" ? JSON.parse(form.schema_json) : form.schema_json;
+        } catch (error) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "schema_json",
+            message: "invalid_json"
+          });
+        }
+        const ruleError = validateFileRulesFromSchema(parsedSchema);
+        if (ruleError) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "schema_json",
+            message: "invalid_file_rules",
+            detail: ruleError
+          });
+        }
+        const fileRulesJson = buildFileRulesJsonFromSchema(JSON.stringify(parsedSchema));
+        const existing = await env.DB.prepare(
+          "SELECT id, deleted_at FROM templates WHERE key=?"
+        )
+          .bind(templateKey)
+          .first<{ id: string; deleted_at: string | null }>();
+        if (existing?.id && existing.deleted_at && !body?.restoreTrash) {
+          return errorResponse(409, "conflict", requestId, corsHeaders, {
+            message: "slug_in_trash"
+          });
+        }
+        if (existing?.id) {
+          await env.DB.prepare(
+            "UPDATE templates SET name=?, schema_json=?, file_rules_json=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+          )
+            .bind(
+              form.templateName || form.title || templateKey,
+              JSON.stringify(parsedSchema),
+              fileRulesJson ?? "{}",
+              existing.id
+            )
+            .run();
+          return jsonResponse(
+            200,
+            { ok: true, updated: true, restored: Boolean(existing.deleted_at), requestId },
+            requestId,
+            corsHeaders
+          );
+        }
+        const templateId = crypto.randomUUID();
+        await env.DB.prepare(
+          "INSERT INTO templates (id, key, name, schema_json, file_rules_json) VALUES (?, ?, ?, ?, ?)"
+        )
+          .bind(
+            templateId,
+            templateKey,
+            form.templateName || form.title || templateKey,
+            JSON.stringify(parsedSchema),
+            fileRulesJson ?? "{}"
+          )
+          .run();
+        return jsonResponse(201, { ok: true, created: true, requestId }, requestId, corsHeaders);
       }
 
       if (request.method === "POST" && url.pathname === "/api/admin/forms") {
@@ -3972,6 +7580,10 @@ export default {
           is_public?: boolean;
           auth_policy?: string;
           file_rules?: unknown;
+          canvasEnabled?: boolean;
+          canvasCourseId?: string | null;
+          canvasAllowedSectionIds?: string[] | null;
+          canvasFieldsPosition?: string | null;
         } | null = null;
         try {
           body = await parseJsonBody(request);
@@ -4007,6 +7619,61 @@ export default {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             field: "is_public",
             message: "expected_boolean"
+          });
+        }
+
+        const canvasEnabled = Boolean(body.canvasEnabled);
+        let canvasWarning: string | null = null;
+        const canvasCourseId =
+          typeof body.canvasCourseId === "string" && body.canvasCourseId.trim()
+            ? body.canvasCourseId.trim()
+            : null;
+        const canvasAllowedSectionIds = Array.isArray(body.canvasAllowedSectionIds)
+          ? body.canvasAllowedSectionIds
+              .filter((id) => typeof id === "string")
+              .map((id) => id.trim())
+              .filter((id) => id.length > 0)
+          : null;
+        if (body.canvasAllowedSectionIds !== undefined && !Array.isArray(body.canvasAllowedSectionIds)) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "canvasAllowedSectionIds",
+            message: "expected_array"
+          });
+        }
+        if (canvasEnabled && !canvasCourseId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "canvasCourseId",
+            message: "required"
+          });
+        }
+        if (canvasEnabled && canvasCourseId && canvasAllowedSectionIds && canvasAllowedSectionIds.length > 0) {
+          const { results } = await env.DB.prepare(
+            "SELECT id FROM canvas_sections_cache WHERE course_id=?"
+          )
+            .bind(canvasCourseId)
+            .all<{ id: string }>();
+          if (results.length > 0) {
+            const allowedSet = new Set(results.map((row) => String(row.id)));
+            const invalid = canvasAllowedSectionIds.find((id) => !allowedSet.has(id));
+            if (invalid) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "canvasAllowedSectionIds",
+                message: "section_not_in_course",
+                detail: invalid
+              });
+            }
+          } else {
+            canvasWarning = "canvas_sections_not_cached";
+          }
+        }
+        const canvasFieldsPosition =
+          typeof body.canvasFieldsPosition === "string" && body.canvasFieldsPosition.trim()
+            ? body.canvasFieldsPosition.trim()
+            : "bottom";
+        if (!["top", "after_identity", "bottom"].includes(canvasFieldsPosition)) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "canvasFieldsPosition",
+            message: "invalid_value"
           });
         }
 
@@ -4058,9 +7725,13 @@ export default {
         const isPublic = body.is_public === undefined ? 1 : body.is_public ? 1 : 0;
         const description = body.description ?? null;
         const mirroredRules = buildFileRulesJsonFromSchema(template.schema_json);
+        const canvasAllowedJson =
+          canvasAllowedSectionIds && canvasAllowedSectionIds.length > 0
+            ? JSON.stringify(canvasAllowedSectionIds)
+            : null;
         const statements = [
           env.DB.prepare(
-            "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           ).bind(
             formId,
             body.slug.trim(),
@@ -4071,6 +7742,10 @@ export default {
             authPolicy,
             driveFolderId,
             mirroredRules,
+            canvasEnabled ? 1 : 0,
+            canvasCourseId,
+            canvasAllowedJson,
+            canvasFieldsPosition,
             authPayload?.userId ?? null
           ),
           env.DB.prepare(
@@ -4098,8 +7773,13 @@ export default {
               is_public: isPublic === 1,
               auth_policy: authPolicy,
               templateKey: template.key,
-              driveFolderId
+              driveFolderId,
+              canvas_enabled: canvasEnabled,
+              canvas_course_id: canvasCourseId,
+              canvas_allowed_section_ids_json: canvasAllowedJson,
+              canvas_fields_position: canvasFieldsPosition
             },
+            warning: canvasWarning ? { code: canvasWarning } : null,
             requestId
           },
           requestId,
@@ -4119,6 +7799,10 @@ export default {
             auth_policy?: string;
             templateKey?: string;
             schema_json?: string;
+            canvasEnabled?: boolean;
+            canvasCourseId?: string | null;
+            canvasAllowedSectionIds?: string[] | null;
+            canvasFieldsPosition?: string | null;
           } | null = null;
           try {
             body = await parseJsonBody(request);
@@ -4168,6 +7852,108 @@ export default {
             }
             updates.push("auth_policy=?");
             params.push(body.auth_policy);
+          }
+
+          if (body?.canvasEnabled !== undefined) {
+            if (typeof body.canvasEnabled !== "boolean") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "canvasEnabled",
+                message: "expected_boolean"
+              });
+            }
+            if (body.canvasEnabled && body.canvasCourseId === null) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "canvasCourseId",
+                message: "required"
+              });
+            }
+            if (body.canvasEnabled && body.canvasCourseId === undefined) {
+              const formRow = await env.DB.prepare(
+                "SELECT canvas_course_id FROM forms WHERE slug=? AND deleted_at IS NULL"
+              )
+                .bind(slug)
+                .first<{ canvas_course_id: string | null }>();
+              if (!formRow?.canvas_course_id) {
+                return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                  field: "canvasCourseId",
+                  message: "required"
+                });
+              }
+            }
+            updates.push("canvas_enabled=?");
+            params.push(body.canvasEnabled ? 1 : 0);
+          }
+          if (body?.canvasCourseId !== undefined) {
+            if (body.canvasCourseId !== null && typeof body.canvasCourseId !== "string") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "canvasCourseId",
+                message: "expected_string"
+              });
+            }
+            updates.push("canvas_course_id=?");
+            params.push(body.canvasCourseId ? body.canvasCourseId.trim() : null);
+          }
+          if (body?.canvasAllowedSectionIds !== undefined) {
+            if (!Array.isArray(body.canvasAllowedSectionIds)) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "canvasAllowedSectionIds",
+                message: "expected_array"
+              });
+            }
+            const filtered = body.canvasAllowedSectionIds
+              .filter((id) => typeof id === "string")
+              .map((id) => id.trim())
+              .filter((id) => id.length > 0);
+            const courseId =
+              body.canvasCourseId !== undefined
+                ? body.canvasCourseId?.trim() || null
+                : (await env.DB.prepare(
+                    "SELECT canvas_course_id FROM forms WHERE slug=? AND deleted_at IS NULL"
+                  )
+                    .bind(slug)
+                    .first<{ canvas_course_id: string | null }>())?.canvas_course_id ?? null;
+            if (courseId && filtered.length > 0) {
+              const { results } = await env.DB.prepare(
+                "SELECT id FROM canvas_sections_cache WHERE course_id=?"
+              )
+                .bind(courseId)
+                .all<{ id: string }>();
+              if (results.length > 0) {
+                const allowedSet = new Set(results.map((row) => String(row.id)));
+                const invalid = filtered.find((id) => !allowedSet.has(id));
+                if (invalid) {
+                  return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                    field: "canvasAllowedSectionIds",
+                    message: "section_not_in_course",
+                    detail: invalid
+                  });
+                }
+              } else {
+                canvasWarning = "canvas_sections_not_cached";
+              }
+            }
+            updates.push("canvas_allowed_section_ids_json=?");
+            params.push(filtered.length > 0 ? JSON.stringify(filtered) : null);
+          }
+          if (body?.canvasFieldsPosition !== undefined) {
+            if (body.canvasFieldsPosition !== null && typeof body.canvasFieldsPosition !== "string") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "canvasFieldsPosition",
+                message: "expected_string"
+              });
+            }
+            const value =
+              typeof body.canvasFieldsPosition === "string" && body.canvasFieldsPosition.trim()
+                ? body.canvasFieldsPosition.trim()
+                : "bottom";
+            if (!["top", "after_identity", "bottom"].includes(value)) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "canvasFieldsPosition",
+                message: "invalid_value"
+              });
+            }
+            updates.push("canvas_fields_position=?");
+            params.push(value);
           }
 
           let formId: string | null = null;
@@ -4267,7 +8053,12 @@ export default {
             .bind(...params)
             .run();
 
-          return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+          return jsonResponse(
+            200,
+            { ok: true, warning: canvasWarning ? { code: canvasWarning } : null, requestId },
+            requestId,
+            corsHeaders
+          );
         }
       }
 
@@ -4809,6 +8600,37 @@ export default {
         return jsonResponse(200, { data: results, requestId }, requestId, corsHeaders);
       }
 
+      if (request.method === "GET" && url.pathname === "/api/admin/canvas/test") {
+        if (!env.CANVAS_API_TOKEN) {
+          return errorResponse(500, "canvas_not_configured", requestId, corsHeaders);
+        }
+        const base = getCanvasBaseUrl(env);
+        const response = await canvasFetch(env, `${base}/api/v1/users/self`);
+        const text = await response.text();
+        if (!response.ok) {
+          return errorResponse(500, "canvas_test_failed", requestId, corsHeaders, {
+            message: `canvas_request_failed:${response.status}:${text}`
+          });
+        }
+        let payload: Record<string, unknown> | null = null;
+        try {
+          payload = JSON.parse(text) as Record<string, unknown>;
+        } catch {
+          payload = null;
+        }
+        return jsonResponse(
+          200,
+          {
+            ok: true,
+            canvas_user_id: payload?.id ?? null,
+            canvas_name: payload?.name ?? null,
+            requestId
+          },
+          requestId,
+          corsHeaders
+        );
+      }
+
       const adminFormUploadsMatch = url.pathname.match(/^\/api\/admin\/forms\/([^/]+)\/uploads$/);
       if (request.method === "GET" && adminFormUploadsMatch) {
         const formSlug = decodeURIComponent(adminFormUploadsMatch[1]);
@@ -4914,7 +8736,7 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/api/forms") {
       const { results } = await env.DB.prepare(
-        "SELECT slug,title,is_locked,is_public,auth_policy FROM forms WHERE deleted_at IS NULL AND is_public=1 ORDER BY created_at DESC"
+        "SELECT slug,title,is_locked,is_public,auth_policy,canvas_enabled,canvas_course_id FROM forms WHERE deleted_at IS NULL AND is_public=1 ORDER BY created_at DESC"
       ).all<FormListRow & { auth_policy: string }>();
 
       const data = results.map((row) => ({
@@ -4922,7 +8744,9 @@ export default {
         title: row.title,
         is_locked: toBoolean(row.is_locked),
         is_public: toBoolean(row.is_public),
-        auth_policy: row.auth_policy
+        auth_policy: row.auth_policy,
+        canvas_enabled: toBoolean(row.canvas_enabled),
+        canvas_course_id: row.canvas_course_id ?? null
       }));
 
       return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -4949,6 +8773,32 @@ export default {
 
         const fields = extractFields(schema);
         const fileRules = buildEffectiveRules(row);
+        let allowedSectionIds: string[] | null = null;
+        if (row.canvas_allowed_section_ids_json) {
+          try {
+            const parsed = JSON.parse(row.canvas_allowed_section_ids_json);
+            if (Array.isArray(parsed)) {
+              allowedSectionIds = parsed.filter((id) => typeof id === "string");
+            }
+          } catch (error) {
+            allowedSectionIds = null;
+          }
+        }
+        const canvasSections =
+          toBoolean(row.canvas_enabled) && row.canvas_course_id
+            ? await getCanvasAllowedSections(env, row.canvas_course_id, allowedSectionIds)
+            : [];
+        let canvasCourseName: string | null = null;
+        if (row.canvas_course_id) {
+          const courseRow = await env.DB.prepare(
+            "SELECT name FROM canvas_courses_cache WHERE id=?"
+          )
+            .bind(row.canvas_course_id)
+            .first<{ name?: string }>();
+          if (courseRow?.name) {
+            canvasCourseName = courseRow.name;
+          }
+        }
         const data = {
           slug: row.slug,
           title: row.title,
@@ -4962,7 +8812,12 @@ export default {
           template_schema_json: row.schema_json,
           file_rules_json: row.form_file_rules_json ?? row.template_file_rules_json ?? null,
           fields,
-          file_rules: fileRules
+          file_rules: fileRules,
+          canvas_enabled: toBoolean(row.canvas_enabled),
+          canvas_course_id: row.canvas_course_id ?? null,
+          canvas_course_name: canvasCourseName,
+          canvas_allowed_sections: canvasSections,
+          canvas_fields_position: row.canvas_fields_position ?? "bottom"
         };
 
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -5980,6 +9835,71 @@ export default {
         return errorResponse(401, "auth_required", requestId, corsHeaders);
       }
       const identities = await getUserIdentities(env, authPayload.userId);
+      let canvasInfo: {
+        user_id: string | null;
+        name: string | null;
+        course_id: string | null;
+        course_name: string | null;
+        course_code: string | null;
+        section_id: string | null;
+        section_name: string | null;
+        status: string | null;
+        enrolled_at: string | null;
+        form_title: string | null;
+        submission_id: string | null;
+        submission_deleted: boolean;
+      } | null = null;
+      if (authPayload.email && env.CANVAS_API_TOKEN) {
+        const lookup = await canvasFindUserByEmail(env, authPayload.email);
+        let courseId: string | null = null;
+        let courseName: string | null = null;
+        let courseCode: string | null = null;
+        let enrolledAt: string | null = null;
+        let status: string | null = null;
+        let sectionId: string | null = null;
+        let sectionName: string | null = null;
+        let submissionDeleted = false;
+        const courseRow = await env.DB.prepare(
+          "SELECT s.id as submission_id,s.canvas_course_id as course_id,s.canvas_section_id as section_id,s.canvas_enroll_status as status,s.canvas_enrolled_at as enrolled_at,s.deleted_at as submission_deleted,cc.name as course_name,cc.code as course_code,cs.name as section_name,f.title as form_title FROM submissions s LEFT JOIN canvas_courses_cache cc ON cc.id=s.canvas_course_id LEFT JOIN canvas_sections_cache cs ON cs.id=s.canvas_section_id LEFT JOIN forms f ON f.id=s.form_id WHERE s.user_id=? AND s.canvas_course_id IS NOT NULL ORDER BY COALESCE(s.canvas_enrolled_at, s.updated_at, s.created_at) DESC LIMIT 1"
+        )
+          .bind(authPayload.userId)
+          .first<{
+            submission_id: string | null;
+            course_id: string | null;
+            section_id: string | null;
+            status: string | null;
+            enrolled_at: string | null;
+            submission_deleted: string | null;
+            course_name: string | null;
+            course_code: string | null;
+            section_name: string | null;
+            form_title: string | null;
+          }>();
+        if (courseRow) {
+          courseId = courseRow.course_id ?? null;
+          courseName = courseRow.course_name ?? null;
+          courseCode = courseRow.course_code ?? null;
+          sectionId = courseRow.section_id ?? null;
+          sectionName = courseRow.section_name ?? null;
+          enrolledAt = courseRow.enrolled_at ?? null;
+          status = courseRow.status ?? null;
+          submissionDeleted = Boolean(courseRow.submission_deleted);
+        }
+        canvasInfo = {
+          user_id: lookup.id ?? null,
+          name: lookup.name ?? null,
+          course_id: courseId,
+          course_name: courseName,
+          course_code: courseCode,
+          section_id: sectionId,
+          section_name: sectionName,
+          status,
+          enrolled_at: enrolledAt,
+          form_title: courseRow?.form_title ?? null,
+          submission_id: courseRow?.submission_id ?? null,
+          submission_deleted: submissionDeleted
+        };
+      }
       return jsonResponse(
         200,
         {
@@ -5990,6 +9910,7 @@ export default {
             isAdmin: authPayload.isAdmin
           },
           identities,
+          canvas: canvasInfo,
           requestId
         },
         requestId,
@@ -6079,7 +10000,7 @@ export default {
       }
 
       const submission = await env.DB.prepare(
-        "SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL"
+        "SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL"
       )
         .bind(submissionId)
         .first<{
@@ -6089,6 +10010,13 @@ export default {
           payload_json: string;
           created_at: string | null;
           updated_at: string | null;
+          canvas_enroll_status: string | null;
+          canvas_enroll_error: string | null;
+          canvas_course_id: string | null;
+          canvas_section_id: string | null;
+          canvas_enrolled_at: string | null;
+          canvas_user_id: string | null;
+          canvas_user_name: string | null;
           form_slug: string;
           form_title: string;
           is_locked: number;
@@ -6126,6 +10054,15 @@ export default {
             files: Array.isArray(filesResult?.results) ? filesResult.results : [],
             created_at: submission.created_at,
             updated_at: submission.updated_at,
+            canvas: {
+              status: submission.canvas_enroll_status,
+              error: submission.canvas_enroll_error,
+              course_id: submission.canvas_course_id,
+              section_id: submission.canvas_section_id,
+              enrolled_at: submission.canvas_enrolled_at,
+              user_id: submission.canvas_user_id,
+              user_name: submission.canvas_user_name
+            },
             form: {
               slug: submission.form_slug,
               title: submission.form_title,
@@ -6214,9 +10151,20 @@ export default {
         if (!row) {
           return errorResponse(404, "not_found", requestId, corsHeaders);
         }
-        await restoreSubmission(env, id);
-        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+        const result = await restoreSubmission(env, id);
+        return jsonResponse(
+          200,
+          {
+            ok: true,
+            canvasWarning: result.canvasError || null,
+            canvasAction: result.canvasStatus || null,
+            requestId
+          },
+          requestId,
+          corsHeaders
+        );
       }
+
       if (type === "file") {
         const row = await env.DB.prepare(
           "SELECT sfi.id FROM submission_file_items sfi WHERE sfi.id=? AND sfi.deleted_at IS NOT NULL AND sfi.submission_id IN (SELECT id FROM submissions WHERE user_id=?)"
@@ -6239,87 +10187,15 @@ export default {
       if (!authPayload) {
         return errorResponse(401, "auth_required", requestId, corsHeaders);
       }
-      let body: { type?: string; id?: string } | null = null;
-      try {
-        body = await parseJsonBody(request);
-      } catch (error) {
-        return errorResponse(400, "invalid_json", requestId, corsHeaders);
-      }
-      const type = body?.type?.toLowerCase();
-      const id = body?.id?.trim();
-      if (!type || !id) {
-        return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-          message: "type and id are required"
-        });
-      }
-      if (type === "submission") {
-        const row = await env.DB.prepare(
-          "SELECT id FROM submissions WHERE id=? AND user_id=? AND deleted_at IS NOT NULL"
-        )
-          .bind(id, authPayload.userId)
-          .first<{ id: string }>();
-        if (!row) {
-          return errorResponse(404, "not_found", requestId, corsHeaders);
-        }
-        const ok = await hardDeleteSubmission(env, id);
-        return jsonResponse(200, { ok, requestId }, requestId, corsHeaders);
-      }
-      if (type === "file") {
-        const row = await env.DB.prepare(
-          "SELECT sfi.id FROM submission_file_items sfi WHERE sfi.id=? AND sfi.deleted_at IS NOT NULL AND sfi.submission_id IN (SELECT id FROM submissions WHERE user_id=?)"
-        )
-          .bind(id, authPayload.userId)
-          .first<{ id: string }>();
-        if (!row) {
-          return errorResponse(404, "not_found", requestId, corsHeaders);
-        }
-        const ok = await hardDeleteFileItem(env, id);
-        return jsonResponse(200, { ok, requestId }, requestId, corsHeaders);
-      }
-      return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-        message: "unsupported_type"
-      });
+      return errorResponse(403, "forbidden", requestId, corsHeaders);
     }
-
     if (request.method === "POST" && url.pathname === "/api/me/trash/empty") {
       const authPayload = await getAuthPayload(request, env);
       if (!authPayload) {
         return errorResponse(401, "auth_required", requestId, corsHeaders);
       }
-      let body: { type?: string } | null = null;
-      try {
-        body = await parseJsonBody(request);
-      } catch (error) {
-        return errorResponse(400, "invalid_json", requestId, corsHeaders);
-      }
-      const type = (body?.type || "all").toLowerCase();
-      if (type === "all" || type === "submissions") {
-        const { results } = await env.DB.prepare(
-          "SELECT id FROM submissions WHERE deleted_at IS NOT NULL AND user_id=?"
-        )
-          .bind(authPayload.userId)
-          .all<{ id: string }>();
-        for (const row of results) {
-          if (row?.id) {
-            await hardDeleteSubmission(env, row.id);
-          }
-        }
-      }
-      if (type === "all" || type === "files") {
-        const { results } = await env.DB.prepare(
-          "SELECT sfi.id FROM submission_file_items sfi WHERE sfi.deleted_at IS NOT NULL AND sfi.submission_id IN (SELECT id FROM submissions WHERE user_id=?)"
-        )
-          .bind(authPayload.userId)
-          .all<{ id: string }>();
-        for (const row of results) {
-          if (row?.id) {
-            await hardDeleteFileItem(env, row.id);
-          }
-        }
-      }
-      return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      return errorResponse(403, "forbidden", requestId, corsHeaders);
     }
-
     if (request.method === "GET" && url.pathname.match(/^\/api\/me\/submissions\/[^/]+$/)) {
       const submissionId = decodeURIComponent(url.pathname.split("/")[4] || "").trim();
       if (!submissionId) {
@@ -6334,7 +10210,7 @@ export default {
       }
 
       const submission = await env.DB.prepare(
-        "SELECT s.id,s.payload_json,s.created_at,s.updated_at,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.user_id=? AND s.deleted_at IS NULL AND f.deleted_at IS NULL"
+        "SELECT s.id,s.payload_json,s.created_at,s.updated_at,s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.user_id=? AND s.deleted_at IS NULL AND f.deleted_at IS NULL"
       )
         .bind(submissionId, authPayload.userId)
         .first<{
@@ -6342,6 +10218,13 @@ export default {
           payload_json: string;
           created_at: string;
           updated_at: string | null;
+          canvas_enroll_status: string | null;
+          canvas_enroll_error: string | null;
+          canvas_course_id: string | null;
+          canvas_section_id: string | null;
+          canvas_enrolled_at: string | null;
+          canvas_user_id: string | null;
+          canvas_user_name: string | null;
           form_slug: string;
           form_title: string;
           is_locked: number;
@@ -6375,6 +10258,15 @@ export default {
             updated_at: submission.updated_at,
             data_json: payload?.data ?? null,
             files: Array.isArray(filesResult?.results) ? filesResult.results : [],
+            canvas: {
+              status: submission.canvas_enroll_status,
+              error: submission.canvas_enroll_error,
+              course_id: submission.canvas_course_id,
+              section_id: submission.canvas_section_id,
+              enrolled_at: submission.canvas_enrolled_at,
+              user_id: submission.canvas_user_id,
+              user_name: submission.canvas_user_name
+            },
             form: {
               slug: submission.form_slug,
               title: submission.form_title,
@@ -6395,7 +10287,37 @@ export default {
       if (!authPayload) {
         return errorResponse(401, "auth_required", requestId, corsHeaders);
       }
+      const emailRow = await env.DB.prepare(
+        "SELECT email FROM user_identities WHERE user_id=? AND email IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+      )
+        .bind(authPayload.userId)
+        .first<{ email: string | null }>();
+      const goodbyeEmail = authPayload.email ?? emailRow?.email ?? null;
       await softDeleteUser(env, authPayload.userId, authPayload.userId, "user_deleted");
+      if (goodbyeEmail) {
+        try {
+          const message = buildAccountGoodbyeMessage();
+          const result = await sendGmailMessage(env, {
+            to: goodbyeEmail,
+            subject: message.subject,
+            body: message.body
+          });
+          await logEmailSend(env, {
+            to: goodbyeEmail,
+            subject: message.subject,
+            body: message.body,
+            status: result.ok ? "sent" : "failed",
+            error: result.ok ? null : result.error || "send_failed",
+            triggeredBy: authPayload.userId,
+            triggerSource: "account_deleted"
+          });
+        } catch (error) {
+          console.error(
+            "gmail_goodbye_failed",
+            String((error as Error | undefined)?.message || error)
+          );
+        }
+      }
       const response = jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
       response.headers.set(
         "Set-Cookie",
@@ -6570,14 +10492,27 @@ export default {
       if (!authCheck.ok) {
         return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
       }
-      await softDeleteSubmissionForUser(
+      const deleteResult = await softDeleteSubmissionForUser(
         env,
         form.id,
         authPayload.userId,
         authPayload.userId,
         "user_deleted"
       );
-      return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+      if (!deleteResult.ok) {
+        return errorResponse(502, "canvas_deactivate_failed", requestId, corsHeaders, {
+          message: deleteResult.error || "canvas_deactivate_failed"
+        });
+      }
+      const attempted = deleteResult.canvas?.attempted ?? 0;
+      const failed = deleteResult.canvas?.failed ?? 0;
+      const canvasAction = attempted === 0 ? "skipped" : failed > 0 ? "failed" : "deactivated";
+      return jsonResponse(
+        200,
+        { ok: true, canvasAction, canvasAttempts: attempted, canvasFailed: failed, requestId },
+        requestId,
+        corsHeaders
+      );
     }
 
     if (request.method === "POST") {
@@ -6651,19 +10586,20 @@ export default {
             submissionId = existing.id;
             updated = true;
             await env.DB.prepare(
-              "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), submitter_provider=?, submitter_email=?, submitter_github_username=? WHERE id=?"
+              "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), submitter_provider=?, submitter_email=?, submitter_github_username=?, canvas_course_id=? WHERE id=?"
             )
               .bind(
                 payloadJson,
                 submitter.provider,
                 submitter.email,
                 submitter.github,
+                form.canvas_course_id ?? null,
                 submissionId
               )
               .run();
           } else {
             await env.DB.prepare(
-              "INSERT INTO submissions (id, form_id, user_id, payload_json, created_ip, created_user_agent, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              "INSERT INTO submissions (id, form_id, user_id, payload_json, created_ip, created_user_agent, submitter_provider, submitter_email, submitter_github_username, canvas_course_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
               .bind(
                 submissionId,
@@ -6674,13 +10610,14 @@ export default {
                 createdUserAgent,
                 submitter.provider,
                 submitter.email,
-                submitter.github
+                submitter.github,
+                form.canvas_course_id ?? null
               )
               .run();
           }
         } else {
           await env.DB.prepare(
-            "INSERT INTO submissions (id, form_id, user_id, payload_json, created_ip, created_user_agent, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO submissions (id, form_id, user_id, payload_json, created_ip, created_user_agent, submitter_provider, submitter_email, submitter_github_username, canvas_course_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           )
             .bind(
               submissionId,
@@ -6691,7 +10628,8 @@ export default {
               createdUserAgent,
               submitter.provider,
               submitter.email,
-              submitter.github
+              submitter.github,
+              form.canvas_course_id ?? null
             )
             .run();
         }
@@ -7343,6 +11281,10 @@ export default {
       }
 
       const dataObj: Record<string, unknown> = { ...(parsed.data as Record<string, unknown>) };
+      const rawCanvasSectionId =
+        typeof dataObj._canvas_section_id === "string" ? dataObj._canvas_section_id.trim() : "";
+      let canvasSectionId = rawCanvasSectionId || null;
+      delete dataObj._canvas_section_id;
       const githubLogin =
         authPayload?.userId ? await getGithubLoginForUser(env, authPayload.userId) : null;
       for (const field of fields) {
@@ -7416,6 +11358,74 @@ export default {
             });
           }
         }
+      }
+
+      const canvasEnabled = toBoolean(form.canvas_enabled) && Boolean(form.canvas_course_id);
+      let canvasAllowedSectionIds: string[] | null = null;
+      if (form.canvas_allowed_section_ids_json) {
+        try {
+          const parsedAllowed = JSON.parse(form.canvas_allowed_section_ids_json);
+          if (Array.isArray(parsedAllowed)) {
+            canvasAllowedSectionIds = parsedAllowed.map((id) => String(id));
+          }
+        } catch (error) {
+          canvasAllowedSectionIds = null;
+        }
+      }
+      if (canvasEnabled && form.canvas_course_id) {
+        const allowedSections = await getCanvasAllowedSections(
+          env,
+          form.canvas_course_id,
+          canvasAllowedSectionIds
+        );
+        if (allowedSections.length > 1 && !canvasSectionId) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "_canvas_section_id",
+            message: "required"
+          });
+        }
+        if (!canvasSectionId && allowedSections.length === 1) {
+          canvasSectionId = allowedSections[0].id;
+        }
+        if (canvasSectionId && allowedSections.length > 0) {
+          const allowed = new Set(allowedSections.map((section) => section.id));
+          if (!allowed.has(canvasSectionId)) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "_canvas_section_id",
+              message: "invalid_canvas_section"
+            });
+          }
+        }
+      }
+
+      let canvasName: string | null = null;
+      let canvasEmail: string | null = null;
+      if (canvasEnabled) {
+        const nameField = fields.find((field) => field.type === "full_name");
+        const emailField = fields.find((field) => field.type === "email");
+        if (!nameField || !emailField) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "canvas_missing_fields"
+          });
+        }
+        const nameValue =
+          typeof dataObj[nameField.id] === "string" ? dataObj[nameField.id].trim() : "";
+        const emailValue =
+          typeof dataObj[emailField.id] === "string" ? dataObj[emailField.id].trim() : "";
+        if (!nameValue) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: nameField.id,
+            message: "required"
+          });
+        }
+        if (!emailValue) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: emailField.id,
+            message: "required"
+          });
+        }
+        canvasName = nameValue;
+        canvasEmail = emailValue;
       }
 
       const userId = await resolveUserId(env, authPayload);
@@ -7546,16 +11556,18 @@ export default {
           }
         }
       }
+      const isResubmission = Boolean(existingSubmissionId);
 
       if (existingSubmissionId) {
         await env.DB.prepare(
-          "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), submitter_provider=?, submitter_email=?, submitter_github_username=? WHERE id=?"
+          "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), submitter_provider=?, submitter_email=?, submitter_github_username=?, canvas_course_id=? WHERE id=?"
         )
           .bind(
             payloadJson,
             submitter.provider,
             submitter.email,
             submitter.github,
+            form.canvas_course_id ?? null,
             submissionId
           )
           .run();
@@ -7577,13 +11589,13 @@ export default {
             return errorResponse(401, "auth_required", requestId, corsHeaders);
           }
           await env.DB.prepare(
-            "UPDATE submissions SET payload_json=?, updated_at=datetime('now') WHERE id=?"
+            "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), canvas_course_id=? WHERE id=?"
           )
-            .bind(payloadJson, submissionId)
+            .bind(payloadJson, form.canvas_course_id ?? null, submissionId)
             .run();
         } else {
           await env.DB.prepare(
-            "INSERT INTO submissions (id, form_id, user_id, payload_json, created_ip, created_user_agent, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO submissions (id, form_id, user_id, payload_json, created_ip, created_user_agent, submitter_provider, submitter_email, submitter_github_username, canvas_course_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           )
             .bind(
               submissionId,
@@ -7594,7 +11606,8 @@ export default {
               createdUserAgent,
               submitter.provider,
               submitter.email,
-              submitter.github
+              submitter.github,
+              form.canvas_course_id ?? null
             )
             .run();
         }
@@ -7604,7 +11617,7 @@ export default {
           .first<{ id: string }>();
         if (!exists) {
           await env.DB.prepare(
-            "INSERT INTO submissions (id, form_id, user_id, payload_json, created_ip, created_user_agent, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO submissions (id, form_id, user_id, payload_json, created_ip, created_user_agent, submitter_provider, submitter_email, submitter_github_username, canvas_course_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           )
             .bind(
               submissionId,
@@ -7615,7 +11628,8 @@ export default {
               createdUserAgent,
               submitter.provider,
               submitter.email,
-              submitter.github
+              submitter.github,
+              form.canvas_course_id ?? null
             )
             .run();
         }
@@ -7797,9 +11811,190 @@ export default {
         }
       }
 
-      return jsonResponse(200, { submissionId, scans, requestId }, requestId, corsHeaders);
+      let canvasResult: { status: string; error: string | null; user_id?: string | null; user_name?: string | null } | null = null;
+      if (canvasEnabled && canvasName && canvasEmail) {
+        const enrollment = await handleCanvasEnrollment(env, form, canvasName, canvasEmail, canvasSectionId);
+        let finalStatus = enrollment.status;
+        let finalError = enrollment.error;
+        if (finalStatus !== "invited" && shouldRetryCanvasError(finalError)) {
+          await enqueueCanvasRetry(
+            env,
+            submissionId,
+            form.id,
+            form.canvas_course_id ?? "",
+            canvasSectionId,
+            canvasName,
+            canvasEmail,
+            finalError || "canvas_enroll_failed"
+          );
+          finalStatus = "pending_retry";
+          finalError = `queued:${finalError || "canvas_enroll_failed"}`;
+        }
+        canvasResult = {
+          status: finalStatus,
+          error: finalError,
+          user_id: enrollment.canvasUserId ?? null,
+          user_name: enrollment.canvasUserName ?? null
+        };
+        await env.DB.prepare(
+          "UPDATE submissions SET canvas_enroll_status=?, canvas_enroll_error=?, canvas_course_id=?, canvas_section_id=?, canvas_enrolled_at=?, canvas_user_id=?, canvas_user_name=? WHERE id=?"
+        )
+          .bind(
+            finalStatus,
+            finalError,
+            form.canvas_course_id ?? null,
+            enrollment.sectionId,
+            enrollment.enrolledAt,
+            enrollment.canvasUserId ?? null,
+            enrollment.canvasUserName ?? null,
+            submissionId
+          )
+          .run();
+        if (userId && form.canvas_course_id) {
+          await ensureCanvasNameCheckRow(env, userId, form.canvas_course_id);
+        }
+        if (canvasResult.status === "invited" && canvasEmail) {
+          const canvasUserName = canvasResult.user_name ?? null;
+          try {
+            let courseTitle: string | null = null;
+            let courseCode: string | null = null;
+            let sectionName: string | null = null;
+            if (form.canvas_course_id) {
+              const courseRow = await env.DB.prepare(
+                "SELECT name, code FROM canvas_courses_cache WHERE id=?"
+              )
+                .bind(form.canvas_course_id)
+                .first<{ name: string | null; code: string | null }>();
+              courseTitle = courseRow?.name ?? null;
+              courseCode = courseRow?.code ?? null;
+            }
+            if (form.canvas_course_id && canvasSectionId) {
+              const sectionRow = await env.DB.prepare(
+                "SELECT name FROM canvas_sections_cache WHERE id=?"
+              )
+                .bind(canvasSectionId)
+                .first<{ name: string | null }>();
+              sectionName = sectionRow?.name ?? null;
+            }
+            const courseLabel = courseTitle
+              ? `${courseTitle}${courseCode ? ` (${courseCode})` : ""}`
+              : form.canvas_course_id
+              ? `Course ${form.canvas_course_id}`
+              : null;
+            const sectionLabel = sectionName
+              ? sectionName
+              : canvasSectionId
+              ? `Section ${canvasSectionId}`
+              : null;
+            const baseWeb = env.BASE_URL_WEB ? String(env.BASE_URL_WEB).replace(/\/$/, "") : "";
+            const formLink = baseWeb ? `${baseWeb}/#/f/${form.slug}` : null;
+            const submittedName =
+              pickNameFromPayload(dataObj) ||
+              canvasName ||
+              titleCaseFromEmail(canvasEmail);
+            const studentId = pickFirstStringValue(dataObj, [
+              "student-id",
+              "student_id",
+              "studentId",
+              "mssv"
+            ]);
+            const className = pickFirstStringValue(dataObj, [
+              "class",
+              "class_name",
+              "className",
+              "lop"
+            ]);
+            const dob = pickFirstStringValue(dataObj, ["dob", "date_of_birth", "birthday"]);
+
+            if (isResubmission) {
+              const message = buildCanvasInformMessage({
+                submittedName,
+                submittedEmail: canvasEmail,
+                studentId,
+                className,
+                dob,
+                courseLabel,
+                sectionLabel,
+                formTitle: form.title,
+                formLink
+              });
+              const informResult = await sendGmailMessage(env, {
+                to: canvasEmail,
+                subject: message.subject,
+                body: message.body
+              });
+              await logEmailSend(env, {
+                to: canvasEmail,
+                subject: message.subject,
+                body: message.body,
+                status: informResult.ok ? "sent" : "failed",
+                error: informResult.ok ? null : informResult.error || "send_failed",
+                submissionId,
+                formId: form.id ?? null,
+                formSlug: form.slug ?? null,
+                formTitle: form.title ?? null,
+                canvasCourseId: form.canvas_course_id ?? null,
+                canvasSectionId: canvasSectionId ?? null,
+                triggerSource: "auto_inform"
+              });
+            } else {
+              const welcomeMessage = buildCanvasWelcomeMessage({
+                courseLabel,
+                sectionLabel,
+                formTitle: form.title
+              });
+              const welcomeResult = await sendGmailMessage(env, {
+                to: canvasEmail,
+                subject: welcomeMessage.subject,
+                body: welcomeMessage.body
+              });
+              await logEmailSend(env, {
+                to: canvasEmail,
+                subject: welcomeMessage.subject,
+                body: welcomeMessage.body,
+                status: welcomeResult.ok ? "sent" : "failed",
+                error: welcomeResult.ok ? null : welcomeResult.error || "send_failed",
+                submissionId,
+                formId: form.id ?? null,
+                formSlug: form.slug ?? null,
+                formTitle: form.title ?? null,
+                canvasCourseId: form.canvas_course_id ?? null,
+                canvasSectionId: canvasSectionId ?? null,
+                triggerSource: "auto_welcome"
+              });
+            }
+          } catch (error) {
+            console.error(
+              "gmail_auto_notify_failed",
+              String((error as Error | undefined)?.message || error)
+            );
+          }
+        }
+      }
+
+      return jsonResponse(200, { submissionId, scans, canvas: canvasResult, requestId }, requestId, corsHeaders);
     }
 
     return errorResponse(404, "not_found", requestId, corsHeaders);
+  }
+  ,
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const { results: tasks } = await env.DB.prepare(
+            "SELECT id,cron,enabled FROM routine_tasks"
+          ).all<{ id: string; cron: string; enabled: number }>();
+          const now = new Date();
+          for (const task of tasks) {
+            if (!task.enabled) continue;
+            if (!cronMatchesNow(task.cron, now)) continue;
+            await runRoutineTaskById(env, task.id);
+          }
+        } catch (error) {
+          console.error("canvas_sync_failed", String((error as Error | undefined)?.message || error));
+        }
+      })()
+    );
   }
 };

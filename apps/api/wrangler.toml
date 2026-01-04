@@ -21,3 +21,8 @@ BASE_URL_WEB = "https://hoanganhduc.github.io/forms/"
 ALLOWED_ORIGIN = "http://localhost:5173,http://127.0.0.1:5173,https://hoanganhduc.github.io"
 DRIVE_PARENT_FOLDER_ID = "0AOpdQiTr35VfUk9PVA"
 GIT_COMMIT = ""
+CANVAS_BASE_URL = "https://canvas.instructure.com"
+CANVAS_ACCOUNT_ID = ""
+
+[triggers]
+crons = ["0 2 * * *"]

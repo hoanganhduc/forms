@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { HashRouter, Link, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { APP_INFO } from "./config";
 import { apiFetch, clearToken, setToken } from "./auth";
@@ -29,6 +29,11 @@ type FormDetail = {
   template_schema_json?: string | null;
   file_rules_json?: string | null;
   fields: FormField[];
+  canvas_enabled?: boolean;
+  canvas_course_id?: string | null;
+  canvas_course_name?: string | null;
+  canvas_allowed_sections?: Array<{ id: string; name: string }>;
+  canvas_fields_position?: string | null;
   file_rules?: {
     enabled: boolean;
     maxFiles: number;
@@ -160,6 +165,29 @@ function isValidDateString(value: string) {
     date.getUTCMonth() === month - 1 &&
     date.getUTCDate() === day
   );
+}
+
+function normalizeNameValue(value: string) {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function pickNameFromData(data: Record<string, unknown> | null) {
+  if (!data) return "";
+  const preferredKeys = ["full_name", "fullName", "fullname", "full-name", "name"];
+  for (const key of preferredKeys) {
+    const value = data[key];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  const nameKey = Object.keys(data).find((key) => key.toLowerCase().includes("name"));
+  if (nameKey) {
+    const value = data[nameKey];
+    if (typeof value === "string" && value.trim()) {
+      return value.trim();
+    }
+  }
+  return "";
 }
 
 function getAuthPolicyLabel(policy?: string) {
@@ -1129,7 +1157,7 @@ function AuthBar({
 }: {
   user: UserInfo | null;
   onLogin: (provider: "google" | "github") => void;
-  onLogout: () => void;
+  onLogout: (silent?: boolean) => void;
 }) {
   const providerLabel = user?.provider
     ? user.provider.charAt(0).toUpperCase() + user.provider.slice(1)
@@ -1390,7 +1418,6 @@ function FormPage({
   const [submissionId, setSubmissionId] = useState<string | null>(null);
   const [hasExistingSubmission, setHasExistingSubmission] = useState(false);
   const [fileItems, setFileItems] = useState<FileItem[]>([]);
-  const [deleteError, setDeleteError] = useState<string | null>(null);
   const navigate = useNavigate();
 
   function getEmailDomain(field: FormField) {
@@ -1606,6 +1633,16 @@ function FormPage({
     }
   }, [form, user, values]);
 
+  const canvasSections = Array.isArray(form?.canvas_allowed_sections) ? form?.canvas_allowed_sections : [];
+  const singleCanvasSection = canvasSections.length === 1 ? canvasSections[0] : null;
+
+  useEffect(() => {
+    if (!form?.canvas_enabled) return;
+    if (!singleCanvasSection) return;
+    if ((values._canvas_section_id || "").trim()) return;
+    setValues((prev) => ({ ...prev, _canvas_section_id: String(singleCanvasSection.id) }));
+  }, [form?.canvas_enabled, singleCanvasSection, values._canvas_section_id]);
+
   useEffect(() => {
     if (!form || !submissionId) return;
     const pending = fileItems.filter((item) => item.vt_status === "pending");
@@ -1669,6 +1706,452 @@ function FormPage({
     : !isFormComplete
     ? "Complete required fields and select required files."
     : "";
+  const canvasFieldsPosition = form?.canvas_fields_position || "bottom";
+  const canvasCourseTitle =
+    form?.canvas_enabled && form?.canvas_course_name ? form.canvas_course_name : null;
+  const canvasCourseField = canvasCourseTitle ? (
+    <div key="canvas-course" className="field">
+      <span>Canvas Course</span>
+      <div className="field-value">{canvasCourseTitle}</div>
+    </div>
+  ) : null;
+  const canvasSectionField =
+    form?.canvas_enabled && canvasSections.length > 0 ? (
+      singleCanvasSection ? (
+        <div key="canvas-section" className="field">
+          <span>Canvas Section</span>
+          <div className="field-value">{singleCanvasSection.name}</div>
+          <span className="field-help">Assigned automatically.</span>
+        </div>
+      ) : (
+        <label key="canvas-section" className="field">
+          <span>Canvas Section *</span>
+          <select
+            value={values._canvas_section_id || ""}
+            disabled={locked || !canSubmit}
+            onChange={(event) =>
+              setValues((prev) => ({ ...prev, _canvas_section_id: event.target.value }))
+            }
+          >
+            <option value="">Select a section</option>
+            {canvasSections.map((section) => (
+              <option key={section.id} value={section.id}>
+                {section.name}
+              </option>
+            ))}
+          </select>
+          <span className="field-help">Select one section to enroll.</span>
+        </label>
+      )
+    ) : null;
+  const canvasNodes = [canvasCourseField, canvasSectionField].filter(Boolean) as React.ReactNode[];
+  const fieldNodes = (form?.fields || []).map((field) => {
+    if (field.type === "file") {
+      const rules = getFieldRule(fileRules, field.id);
+      const files = selectedFiles[field.id] || [];
+      const isFieldUploading = Boolean(fieldUploading[field.id]);
+      const existing = existingFilesByField[field.id] || [];
+      const reachedMax = rules.maxFiles > 0 && existing.length >= rules.maxFiles;
+      const hasPendingSelected = files.some((file) => {
+        const meta = fileMeta[buildFileIdentity(field.id, file)];
+        return !meta || meta.status !== "uploaded";
+      });
+      return (
+        <label key={field.id} className="field">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+          </span>
+          <input
+            type="file"
+            multiple={Boolean(rules.maxFiles ? rules.maxFiles > 1 : true)}
+            required={Boolean(field.required && existing.length === 0)}
+            disabled={locked || !canSubmit || uploading || reachedMax}
+            onChange={(event) => handleFileChange(field.id, event.target.files)}
+            accept={
+              rules.extensions.length ? rules.extensions.map((ext) => `.${ext}`).join(",") : undefined
+            }
+          />
+          <span className="field-help">
+            {rules.extensions.length > 0 ? `Allowed: ${rules.extensions.join(", ")}` : "All file types"}
+            {" - "}Max size {formatSize(rules.maxBytes)}
+            {" - "}Max files {rules.maxFiles} (existing files {existing.length})
+            {field.required ? " - Required" : ""}
+          </span>
+          <div className="upload-actions">
+            <button
+              type="button"
+              className="btn btn-outline-success btn-sm"
+              disabled={locked || !canSubmit || isFieldUploading || files.length === 0}
+              onClick={() => handleUploadField(field.id)}
+            >
+              <i className="bi bi-cloud-upload" aria-hidden="true" />{" "}
+              {isFieldUploading ? "Uploading..." : "Upload selected files"}
+            </button>
+            <span className="badge text-bg-light">
+              <i className="bi bi-paperclip" aria-hidden="true" />{" "}
+              {files.length === 0 ? "No files selected" : `Selected ${files.length}`}
+            </span>
+            {existing.length > 0 ? (
+              <span className="badge text-bg-secondary">
+                <i className="bi bi-inbox" aria-hidden="true" /> Existing {existing.length}
+              </span>
+            ) : null}
+          </div>
+          {uploadError ? (
+            <div className="alert alert-warning mt-2" role="alert">
+              {uploadError}
+            </div>
+          ) : null}
+          {files.length > 0 && hasPendingSelected ? (
+            <div className="upload-list mt-2">
+              <div className="upload-title">Files selected</div>
+              <ul>
+                {files.map((file, index) => {
+                  const url = fileUrls[field.id]?.[index] || "";
+                  const key = buildFileIdentity(field.id, file);
+                  const meta = fileMeta[key] || { status: "pending", progress: 0 };
+                  const statusText = meta.status;
+                  return (
+                    <li key={`${field.id}-${file.name}-${index}`}>
+                      <div className="upload-item">
+                        <div className="upload-name">{file.name}</div>
+                        <div className="upload-meta">
+                          {formatSize(file.size)} - {file.type || "unknown type"}
+                        </div>
+                        <div className={`upload-status upload-status--${statusText}`}>
+                          <i
+                            className={`bi ${getUploadStatusIcon(statusText)}`}
+                            aria-hidden="true"
+                          />{" "}
+                          Status: {statusText} - {meta.progress}%
+                        </div>
+                        {url && meta.status === "uploaded" ? (
+                          <div className="upload-link">
+                            <span className="upload-url">{url}</span>
+                          </div>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ) : null}
+          {existing.length > 0 ? (
+            <div className="upload-list mt-2">
+              <div className="upload-title d-flex align-items-center justify-content-between">
+                <span>Uploaded files</span>
+                {!locked ? (
+                  <button
+                    type="button"
+                    className="btn btn-outline-danger btn-sm"
+                    onClick={() => handleRemoveAllFiles(field.id, existing)}
+                  >
+                    <i className="bi bi-trash" aria-hidden="true" /> Remove all
+                  </button>
+                ) : null}
+              </div>
+              <ul>
+                {existing.map((item) => (
+                  <li key={item.id}>
+                    <div className="upload-item">
+                      <div className="upload-name">{item.original_name}</div>
+                      <div className="upload-meta">{formatSize(item.size_bytes)}</div>
+                      <div className="upload-meta">
+                        <i
+                          className={`bi ${getVtStatusIcon(item.vt_status || "pending")}`}
+                          aria-hidden="true"
+                        />{" "}
+                        VirusTotal: {item.vt_status || "pending"}{" "}
+                        {item.vt_verdict ? `(${item.vt_verdict})` : ""}
+                      </div>
+                      <div className="upload-actions">
+                        <button
+                          type="button"
+                          className="btn btn-outline-secondary btn-sm"
+                          onClick={() => handleCheckFile(item.id)}
+                        >
+                          <i className="bi bi-arrow-repeat" aria-hidden="true" /> Check status
+                        </button>
+                        {!locked ? (
+                          <button
+                            type="button"
+                            className="btn btn-outline-danger btn-sm"
+                            onClick={() => handleRemoveFile(item.id)}
+                          >
+                            <i className="bi bi-trash" aria-hidden="true" /> Remove
+                          </button>
+                        ) : null}
+                        {!locked ? (
+                          <label className="btn btn-outline-primary btn-sm mb-0">
+                            <i className="bi bi-arrow-left-right" aria-hidden="true" /> Replace
+                            <input
+                              type="file"
+                              hidden
+                              accept={
+                                rules.extensions.length
+                                  ? rules.extensions.map((ext) => `.${ext}`).join(",")
+                                  : undefined
+                              }
+                              onChange={(event) =>
+                                (() => {
+                                  const file = event.target.files?.[0] || null;
+                                  event.currentTarget.value = "";
+                                  handleReplaceFile(field.id, item.id, file);
+                                })()
+                              }
+                            />
+                          </label>
+                        ) : null}
+                        {item.finalized_at ? (
+                          <span className="badge text-bg-success">
+                            <i className="bi bi-cloud-check" aria-hidden="true" /> Finalized
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </label>
+      );
+    }
+
+    if (field.type === "email" || field.type === "github_username") {
+      const autofillValue = getAutofillValue(field);
+      const isAutofilled = Boolean(autofillValue);
+      const inputValue = values[field.id] || autofillValue || "";
+      const placeholder =
+        typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
+          ? String((field as any).placeholder)
+          : field.label;
+      const domain = field.type === "email" ? getEmailDomain(field) : "";
+      return (
+        <label key={field.id} className="field">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+          </span>
+          <input
+            type="text"
+            className="form-control"
+            value={inputValue}
+            disabled={locked || !canSubmit || isAutofilled}
+            placeholder={placeholder}
+            onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
+          />
+          {field.type === "email" && domain ? (
+            <span className="field-help">Email must end with @{domain}.</span>
+          ) : null}
+        </label>
+      );
+    }
+
+    if (field.type === "full_name") {
+      const autofillValue = getAutofillValue(field);
+      const isAutofilled = Boolean(autofillValue);
+      const inputValue = values[field.id] || autofillValue || "";
+      const placeholder =
+        typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
+          ? String((field as any).placeholder)
+          : field.label;
+      return (
+        <label key={field.id} className="field">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+          </span>
+          <input
+            type="text"
+            className="form-control"
+            value={inputValue}
+            disabled={locked || !canSubmit || isAutofilled}
+            placeholder={placeholder}
+            onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
+          />
+        </label>
+      );
+    }
+
+    if (field.type === "textarea") {
+      const placeholder =
+        typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
+          ? String((field as any).placeholder)
+          : field.label;
+      return (
+        <label key={field.id} className="field">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+          </span>
+          <textarea
+            className="form-control"
+            value={values[field.id] || ""}
+            disabled={locked || !canSubmit}
+            placeholder={placeholder}
+            onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
+          />
+        </label>
+      );
+    }
+
+    if (field.type === "date") {
+      return (
+        <label key={field.id} className="field">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+          </span>
+          <input
+            type="date"
+            className="form-control"
+            value={values[field.id] || ""}
+            disabled={locked || !canSubmit}
+            onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
+          />
+        </label>
+      );
+    }
+
+    if (field.type === "number") {
+      const placeholder =
+        typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
+          ? String((field as any).placeholder)
+          : field.label;
+      return (
+        <label key={field.id} className="field">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+          </span>
+          <input
+            type="number"
+            className="form-control"
+            value={values[field.id] || ""}
+            disabled={locked || !canSubmit}
+            placeholder={placeholder}
+            onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
+          />
+        </label>
+      );
+    }
+
+    if (field.type === "select") {
+      const options = Array.isArray((field as any).options) ? (field as any).options : [];
+      return (
+        <label key={field.id} className="field">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+          </span>
+          <select
+            className="form-select"
+            value={values[field.id] || ""}
+            disabled={locked || !canSubmit}
+            onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
+          >
+            <option value="">{field.label}</option>
+            {options.map((option: string) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </label>
+      );
+    }
+
+    if (field.type === "checkbox") {
+      const options = Array.isArray((field as any).options) ? (field as any).options : [];
+      const isMultiple = Boolean((field as any).multiple);
+      return (
+        <label key={field.id} className="field">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+          </span>
+          <div className="checkbox-group">
+            {options.map((option: string) => {
+              const value = values[field.id] || "";
+              const selected = isMultiple
+                ? value.split(",").map((item) => item.trim()).includes(option)
+                : value === option;
+              return (
+                <label key={`${field.id}-${option}`} className="checkbox-option">
+                  <input
+                    type="checkbox"
+                    disabled={locked || !canSubmit}
+                    checked={selected}
+                    onChange={(event) => {
+                      if (!isMultiple) {
+                        setValues((prev) => ({ ...prev, [field.id]: event.target.checked ? option : "" }));
+                        return;
+                      }
+                      const parts = value ? value.split(",").map((item) => item.trim()) : [];
+                      const next = new Set(parts);
+                      if (event.target.checked) {
+                        next.add(option);
+                      } else {
+                        next.delete(option);
+                      }
+                      setValues((prev) => ({ ...prev, [field.id]: Array.from(next).join(", ") }));
+                    }}
+                  />
+                  <span>{option}</span>
+                </label>
+              );
+            })}
+          </div>
+        </label>
+      );
+    }
+
+    const placeholder =
+      typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
+        ? String((field as any).placeholder)
+        : field.label;
+    return (
+      <label key={field.id} className="field">
+        <span>
+          {field.label}
+          {field.required ? " *" : ""}
+        </span>
+        <input
+          type="text"
+          className="form-control"
+          value={values[field.id] || ""}
+          disabled={locked || !canSubmit}
+          placeholder={placeholder}
+          onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
+        />
+      </label>
+    );
+  });
+  if (canvasNodes.length > 0) {
+    if (canvasFieldsPosition === "top") {
+      fieldNodes.unshift(...canvasNodes);
+    } else if (canvasFieldsPosition === "after_identity") {
+      let insertAfter = -1;
+      form?.fields?.forEach((field, index) => {
+        if (field.type === "email" || field.type === "full_name") {
+          insertAfter = index;
+        }
+      });
+      if (insertAfter < 0 && fieldNodes.length > 0) {
+        insertAfter = 0;
+      }
+      if (insertAfter < 0) {
+        fieldNodes.unshift(...canvasNodes);
+      } else {
+        fieldNodes.splice(insertAfter + 1, 0, ...canvasNodes);
+      }
+    } else {
+      fieldNodes.push(...canvasNodes);
+    }
+  }
 
   function buildFileSelectionMessage(
     fieldKey: string,
@@ -1918,7 +2401,7 @@ function FormPage({
   async function handleRemoveAllFiles(fieldKey: string, items: FileItem[]) {
     if (!form || locked) return;
     if (items.length === 0) return;
-    if (!window.confirm(`Remove all ${items.length} uploaded file(s)?`)) {
+    if (!window.confirm(`Move all ${items.length} uploaded file(s) to trash?`)) {
       return;
     }
     for (const item of items) {
@@ -1972,29 +2455,6 @@ function FormPage({
     }
   }
 
-  async function handleDeleteSubmission() {
-    if (!form) return;
-    setDeleteError(null);
-    if (!window.confirm("Delete your submission? This cannot be undone.")) {
-      return;
-    }
-    const response = await apiFetch(
-      `${API_BASE}/api/me/submission?formSlug=${encodeURIComponent(form.slug)}`,
-      { method: "DELETE" }
-    );
-    const payload = await response.json().catch(() => null);
-    if (!response.ok) {
-      setDeleteError(payload?.error || "Failed to delete submission.");
-      return;
-    }
-    setSubmissionId(null);
-    setSavedAt(null);
-    setValues({});
-    setSelectedFiles({});
-    setFileItems([]);
-    setUploadedFiles({});
-    onNotice("Submission deleted.", "success");
-  }
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -2049,6 +2509,17 @@ function FormPage({
         errors[field.id] = "Please upload selected files";
       }
     });
+
+    if (form.canvas_enabled && canvasSections.length > 0) {
+      const selectedSection = typeof values._canvas_section_id === "string" ? values._canvas_section_id.trim() : "";
+      if (selectedSection) {
+        normalizedValues._canvas_section_id = selectedSection;
+      } else if (singleCanvasSection) {
+        normalizedValues._canvas_section_id = String(singleCanvasSection.id);
+      } else {
+        errors._canvas_section_id = "Please select a section";
+      }
+    }
 
     if (Object.keys(errors).length > 0) {
       setFieldErrors(errors);
@@ -2114,7 +2585,7 @@ function FormPage({
       setSavedAt(new Date().toISOString());
       setSaving(false);
       if (returnedId) {
-        navigate(`/me/submissions/${returnedId}`);
+        navigate(`/me/submissions/${returnedId}?submitted=1`);
       }
     } catch (err) {
       setUploading(false);
@@ -2222,421 +2693,8 @@ function FormPage({
       ) : null}
 
       <form className="form-grid" onSubmit={handleSubmit}>
-        {form.fields.length === 0 ? (
-          <p className="muted">No fields configured yet.</p>
-        ) : (
-          form.fields.map((field) => {
-            if (field.type === "file") {
-              const rules = getFieldRule(fileRules, field.id);
-              const files = selectedFiles[field.id] || [];
-              const isFieldUploading = Boolean(fieldUploading[field.id]);
-              const existing = existingFilesByField[field.id] || [];
-              const reachedMax = rules.maxFiles > 0 && existing.length >= rules.maxFiles;
-              const hasPendingSelected = files.some((file) => {
-                const meta = fileMeta[buildFileIdentity(field.id, file)];
-                return !meta || meta.status !== "uploaded";
-              });
-              return (
-                <label key={field.id} className="field">
-                  <span>
-                    {field.label}
-                    {field.required ? " *" : ""}
-                  </span>
-                  <input
-                    type="file"
-                    multiple={Boolean(rules.maxFiles ? rules.maxFiles > 1 : true)}
-                    required={Boolean(field.required && existing.length === 0)}
-                    disabled={locked || !canSubmit || uploading || reachedMax}
-                    onChange={(event) => handleFileChange(field.id, event.target.files)}
-                    accept={
-                      rules.extensions.length
-                        ? rules.extensions.map((ext) => `.${ext}`).join(",")
-                        : undefined
-                    }
-                  />
-                  <span className="field-help">
-                    {rules.extensions.length > 0
-                      ? `Allowed: ${rules.extensions.join(", ")}`
-                      : "All file types"}
-                    {" - "}Max size {formatSize(rules.maxBytes)}
-                    {" - "}Max files {rules.maxFiles} (existing files {existing.length})
-                    {field.required ? " - Required" : ""}
-                  </span>
-                  <div className="upload-actions">
-                    <button
-                      type="button"
-                      className="btn btn-outline-success btn-sm"
-                      disabled={locked || !canSubmit || isFieldUploading || files.length === 0}
-                      onClick={() => handleUploadField(field.id)}
-                    >
-                      <i className="bi bi-cloud-upload" aria-hidden="true" />{" "}
-                      {isFieldUploading ? "Uploading..." : "Upload selected files"}
-                    </button>
-                    <span className="badge text-bg-light">
-                      <i className="bi bi-paperclip" aria-hidden="true" />{" "}
-                      {files.length === 0 ? "No files selected" : `Selected ${files.length}`}
-                    </span>
-                    {existing.length > 0 ? (
-                      <span className="badge text-bg-secondary">
-                        <i className="bi bi-inbox" aria-hidden="true" /> Existing {existing.length}
-                      </span>
-                    ) : null}
-                  </div>
-                  {uploadError ? (
-                    <div className="alert alert-warning mt-2" role="alert">
-                      {uploadError}
-                    </div>
-                  ) : null}
-                  {files.length > 0 && hasPendingSelected ? (
-                    <div className="upload-list mt-2">
-                      <div className="upload-title">Files selected</div>
-                      <ul>
-                        {files.map((file, index) => {
-                          const url = fileUrls[field.id]?.[index] || "";
-                          const key = buildFileIdentity(field.id, file);
-                          const meta = fileMeta[key] || { status: "pending", progress: 0 };
-                          const statusText = meta.status;
-                          return (
-                            <li key={`${field.id}-${file.name}-${index}`}>
-                              <div className="upload-item">
-                                <div className="upload-name">{file.name}</div>
-                                <div className="upload-meta">
-                                  {formatSize(file.size)} - {file.type || "unknown type"}
-                                </div>
-                                <div className={`upload-status upload-status--${statusText}`}>
-                                  <i
-                                    className={`bi ${getUploadStatusIcon(statusText)}`}
-                                    aria-hidden="true"
-                                  />{" "}
-                                  Status: {statusText} - {meta.progress}%
-                                </div>
-                                {url && meta.status === "uploaded" ? (
-                                  <div className="upload-link">
-                                    <span className="upload-url">{url}</span>
-                                  </div>
-                                ) : null}
-                              </div>
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    </div>
-                  ) : null}
-                  {existing.length > 0 ? (
-                    <div className="upload-list mt-2">
-                      <div className="upload-title d-flex align-items-center justify-content-between">
-                        <span>Uploaded files</span>
-                        {!locked ? (
-                          <button
-                            type="button"
-                            className="btn btn-outline-danger btn-sm"
-                            onClick={() => handleRemoveAllFiles(field.id, existing)}
-                          >
-                            <i className="bi bi-trash" aria-hidden="true" /> Remove all
-                          </button>
-                        ) : null}
-                      </div>
-                      <ul>
-                        {existing.map((item) => (
-                          <li key={item.id}>
-                            <div className="upload-item">
-                              <div className="upload-name">{item.original_name}</div>
-                              <div className="upload-meta">{formatSize(item.size_bytes)}</div>
-                              <div className="upload-meta">
-                                <i
-                                  className={`bi ${getVtStatusIcon(item.vt_status || "pending")}`}
-                                  aria-hidden="true"
-                                />{" "}
-                                VirusTotal: {item.vt_status || "pending"}{" "}
-                                {item.vt_verdict ? `(${item.vt_verdict})` : ""}
-                              </div>
-                              <div className="upload-actions">
-                                <button
-                                  type="button"
-                                  className="btn btn-outline-secondary btn-sm"
-                                  onClick={() => handleCheckFile(item.id)}
-                                >
-                                  <i className="bi bi-arrow-repeat" aria-hidden="true" /> Check status
-                                </button>
-                                {!locked ? (
-                                  <button
-                                    type="button"
-                                    className="btn btn-outline-danger btn-sm"
-                                    onClick={() => handleRemoveFile(item.id)}
-                                  >
-                                    <i className="bi bi-trash" aria-hidden="true" /> Remove
-                                  </button>
-                                ) : null}
-                                {!locked ? (
-                                  <label className="btn btn-outline-primary btn-sm mb-0">
-                                    <i className="bi bi-arrow-left-right" aria-hidden="true" /> Replace
-                                    <input
-                                      type="file"
-                                      hidden
-                                      accept={
-                                        rules.extensions.length
-                                          ? rules.extensions.map((ext) => `.${ext}`).join(",")
-                                          : undefined
-                                      }
-                                      onChange={(event) =>
-                                        (() => {
-                                          const file = event.target.files?.[0] || null;
-                                          event.currentTarget.value = "";
-                                          handleReplaceFile(field.id, item.id, file);
-                                        })()
-                                      }
-                                    />
-                                  </label>
-                                ) : null}
-                                {item.finalized_at ? (
-                                  <span className="badge text-bg-success">
-                                    <i className="bi bi-cloud-check" aria-hidden="true" /> Finalized
-                                  </span>
-                                ) : null}
-                              </div>
-                            </div>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  ) : null}
-                </label>
-              );
-            }
-
-            if (field.type === "email" || field.type === "github_username") {
-              const autofillValue = getAutofillValue(field);
-              const isAutofilled = Boolean(autofillValue);
-              const inputValue = values[field.id] || autofillValue || "";
-              const placeholder =
-                typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
-                  ? String((field as any).placeholder)
-                  : field.label;
-              const domain = field.type === "email" ? getEmailDomain(field) : "";
-              return (
-                <label key={field.id} className="field">
-                  <span>
-                    {field.label}
-                    {field.required ? " *" : ""}
-                  </span>
-                  <input
-                    type={field.type === "email" ? "email" : "text"}
-                    value={inputValue}
-                    placeholder={placeholder}
-                    disabled={locked || !canSubmit || isAutofilled}
-                    onChange={(event) => {
-                      const nextValue = event.target.value;
-                      setValues((prev) => ({ ...prev, [field.id]: nextValue }));
-                      if (fieldErrors[field.id]) {
-                        updateFieldError(field, nextValue);
-                      }
-                    }}
-                    onBlur={(event) => updateFieldError(field, event.target.value)}
-                  />
-                  {domain ? (
-                    <span className="field-help">Required domain: @{domain}</span>
-                  ) : null}
-                  {isAutofilled ? (
-                    <span className="field-help">Auto-filled from login</span>
-                  ) : null}
-                  {fieldErrors[field.id] ? (
-                    <span className="error-text">{fieldErrors[field.id]}</span>
-                  ) : null}
-                </label>
-              );
-            }
-
-            if (field.type === "textarea") {
-              const placeholder =
-                typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
-                  ? String((field as any).placeholder)
-                  : field.label;
-              return (
-                <label key={field.id} className="field">
-                  <span>
-                    {field.label}
-                    {field.required ? " *" : ""}
-                  </span>
-                  <textarea
-                    rows={4}
-                    value={values[field.id] || ""}
-                    placeholder={placeholder}
-                    disabled={locked || !canSubmit}
-                    onChange={(event) =>
-                      setValues((prev) => ({ ...prev, [field.id]: event.target.value }))
-                    }
-                    onBlur={(event) => updateFieldError(field, event.target.value)}
-                  />
-                  {fieldErrors[field.id] ? (
-                    <span className="error-text">{fieldErrors[field.id]}</span>
-                  ) : null}
-                </label>
-              );
-            }
-
-            if (field.type === "select") {
-              const options = Array.isArray((field as any).options) ? (field as any).options : [];
-              return (
-                <label key={field.id} className="field">
-                  <span>
-                    {field.label}
-                    {field.required ? " *" : ""}
-                  </span>
-                  <select
-                    value={values[field.id] || ""}
-                    disabled={locked || !canSubmit || options.length === 0}
-                    onChange={(event) => {
-                      const nextValue = event.target.value;
-                      setValues((prev) => ({ ...prev, [field.id]: nextValue }));
-                      if (fieldErrors[field.id]) {
-                        updateFieldError(field, nextValue);
-                      }
-                    }}
-                    onBlur={(event) => updateFieldError(field, event.target.value)}
-                  >
-                    <option value="">Select an option</option>
-                    {options.map((option: string) => (
-                      <option key={option} value={option}>
-                        {option}
-                      </option>
-                    ))}
-                  </select>
-                  {options.length === 0 ? <span className="error-text">No options configured</span> : null}
-                  {fieldErrors[field.id] ? (
-                    <span className="error-text">{fieldErrors[field.id]}</span>
-                  ) : null}
-                </label>
-              );
-            }
-
-            if (field.type === "checkbox") {
-              const options = Array.isArray((field as any).options) ? (field as any).options : [];
-              const selectedValues = (values[field.id] || "")
-                .split(",")
-                .map((item) => item.trim())
-                .filter((item) => item.length > 0);
-              const multiple = Boolean((field as any).multiple);
-              return (
-                <fieldset key={field.id} className="field field--group" disabled={locked || !canSubmit}>
-                  <legend>
-                    {field.label}
-                    {field.required ? " *" : ""}
-                  </legend>
-                  {options.length === 0 ? <span className="error-text">No options configured</span> : null}
-                  <div className="checkbox-grid">
-                    {options.map((option: string) => {
-                      const checked = selectedValues.includes(option);
-                      return (
-                        <label key={option} className="checkbox-item">
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={(event) => {
-                              let nextValues = [...selectedValues];
-                              if (event.target.checked) {
-                                if (!multiple) {
-                                  nextValues = [option];
-                                } else if (!nextValues.includes(option)) {
-                                  nextValues.push(option);
-                                }
-                              } else {
-                                nextValues = nextValues.filter((item) => item !== option);
-                              }
-                              const nextValue = nextValues.join(", ");
-                              setValues((prev) => ({ ...prev, [field.id]: nextValue }));
-                              if (fieldErrors[field.id]) {
-                                updateFieldError(field, nextValue);
-                              }
-                            }}
-                            onBlur={() => updateFieldError(field, selectedValues.join(", "))}
-                          />
-                          <span>{option}</span>
-                        </label>
-                      );
-                    })}
-                  </div>
-                  {fieldErrors[field.id] ? (
-                    <span className="error-text">{fieldErrors[field.id]}</span>
-                  ) : null}
-                </fieldset>
-              );
-            }
-
-            if (field.type === "full_name") {
-              const placeholder =
-                typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
-                  ? String((field as any).placeholder)
-                  : field.label;
-              return (
-                <label key={field.id} className="field">
-                  <span>
-                    {field.label}
-                    {field.required ? " *" : ""}
-                  </span>
-                <input
-                  type="text"
-                  value={values[field.id] || ""}
-                  placeholder={placeholder}
-                  disabled={locked || !canSubmit}
-                  onChange={(event) =>
-                    setValues((prev) => ({ ...prev, [field.id]: event.target.value }))
-                  }
-                  onBlur={(event) => {
-                    const formatted = toTitleCase(event.target.value);
-                    if (formatted !== event.target.value) {
-                      setValues((prev) => ({ ...prev, [field.id]: formatted }));
-                    }
-                    updateFieldError(field, formatted);
-                  }}
-                />
-                {fieldErrors[field.id] ? (
-                  <span className="error-text">{fieldErrors[field.id]}</span>
-                ) : null}
-                </label>
-              );
-            }
-
-            return (
-              <label key={field.id} className="field">
-                <span>
-                  {field.label}
-                  {field.required ? " *" : ""}
-                </span>
-                <input
-                  type={
-                    field.type === "date"
-                      ? "date"
-                      : field.type === "email"
-                      ? "email"
-                      : field.type === "number"
-                      ? "number"
-                      : "text"
-                  }
-                  value={values[field.id] || ""}
-                  placeholder={
-                    typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
-                      ? String((field as any).placeholder)
-                      : field.label
-                  }
-                  disabled={locked || !canSubmit}
-                  onChange={(event) => {
-                    const nextValue = event.target.value;
-                    setValues((prev) => ({ ...prev, [field.id]: nextValue }));
-                    if (fieldErrors[field.id]) {
-                      updateFieldError(field, nextValue);
-                    }
-                  }}
-                  onBlur={(event) => updateFieldError(field, event.target.value)}
-                />
-                {fieldErrors[field.id] ? (
-                  <span className="error-text">{fieldErrors[field.id]}</span>
-                ) : null}
-              </label>
-            );
-          })
-        )}
+        {fieldNodes.length === 0 ? <p className="muted">No fields configured yet.</p> : fieldNodes}
         {uploading ? <p className="muted">Uploading files...</p> : null}
-        {deleteError ? <div className="alert alert-danger">{deleteError}</div> : null}
         <div className="form-actions">
           {!locked ? (
             <button
@@ -2647,16 +2705,6 @@ function FormPage({
             >
               <i className="bi bi-send" aria-hidden="true" />{" "}
               {saving ? "Saving..." : isAnyUploading ? "Uploading..." : submitLabel}
-            </button>
-          ) : null}
-          {hasExistingSubmission ? (
-            <button
-              type="button"
-              className="btn btn-outline-danger"
-              disabled={saving || uploading || isAnyUploading}
-              onClick={handleDeleteSubmission}
-            >
-              <i className="bi bi-trash" aria-hidden="true" /> Delete
             </button>
           ) : null}
           {savedAt ? <span className="muted">Last saved: {formatTimeICT(savedAt)}</span> : null}
@@ -2782,6 +2830,63 @@ function DocsPage() {
       </div>
 
       <div className="panel panel--compact">
+        <h3>Canvas enrollment forms</h3>
+        <ul className="list-unstyled">
+          <li>Enable Canvas enrollment in the Builder and select a Canvas course.</li>
+          <li>Optionally limit the dropdown to specific course sections.</li>
+          <li>
+            The form must include a <strong>Full Name</strong> field and an <strong>Email</strong>{" "}
+            field; these are required for Canvas enrollment.
+          </li>
+          <li>
+            If more than one section is available, users must select a section. If there is only
+            one section, it is auto-assigned.
+          </li>
+          <li>
+            After submit: the API enrolls the user and records a status on the submission.
+          </li>
+          <li>
+            Admin Canvas page exposes the retry queue and dead letters with Retry/Drop actions.
+          </li>
+        </ul>
+      </div>
+
+      <div className="panel panel--compact">
+        <h3>Routine tasks + health</h3>
+        <ul className="list-unstyled">
+          <li>
+            Admin dashboard includes routine tasks (cron-based) and health history for key
+            services.
+          </li>
+          <li>
+            Routine tasks include Canvas sync, name mismatch checks, Canvas retry queue, backup,
+            and empty trash.
+          </li>
+          <li>
+            Routine run logs are retained (last 100 per task, last 30 days).
+          </li>
+          <li>
+            Health data is stored in D1 and summarized in the admin health panel.
+          </li>
+        </ul>
+      </div>
+
+      <div className="panel panel--compact">
+        <h3>Backups + restore</h3>
+        <ul className="list-unstyled">
+          <li>
+            Admin can export selected forms/templates to JSON backups.
+          </li>
+          <li>
+            Restore supports slug conflict handling (restore trash version or cancel).
+          </li>
+          <li>
+            Routine backup writes JSON to R2 and Drive under <code>/backups</code>.
+          </li>
+        </ul>
+      </div>
+
+      <div className="panel panel--compact">
         <h3>Admin submissions access</h3>
         <ul className="list-unstyled">
           <li>Admin can open any submission at <code>/#/me/submissions/&lt;id&gt;</code>.</li>
@@ -2853,6 +2958,7 @@ function DocsPage() {
           <li>Start API: <code>npm run dev:api</code></li>
           <li>Start Web: <code>npm run dev:web</code></li>
           <li>Open <code>http://localhost:5173/forms/</code></li>
+          <li>Canvas sync requires <code>CANVAS_API_TOKEN</code> in <code>apps/api/.dev.vars</code>.</li>
         </ol>
       </div>
 
@@ -2868,6 +2974,10 @@ function DocsPage() {
             <strong>API (Cloudflare Workers):</strong> configure{" "}
             <code>wrangler.toml</code> bindings, run migrations, then deploy with{" "}
             <code>npx wrangler deploy -c wrangler.toml</code>.
+          </li>
+          <li>
+            <strong>Canvas:</strong> set <code>CANVAS_API_TOKEN</code> and optional{" "}
+            <code>CANVAS_ACCOUNT_ID</code> in Cloudflare secrets/vars, then sync courses.
           </li>
         </ul>
       </div>
@@ -2911,10 +3021,12 @@ function NotFoundPage() {
 
 function DashboardPage({
   user,
-  onLogin
+  onLogin,
+  onNotice
 }: {
   user: UserInfo | null;
   onLogin: (provider: "google" | "github") => void;
+  onNotice: (message: string, type?: NoticeType) => void;
 }) {
   const [loading, setLoading] = useState(true);
   const [items, setItems] = useState<any[]>([]);
@@ -2960,6 +3072,40 @@ function DashboardPage({
       active = false;
     };
   }, [user]);
+
+  async function handleDeleteSubmission(formSlug: string, canvasEnabled: boolean) {
+    setActionError(null);
+    const confirmMessage = canvasEnabled
+      ? "Move this submission to trash? This will deactivate your Canvas enrollment for this course."
+      : "Move this submission to trash?";
+    if (!window.confirm(confirmMessage)) {
+      return;
+    }
+    const response = await apiFetch(
+      `${API_BASE}/api/me/submission?formSlug=${encodeURIComponent(formSlug)}`,
+      { method: "DELETE" }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setActionError(payload?.error || "Failed to delete submission.");
+      return;
+    }
+    if (canvasEnabled && payload?.canvasAction) {
+      const canvasLabel =
+        payload.canvasAction === "deactivated"
+          ? "deactivated"
+          : payload.canvasAction === "failed"
+            ? "failed"
+            : "skipped";
+      onNotice(
+        `Submission deleted. Canvas deactivation: ${canvasLabel}.`,
+        payload.canvasAction === "failed" ? "warning" : "success"
+      );
+    } else {
+      onNotice("Submission deleted.", "success");
+    }
+    setItems((prev) => prev.filter((entry) => entry.form?.slug !== formSlug));
+  }
 
   if (!user) {
     return (
@@ -3051,16 +3197,23 @@ function DashboardPage({
                       <div className="d-flex gap-2 flex-wrap">
                       <a className="btn btn-outline-primary btn-sm" href={`${PUBLIC_BASE}#/f/${slug}`}>
                         <i className="bi bi-pencil-square" aria-hidden="true" />{" "}
-                        {entry.canEdit ? "Edit submission" : "Open form"}
+                        {entry.canEdit ? "Edit" : "Open"}
                       </a>
                       {entry.latestSubmissionId ? (
                         <Link
                           className="btn btn-outline-secondary btn-sm"
                           to={`/me/submissions/${entry.latestSubmissionId}`}
                         >
-                          <i className="bi bi-eye" aria-hidden="true" /> View submission
+                          <i className="bi bi-eye" aria-hidden="true" /> View
                         </Link>
                       ) : null}
+                      <button
+                        type="button"
+                        className="btn btn-outline-danger btn-sm"
+                        onClick={() => handleDeleteSubmission(slug, Boolean(form.canvas_enabled))}
+                      >
+                        <i className="bi bi-trash" aria-hidden="true" /> Delete
+                      </button>
                       </div>
                     </td>
                   </tr>
@@ -3077,17 +3230,20 @@ function DashboardPage({
 function AccountPage({
   user,
   onLogin,
-  onLogout
+  onLogout,
+  onNotice
 }: {
   user: UserInfo | null;
   onLogin: (provider: "google" | "github") => void;
-  onLogout: () => void;
+  onLogout: (silent?: boolean) => void;
+  onNotice: (message: string, type?: NoticeType) => void;
 }) {
   const location = useLocation();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<ApiError | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [identities, setIdentities] = useState<any[]>([]);
+  const [hasCanvasInfo, setHasCanvasInfo] = useState(false);
 
   useEffect(() => {
     if (!user) {
@@ -3110,6 +3266,7 @@ function AccountPage({
         return;
       }
       setIdentities(Array.isArray(payload?.identities) ? payload.identities : []);
+      setHasCanvasInfo(Boolean(payload?.canvas?.course_id || payload?.canvas?.user_id));
       setError(null);
       setLoading(false);
     }
@@ -3154,7 +3311,10 @@ function AccountPage({
 
   async function handleDeleteAccount() {
     setActionError(null);
-    if (!window.confirm("Delete your account? This will remove your submissions.")) {
+    const confirmMessage = hasCanvasInfo
+      ? "Move your account to trash? This will move your submissions to trash and deactivate your Canvas enrollments. If you want to restore your account later, contact an admin."
+      : "Move your account to trash? This will move your submissions to trash. If you want to restore your account later, contact an admin.";
+    if (!window.confirm(confirmMessage)) {
       return;
     }
     // Soft-delete the account server-side; API clears the auth cookie.
@@ -3164,14 +3324,21 @@ function AccountPage({
       setActionError(payload?.error || "Failed to delete account.");
       return;
     }
-    onLogout();
+    onNotice("Account moved to trash.", "success");
+    onLogout(true);
   }
 
   return (
     <section className="panel">
       <div className="panel-header">
         <h2>Account</h2>
-        {user ? <span className="badge">{user.email || user.userId}</span> : null}
+        {user ? (
+          <span className="badge">
+            {user.provider === "github"
+              ? user.username || user.email || user.userId
+              : user.email || user.userId}
+          </span>
+        ) : null}
       </div>
       {linked ? (
         <div className="alert alert-success" role="alert">
@@ -3195,9 +3362,21 @@ function AccountPage({
       ) : null}
       {actionError ? <div className="alert alert-danger">{actionError}</div> : null}
       <div className="panel panel--compact">
+        <div className="panel-header">
+          <h3 className="mb-0">Role</h3>
+        </div>
+        <span
+          className={`badge fs-6 ${user?.isAdmin ? "text-bg-warning" : "text-bg-secondary"}`}
+        >
+          {user?.isAdmin ? "Admin" : "User"}
+        </span>
+      </div>
+      <div className="panel panel--compact mt-3">
+        <div className="panel-header">
+          <h3 className="mb-0">Linked identities</h3>
+        </div>
         <div className="row g-3">
           <div className="col-md-6">
-            <div className="muted">Linked identities</div>
             {identities.length === 0 ? (
               <div className="muted">No linked identities yet.</div>
             ) : (
@@ -3208,7 +3387,9 @@ function AccountPage({
                       <i className={`bi ${getAuthPolicyIcon(identity.provider)}`} aria-hidden="true" />{" "}
                       {identity.provider}
                     </span>
-                    {identity.email || identity.providerLogin || identity.providerSub || "n/a"}
+                    {identity.provider === "github"
+                      ? identity.providerLogin || identity.email || identity.providerSub || "n/a"
+                      : identity.email || identity.providerLogin || identity.providerSub || "n/a"}
                   </li>
                 ))}
               </ul>
@@ -3248,19 +3429,196 @@ function AccountPage({
   );
 }
 
-function SubmissionDetailPage({
+function CanvasPage({
   user,
   onLogin
 }: {
   user: UserInfo | null;
   onLogin: (provider: "google" | "github") => void;
 }) {
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<ApiError | null>(null);
+  const [canvasInfo, setCanvasInfo] = useState<{
+    user_id: string | null;
+    name: string | null;
+    course_id: string | null;
+    course_name: string | null;
+    course_code: string | null;
+    section_id: string | null;
+    section_name: string | null;
+    status: string | null;
+    enrolled_at: string | null;
+    form_title: string | null;
+    submission_id: string | null;
+    submission_deleted: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+    let active = true;
+    async function loadCanvas() {
+      setLoading(true);
+      const response = await apiFetch(`${API_BASE}/api/me`);
+      const payload = await response.json().catch(() => null);
+      if (!active) return;
+      if (!response.ok) {
+        setError({
+          status: response.status,
+          requestId: payload?.requestId,
+          message: payload?.error || "Request failed"
+        });
+        setLoading(false);
+        return;
+      }
+      setCanvasInfo(payload?.canvas ?? null);
+      setError(null);
+      setLoading(false);
+    }
+    loadCanvas();
+    return () => {
+      active = false;
+    };
+  }, [user]);
+
+  if (!user) {
+    return (
+      <section className="panel panel--error">
+        <h2>Sign in required</h2>
+        <p>Please sign in to view Canvas details.</p>
+        <div className="auth-bar">
+          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+            <i className="bi bi-google" aria-hidden="true" /> Login with Google
+          </button>
+          <button type="button" className="btn btn-outline-dark" onClick={() => onLogin("github")}>
+            <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  const hasCanvasInfo = Boolean(
+    canvasInfo &&
+      (canvasInfo.user_id ||
+        canvasInfo.course_id ||
+        canvasInfo.course_name ||
+        canvasInfo.course_code ||
+        canvasInfo.section_id ||
+        canvasInfo.section_name ||
+        canvasInfo.status ||
+        canvasInfo.name ||
+        canvasInfo.enrolled_at ||
+        canvasInfo.form_title)
+  );
+
+  return (
+    <section className="panel">
+      <div className="panel-header">
+        <h2>Canvas</h2>
+      </div>
+      {loading ? <p className="muted">Loading...</p> : null}
+      {error ? (
+        <div className="alert alert-danger" role="alert">
+          {error.message || "Failed to load Canvas."}
+        </div>
+      ) : null}
+      {user.isAdmin ? (
+        <div className="alert alert-info">
+          Admin view is available in <Link to="/admin/canvas">Admin Canvas</Link>.
+        </div>
+      ) : null}
+      {hasCanvasInfo ? (
+        <div className="panel panel--compact">
+          <div className="panel-header">
+            <h3 className="mb-0">Your Canvas enrollment</h3>
+          </div>
+          <div className="row g-3">
+            {canvasInfo?.name ? (
+              <div className="col-md-6">
+                <div className="muted">Display name</div>
+                <div>{canvasInfo.name}</div>
+              </div>
+            ) : null}
+            {canvasInfo?.user_id ? (
+              <div className="col-md-6">
+                <div className="muted">Canvas ID</div>
+                <div>{canvasInfo.user_id}</div>
+              </div>
+            ) : null}
+            {canvasInfo?.course_name || canvasInfo?.course_code || canvasInfo?.course_id ? (
+              <div className="col-md-6">
+                <div className="muted">Registered course</div>
+                {canvasInfo?.course_id ? (
+                  <a
+                    href={`https://canvas.instructure.com/courses/${canvasInfo.course_id}`}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {canvasInfo.course_name || canvasInfo.course_code || canvasInfo.course_id}
+                  </a>
+                ) : (
+                  <div>{canvasInfo.course_name || canvasInfo.course_code || canvasInfo.course_id}</div>
+                )}
+              </div>
+            ) : null}
+            {canvasInfo?.section_name || canvasInfo?.section_id ? (
+              <div className="col-md-6">
+                <div className="muted">Section</div>
+                <div>{canvasInfo.section_name || canvasInfo.section_id}</div>
+              </div>
+            ) : null}
+            {canvasInfo?.status ? (
+              <div className="col-md-6">
+                <div className="muted">Enrollment status</div>
+                <div>{canvasInfo.status === "deleted" ? "unenrolled" : canvasInfo.status}</div>
+              </div>
+            ) : null}
+            {canvasInfo?.enrolled_at ? (
+              <div className="col-md-6">
+                <div className="muted">
+                  Registered via form {canvasInfo.form_title || "submission"} at
+                </div>
+                <div className="d-flex flex-wrap gap-2 align-items-center">
+                  <span>{formatTimeICT(canvasInfo.enrolled_at)}</span>
+                  {canvasInfo?.submission_id && !canvasInfo.submission_deleted ? (
+                    <Link to={`/me/submissions/${canvasInfo.submission_id}`}>
+                      View submission
+                    </Link>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : (
+        <div className="muted">No Canvas enrollment found yet.</div>
+      )}
+    </section>
+  );
+}
+
+function SubmissionDetailPage({
+  user,
+  onLogin,
+  onNotice
+}: {
+  user: UserInfo | null;
+  onLogin: (provider: "google" | "github") => void;
+  onNotice: (message: string, type?: NoticeType) => void;
+}) {
   const { id } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<ApiError | null>(null);
   const [data, setData] = useState<any | null>(null);
   const [fieldMeta, setFieldMeta] = useState<Record<string, { label: string; type: string }>>({});
   const [fieldOrder, setFieldOrder] = useState<string[]>([]);
+  const [showSubmitNotice, setShowSubmitNotice] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!user || !id) {
@@ -3291,6 +3649,41 @@ function SubmissionDetailPage({
       active = false;
     };
   }, [user, id]);
+
+  async function handleDeleteSubmission() {
+    if (!data?.form?.slug) return;
+    setDeleteError(null);
+    const confirmMessage = data.form?.canvas_enabled
+      ? "Move this submission to trash? This will deactivate your Canvas enrollment for this course."
+      : "Move this submission to trash?";
+    if (!window.confirm(confirmMessage)) {
+      return;
+    }
+    const response = await apiFetch(
+      `${API_BASE}/api/me/submission?formSlug=${encodeURIComponent(data.form.slug)}`,
+      { method: "DELETE" }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setDeleteError(payload?.error || "Failed to delete submission.");
+      return;
+    }
+    if (data.form?.canvas_enabled && payload?.canvasAction) {
+      const canvasLabel =
+        payload.canvasAction === "deactivated"
+          ? "deactivated"
+          : payload.canvasAction === "failed"
+            ? "failed"
+            : "skipped";
+      onNotice(
+        `Submission deleted. Canvas deactivation: ${canvasLabel}.`,
+        payload.canvasAction === "failed" ? "warning" : "success"
+      );
+    } else {
+      onNotice("Submission deleted.", "success");
+    }
+    navigate("/me");
+  }
 
   useEffect(() => {
     if (!data?.form?.slug) {
@@ -3330,6 +3723,39 @@ function SubmissionDetailPage({
     };
   }, [data?.form?.slug]);
 
+  const submittedName =
+    data?.data_json && typeof data.data_json === "object"
+      ? pickNameFromData(data.data_json as Record<string, unknown>)
+      : "";
+  const canvasDisplayName =
+    data?.canvas && typeof data.canvas.user_name === "string" ? data.canvas.user_name.trim() : "";
+  const isCanvasInvited = data?.canvas?.status === "invited";
+  const isCanvasDeleted = data?.canvas?.status === "deleted";
+  const isCanvasNameMissing = isCanvasInvited && !isCanvasDeleted && submittedName && !canvasDisplayName;
+  const hasNameMismatch =
+    isCanvasInvited &&
+    !isCanvasDeleted &&
+    submittedName &&
+    canvasDisplayName &&
+    normalizeNameValue(submittedName) !== normalizeNameValue(canvasDisplayName);
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const submitted = params.get("submitted") === "1";
+    if (!submitted) {
+      setShowSubmitNotice(false);
+      return;
+    }
+    setShowSubmitNotice(true);
+    const timer = window.setTimeout(() => {
+      setShowSubmitNotice(false);
+      navigate(location.pathname, { replace: true });
+    }, 10000);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [location.pathname, location.search, navigate]);
+
   if (!user) {
     return (
       <section className="panel panel--error">
@@ -3358,6 +3784,23 @@ function SubmissionDetailPage({
           {error.message || "Failed to load submission."}
         </div>
       ) : null}
+      {showSubmitNotice ? (
+        <div className="alert alert-success" role="alert">
+          <div className="fw-semibold">Your submission was saved.</div>
+          {data?.canvas?.status === "invited" ? (
+            <div className="mt-1">
+              Your Canvas enrollment is invited. Please check your email to accept the invitation.
+            </div>
+          ) : null}
+          {data?.canvas?.status === "deactivated" ? (
+            <div className="mt-1">
+              Your Canvas enrollment is deactivated. Contact the administrator if you need access
+              restored.
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {deleteError ? <div className="alert alert-danger">{deleteError}</div> : null}
       {data ? (
         <div className="panel panel--compact">
           <div className="d-flex justify-content-between align-items-center mb-2">
@@ -3366,9 +3809,14 @@ function SubmissionDetailPage({
               <div className="fw-semibold">{data.form?.title || data.form?.slug || "Form"}</div>
               {data.form?.slug ? <div className="muted">{data.form.slug}</div> : null}
             </div>
-            <Link className="btn btn-outline-primary btn-sm" to={`/f/${data.form?.slug || ""}`}>
-              Open form
-            </Link>
+            <div className="d-flex gap-2">
+              <Link className="btn btn-outline-primary btn-sm" to={`/f/${data.form?.slug || ""}`}>
+                <i className="bi bi-box-arrow-up-right" aria-hidden="true" /> Open form
+              </Link>
+              <button type="button" className="btn btn-outline-danger btn-sm" onClick={handleDeleteSubmission}>
+                <i className="bi bi-trash" aria-hidden="true" /> Delete
+              </button>
+            </div>
           </div>
           <div className="muted">
             Submitted: {data.created_at ? formatTimeICT(data.created_at) : "n/a"}
@@ -3376,6 +3824,32 @@ function SubmissionDetailPage({
           <div className="muted">
             Updated: {data.updated_at ? formatTimeICT(data.updated_at) : "n/a"}
           </div>
+          {data.canvas?.status ? (
+            <div className="muted">
+              Canvas enrollment: {data.canvas.status === "deleted" ? "unenrolled" : data.canvas.status}
+              {data.canvas.error &&
+              data.canvas.status !== "deactivated" &&
+              data.canvas.status !== "deleted" &&
+              data.canvas.status !== "invited"
+                ? ` (${data.canvas.error})`
+                : ""}
+            </div>
+          ) : null}
+          {hasNameMismatch || isCanvasNameMissing ? (
+            <div className="alert alert-warning mt-2">
+              <i className="bi bi-exclamation-triangle" aria-hidden="true" /> Your Canvas display
+              name{" "}
+              {canvasDisplayName ? (
+                <>
+                  <strong>{canvasDisplayName}</strong> differs from the submitted full name{" "}
+                  <strong>{submittedName}</strong>.
+                </>
+              ) : (
+                <>is missing.</>
+              )}{" "}
+              Please update your Canvas display name to match your submitted full name.
+            </div>
+          ) : null}
           <div className="mt-3">
             <div className="muted mb-2">Data</div>
             {data.data_json && typeof data.data_json === "object" ? (
@@ -3482,6 +3956,16 @@ function AdminPage({
   const [templates, setTemplates] = useState<any[]>([]);
   const [users, setUsers] = useState<any[]>([]);
   const [uploads, setUploads] = useState<any[]>([]);
+  const [routines, setRoutines] = useState<any[]>([]);
+  const [healthSummary, setHealthSummary] = useState<any[]>([]);
+  const [healthHistory, setHealthHistory] = useState<any[]>([]);
+  const [healthError, setHealthError] = useState<string | null>(null);
+  const [routineEdits, setRoutineEdits] = useState<Record<string, { cron: string; enabled: boolean }>>(
+    {}
+  );
+  const [routineStatus, setRoutineStatus] = useState<string | null>(null);
+  const [routineLogs, setRoutineLogs] = useState<any[]>([]);
+  const [activeRoutineLogId, setActiveRoutineLogId] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
   const [selectedSlug, setSelectedSlug] = useState<string>("");
@@ -3503,9 +3987,46 @@ function AdminPage({
   const [selectedTemplates, setSelectedTemplates] = useState<Set<string>>(new Set());
   const [selectedUsers, setSelectedUsers] = useState<Set<string>>(new Set());
   const [selectedSubmissions, setSelectedSubmissions] = useState<Set<string>>(new Set());
+  const formRestoreRef = useRef<HTMLInputElement | null>(null);
+  const [restoreFormsPreview, setRestoreFormsPreview] = useState<any[] | null>(null);
+  const [restoreFormsFileName, setRestoreFormsFileName] = useState<string | null>(null);
+  const formRestoreAsTemplateRef = useRef<HTMLInputElement | null>(null);
+  const templateRestoreRef = useRef<HTMLInputElement | null>(null);
 
   function startBulk(label: string, total: number) {
     setBulkStatus({ label, total, done: 0 });
+  }
+
+  function getHealthBadgeClass(status: string | null) {
+    if (status === "ok") return "text-bg-success";
+    if (status === "error") return "text-bg-danger";
+    if (status === "skipped") return "text-bg-secondary";
+    return "text-bg-light";
+  }
+
+  function getHealthServiceTitle(value: string | null) {
+    switch (value) {
+      case "canvas_sync":
+        return "Canvas sync";
+      case "canvas_name_mismatch":
+        return "Canvas name mismatch checker";
+      case "canvas_retry_queue":
+        return "Canvas retry queue";
+      case "backup_forms_templates":
+        return "Backup forms + templates";
+      case "empty_trash":
+        return "Empty trash";
+      case "test_notice":
+        return "Test notice";
+      case "gmail_send":
+        return "Gmail send";
+      case "drive_upload":
+        return "Drive upload";
+      case "routine_unknown":
+        return "Routine (unknown)";
+      default:
+        return value || "n/a";
+    }
   }
 
   function advanceBulk() {
@@ -3527,11 +4048,22 @@ function AdminPage({
     }
     setStatus("ok");
 
-    const [formsRes, templatesRes, usersRes, uploadsRes] = await Promise.all([
+    const [
+      formsRes,
+      templatesRes,
+      usersRes,
+      uploadsRes,
+      routinesRes,
+      healthSummaryRes,
+      healthHistoryRes
+    ] = await Promise.all([
       apiFetch(`${API_BASE}/api/admin/forms`),
       apiFetch(`${API_BASE}/api/admin/templates`),
       apiFetch(`${API_BASE}/api/admin/users`),
-      apiFetch(`${API_BASE}/api/admin/uploads?limit=100`)
+      apiFetch(`${API_BASE}/api/admin/uploads?limit=100`),
+      apiFetch(`${API_BASE}/api/admin/routines`),
+      apiFetch(`${API_BASE}/api/admin/health/summary`),
+      apiFetch(`${API_BASE}/api/admin/health/history?limit=30`)
     ]);
 
     const formsPayload = formsRes.ok ? await formsRes.json().catch(() => null) : null;
@@ -3552,6 +4084,31 @@ function AdminPage({
 
     const uploadsPayload = uploadsRes.ok ? await uploadsRes.json().catch(() => null) : null;
     setUploads(Array.isArray(uploadsPayload?.data) ? uploadsPayload.data : []);
+
+    const routinesPayload = routinesRes.ok ? await routinesRes.json().catch(() => null) : null;
+    const routinesList = Array.isArray(routinesPayload?.data) ? routinesPayload.data : [];
+    setRoutines(routinesList);
+    setRoutineEdits((prev) => {
+      const next: Record<string, { cron: string; enabled: boolean }> = { ...prev };
+      routinesList.forEach((task: any) => {
+        if (!task?.id) return;
+        next[task.id] = {
+          cron: typeof task.cron === "string" ? task.cron : "",
+          enabled: Boolean(task.enabled)
+        };
+      });
+      return next;
+    });
+
+    const healthSummaryPayload = healthSummaryRes.ok ? await healthSummaryRes.json().catch(() => null) : null;
+    const healthHistoryPayload = healthHistoryRes.ok ? await healthHistoryRes.json().catch(() => null) : null;
+    if (!healthSummaryRes.ok || !healthHistoryRes.ok) {
+      setHealthError("Failed to load health history.");
+    } else {
+      setHealthError(null);
+    }
+    setHealthSummary(Array.isArray(healthSummaryPayload?.data) ? healthSummaryPayload.data : []);
+    setHealthHistory(Array.isArray(healthHistoryPayload?.data) ? healthHistoryPayload.data : []);
 
     setLastRefresh(new Date().toISOString());
   }
@@ -3678,6 +4235,377 @@ function AdminPage({
     window.setTimeout(() => setCopyStatus(null), 2000);
   }
 
+  async function clearHealthHistory() {
+    if (!window.confirm("Clear health history?")) {
+      return;
+    }
+    const response = await apiFetch(`${API_BASE}/api/admin/health/clear`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = payload?.error || "Failed to clear health history.";
+      onNotice(message, "error");
+      return;
+    }
+    setHealthSummary([]);
+    setHealthHistory([]);
+    onNotice("Health history cleared.", "success");
+  }
+
+
+  function getFilenameFromContentDisposition(value: string | null, fallback: string) {
+    if (!value) return fallback;
+    const match = value.match(/filename=\"?([^\";]+)\"?/i);
+    return match?.[1] || fallback;
+  }
+
+  async function downloadBackup(url: string, fallbackName: string) {
+    const response = await apiFetch(url);
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      setActionError(payload?.error || "Backup download failed.");
+      return;
+    }
+    const blob = await response.blob();
+    const cd = response.headers.get("content-disposition");
+    const filename = getFilenameFromContentDisposition(cd, fallbackName);
+    const blobUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = blobUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(blobUrl);
+  }
+
+  async function handleRestoreFormFile(file: File) {
+    setActionError(null);
+    setRestoreFormsPreview(null);
+    setRestoreFormsFileName(file.name);
+    onNotice("Reading backup file...", "info");
+    let text = "";
+    try {
+      text = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(reader.error || new Error("read_failed"));
+        reader.readAsText(file);
+      });
+    } catch {
+      setActionError("Failed to read the backup file.");
+      onNotice("Failed to read the backup file.", "error");
+      return;
+    }
+    text = text.replace(/^\uFEFF/, "");
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      setActionError("Invalid JSON file.");
+      onNotice("Invalid JSON file.", "error");
+      return;
+    }
+    const formsList = Array.isArray(parsed?.forms)
+      ? parsed.forms
+      : Array.isArray(parsed?.data?.forms)
+      ? parsed.data.forms
+      : parsed?.data?.form
+      ? [parsed.data.form]
+      : parsed?.form
+      ? [parsed.form]
+      : [];
+    if (formsList.length === 0) {
+      setActionError("Backup does not include any forms.");
+      onNotice("Backup does not include any forms.", "error");
+      return;
+    }
+    const validForms = formsList.filter((form: any) => form && typeof form.slug === "string");
+    if (validForms.length === 0) {
+      setActionError("Backup does not include any valid forms.");
+      onNotice("Backup does not include any valid forms.", "error");
+      return;
+    }
+    setRestoreFormsPreview(validForms);
+    onNotice(`Loaded ${validForms.length} form(s) from backup.`, "success");
+  }
+
+  async function performRestoreForms() {
+    if (!restoreFormsPreview || restoreFormsPreview.length === 0) {
+      setActionError("No forms to restore.");
+      return;
+    }
+    onNotice("Restoring form backup...", "info");
+    for (const form of restoreFormsPreview) {
+      let response = await apiFetch(`${API_BASE}/api/admin/forms/restore`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "form", form })
+      });
+      let payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        if (response.status === 409 && payload?.detail?.message === "slug_in_trash") {
+          const confirmRestore = window.confirm(
+            `A form with slug "${form.slug}" is in trash. Restore that version?`
+          );
+          if (confirmRestore) {
+            response = await apiFetch(`${API_BASE}/api/admin/forms/restore`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ type: "form", form, restoreTrash: true })
+            });
+            payload = await response.json().catch(() => null);
+          } else {
+            setActionError("Restore cancelled.");
+            onNotice("Restore cancelled.", "warning");
+            return;
+          }
+        }
+        if (!response.ok) {
+          setActionError(payload?.error || "Form restore failed.");
+          onNotice("Form restore failed.", "error");
+          return;
+        }
+      }
+    }
+    onNotice(`Restored ${restoreFormsPreview.length} form(s).`, "success");
+    setRestoreFormsPreview(null);
+    setRestoreFormsFileName(null);
+    await loadAdmin();
+  }
+
+  async function handleRestoreTemplateFile(file: File) {
+    setActionError(null);
+    const text = await file.text();
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      setActionError("Invalid JSON file.");
+      return;
+    }
+    const templatesList = Array.isArray(parsed?.templates)
+      ? parsed.templates
+      : Array.isArray(parsed?.data?.templates)
+      ? parsed.data.templates
+      : parsed?.data?.template
+      ? [parsed.data.template]
+      : parsed?.template
+      ? [parsed.template]
+      : [];
+    if (templatesList.length === 0) {
+      setActionError("Backup does not include any templates.");
+      return;
+    }
+    for (const template of templatesList) {
+      let response = await apiFetch(`${API_BASE}/api/admin/templates/restore`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "template", template })
+      });
+      let payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        if (response.status === 409 && payload?.detail?.message === "slug_in_trash") {
+          const confirmRestore = window.confirm(
+            `A template with key "${template.key}" is in trash. Restore that version?`
+          );
+          if (confirmRestore) {
+            response = await apiFetch(`${API_BASE}/api/admin/templates/restore`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ type: "template", template, restoreTrash: true })
+            });
+            payload = await response.json().catch(() => null);
+          } else {
+            setActionError("Restore cancelled.");
+            onNotice("Restore cancelled.", "warning");
+            return;
+          }
+        }
+        if (!response.ok) {
+          setActionError(payload?.error || "Template restore failed.");
+          return;
+        }
+      }
+    }
+    onNotice("Template restored.", "success");
+    await loadAdmin();
+  }
+
+  async function handleRestoreFormAsTemplateFile(file: File) {
+    setActionError(null);
+    const text = await file.text();
+    let parsed: any = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      setActionError("Invalid JSON file.");
+      return;
+    }
+    const formsList = Array.isArray(parsed?.forms)
+      ? parsed.forms
+      : Array.isArray(parsed?.data?.forms)
+      ? parsed.data.forms
+      : parsed?.data?.form
+      ? [parsed.data.form]
+      : parsed?.form
+      ? [parsed.form]
+      : [];
+    if (formsList.length === 0) {
+      setActionError("Backup does not include any forms.");
+      return;
+    }
+    for (const form of formsList) {
+      let response = await apiFetch(`${API_BASE}/api/admin/templates/from-form`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: "form", form })
+      });
+      let payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        if (response.status === 409 && payload?.detail?.message === "slug_in_trash") {
+          const confirmRestore = window.confirm(
+            `A template with key "${form.templateKey}" is in trash. Restore that version?`
+          );
+          if (confirmRestore) {
+            response = await apiFetch(`${API_BASE}/api/admin/templates/from-form`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ type: "form", form, restoreTrash: true })
+            });
+            payload = await response.json().catch(() => null);
+          } else {
+            setActionError("Restore cancelled.");
+            onNotice("Restore cancelled.", "warning");
+            return;
+          }
+        }
+        if (!response.ok) {
+          setActionError(payload?.error || "Template creation failed.");
+          return;
+        }
+      }
+    }
+    onNotice("Template created from form.", "success");
+    await loadAdmin();
+  }
+
+  async function handleBackupSelectedTemplates(keys: string[]) {
+    if (keys.length === 0) {
+      setActionError("Select at least one template to back up.");
+      return;
+    }
+    const templatesBackup: any[] = [];
+    for (const key of keys) {
+      const response = await apiFetch(
+        `${API_BASE}/api/admin/templates/${encodeURIComponent(key)}/backup`
+      );
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        setActionError(payload?.error || `Backup failed for ${key}.`);
+        return;
+      }
+      if (payload?.data?.template) {
+        templatesBackup.push(payload.data.template);
+      }
+    }
+    if (templatesBackup.length === 0) {
+      setActionError("No templates were included in the backup.");
+      return;
+    }
+    const backupPayload = {
+      type: "templates_backup",
+      templates: templatesBackup
+    };
+    const blob = new Blob([JSON.stringify(backupPayload, null, 2)], {
+      type: "application/json"
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `templates-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    link.rel = "noreferrer";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function updateRoutine(taskId: string) {
+    const edit = routineEdits[taskId];
+    if (!edit) return;
+    setRoutineStatus(null);
+    const response = await apiFetch(`${API_BASE}/api/admin/routines`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: taskId, cron: edit.cron, enabled: edit.enabled })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setRoutineStatus(payload?.error || "Failed to update routine.");
+      onNotice(payload?.error || "Failed to update routine.", "error");
+      return;
+    }
+    setRoutineStatus("Routine updated.");
+    onNotice("Routine updated.", "success");
+    await loadAdmin();
+  }
+
+  async function runRoutine(taskId: string) {
+    setRoutineStatus(null);
+    const response = await apiFetch(`${API_BASE}/api/admin/routines/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: taskId })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = payload?.error || "Failed to run routine.";
+      setRoutineStatus(message);
+      onNotice(message, "error");
+      return;
+    }
+    const message = taskId === "test_notice" ? "Test notice task ran." : "Routine ran.";
+    setRoutineStatus(message);
+    onNotice(message, "success");
+    await loadAdmin();
+  }
+
+  async function loadRoutineLogs(taskId: string) {
+    const response = await apiFetch(
+      `${API_BASE}/api/admin/routines/logs?taskId=${encodeURIComponent(taskId)}&limit=20`
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setRoutineStatus(payload?.error || "Failed to load routine logs.");
+      return;
+    }
+    setRoutineLogs(Array.isArray(payload?.data) ? payload.data : []);
+    setActiveRoutineLogId(taskId);
+  }
+
+  async function clearRoutineLogs(taskId: string) {
+    const response = await apiFetch(`${API_BASE}/api/admin/routines/logs/clear`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ taskId })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = payload?.error || "Failed to clear logs.";
+      setRoutineStatus(message);
+      onNotice(message, "error");
+      return;
+    }
+    setRoutineLogs([]);
+    setRoutineStatus("Logs cleared.");
+    onNotice("Logs cleared.", "success");
+    await loadAdmin();
+  }
+
   function nextAuthPolicy(value: string | null | undefined) {
     const order = ["optional", "required", "google", "github", "either"];
     const current = value || "optional";
@@ -3726,7 +4654,7 @@ function AdminPage({
 
   async function handleDeleteForm(slug: string) {
     setActionError(null);
-    if (!window.confirm(`Delete form "${slug}"? This cannot be undone.`)) {
+    if (!window.confirm(`Move form "${slug}" to trash?`)) {
       return;
     }
     const response = await apiFetch(`${API_BASE}/api/admin/forms/${encodeURIComponent(slug)}`, {
@@ -3745,7 +4673,7 @@ function AdminPage({
 
   async function handleDeleteTemplate(key: string) {
     setActionError(null);
-    if (!window.confirm(`Delete template "${key}"? This cannot be undone.`)) {
+    if (!window.confirm(`Move template "${key}" to trash?`)) {
       return;
     }
     const response = await apiFetch(
@@ -3762,7 +4690,7 @@ function AdminPage({
 
   async function handleDeleteUser(userId: string) {
     setActionError(null);
-    if (!window.confirm("Delete this user? This will soft-delete the account.")) {
+    if (!window.confirm("Move this user to trash?")) {
       return;
     }
     const response = await apiFetch(`${API_BASE}/api/admin/users/${encodeURIComponent(userId)}`, {
@@ -3776,9 +4704,25 @@ function AdminPage({
     setUsers((prev) => prev.filter((user) => user.id !== userId));
   }
 
+  async function handlePromoteUser(userId: string) {
+    setActionError(null);
+    const response = await apiFetch(
+      `${API_BASE}/api/admin/users/${encodeURIComponent(userId)}/promote`,
+      { method: "POST" }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setActionError(payload?.error || "Failed to promote user.");
+      return;
+    }
+    setUsers((prev) =>
+      prev.map((user) => (user.id === userId ? { ...user, is_admin: 1 } : user))
+    );
+  }
+
   async function handleDeleteUpload(uploadId: string) {
     setUploadActionError(null);
-    if (!window.confirm("Delete this upload?")) {
+    if (!window.confirm("Move this upload to trash?")) {
       return;
     }
     const response = await apiFetch(`${API_BASE}/api/admin/uploads/${encodeURIComponent(uploadId)}`, {
@@ -3820,7 +4764,7 @@ function AdminPage({
   async function bulkDeleteForms() {
     const ids = Array.from(selectedForms);
     if (ids.length === 0) return;
-    if (!window.confirm("Delete selected forms?")) return;
+    if (!window.confirm("Move selected forms to trash?")) return;
     setActionError(null);
     startBulk("Deleting forms", ids.length);
     for (const slug of ids) {
@@ -3842,7 +4786,7 @@ function AdminPage({
   async function bulkDeleteTemplates() {
     const ids = Array.from(selectedTemplates);
     if (ids.length === 0) return;
-    if (!window.confirm("Delete selected templates?")) return;
+    if (!window.confirm("Move selected templates to trash?")) return;
     setActionError(null);
     startBulk("Deleting templates", ids.length);
     for (const key of ids) {
@@ -3864,7 +4808,7 @@ function AdminPage({
   async function bulkDeleteUsers() {
     const ids = Array.from(selectedUsers);
     if (ids.length === 0) return;
-    if (!window.confirm("Delete selected users?")) return;
+    if (!window.confirm("Move selected users to trash?")) return;
     setActionError(null);
     startBulk("Deleting users", ids.length);
     for (const id of ids) {
@@ -3886,7 +4830,7 @@ function AdminPage({
   async function bulkDeleteSubmissions() {
     const ids = Array.from(selectedSubmissions);
     if (ids.length === 0) return;
-    if (!window.confirm("Delete selected submissions?")) return;
+    if (!window.confirm("Move selected submissions to trash?")) return;
     setSubmissionActionError(null);
     startBulk("Deleting submissions", ids.length);
     for (const id of ids) {
@@ -3908,7 +4852,7 @@ function AdminPage({
 
   async function handleDeleteSubmissionAdmin(submissionId: string) {
     setSubmissionActionError(null);
-    if (!window.confirm("Delete this submission?")) {
+    if (!window.confirm("Move this submission to trash?")) {
       return;
     }
     const response = await apiFetch(
@@ -4135,7 +5079,334 @@ function AdminPage({
           </div>
         </div>
         <div>
+          <div className="panel panel--compact mb-3">
+            <div className="panel-header">
+              <h3 className="mb-0">Routine tasks</h3>
+              {lastRefresh ? (
+                <span className="muted">Updated {formatTimeICT(lastRefresh)}</span>
+              ) : (
+                <span className="muted">Updated just now</span>
+              )}
+            </div>
+            <div className="muted mb-2">
+              Cron format: <code>* * * * *</code>. Learn more at{" "}
+              <a href="https://crontab.guru" target="_blank" rel="noreferrer">
+                crontab.guru
+              </a>
+              .
+            </div>
+            {routineStatus ? <div className="alert alert-info">{routineStatus}</div> : null}
+            {routines.length === 0 ? (
+              <div className="muted">No routine tasks reported.</div>
+            ) : (
+              <div className="table-responsive">
+                <table className="table table-sm align-middle">
+                  <thead>
+                    <tr>
+                      <th>Task</th>
+                      <th>Cron</th>
+                      <th>Enabled</th>
+                      <th>Last run</th>
+                      <th>Status</th>
+                      <th>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {routines.map((task: any) => {
+                      const edit = routineEdits[task.id] || {
+                        cron: task.cron || "",
+                        enabled: Boolean(task.enabled)
+                      };
+                      return (
+                        <tr key={task.id || task.name}>
+                          <td>{task.name || "n/a"}</td>
+                          <td style={{ minWidth: 160 }}>
+                            <input
+                              className="form-control form-control-sm"
+                              value={edit.cron}
+                              onChange={(event) =>
+                                setRoutineEdits((prev) => ({
+                                  ...prev,
+                                  [task.id]: { ...edit, cron: event.target.value }
+                                }))
+                              }
+                            />
+                          </td>
+                          <td>
+                            <div className="form-check">
+                              <input
+                                className="form-check-input"
+                                type="checkbox"
+                                checked={edit.enabled}
+                                onChange={(event) =>
+                                  setRoutineEdits((prev) => ({
+                                    ...prev,
+                                    [task.id]: { ...edit, enabled: event.target.checked }
+                                  }))
+                                }
+                              />
+                            </div>
+                          </td>
+                          <td>{task.last_run_at ? formatTimeICT(task.last_run_at) : "n/a"}</td>
+                          <td>
+                            <button
+                              type="button"
+                              className={`badge border-0 ${
+                                task.last_status === "ok"
+                                  ? "text-bg-success"
+                                  : task.last_status === "error"
+                                  ? "text-bg-danger"
+                                  : task.last_status === "skipped"
+                                  ? "text-bg-warning"
+                                  : "text-bg-secondary"
+                              }`}
+                              onClick={() => loadRoutineLogs(task.id)}
+                            >
+                              {task.last_status || "n/a"}
+                            </button>
+                          </td>
+                          <td>
+                            <button
+                              type="button"
+                              className="btn btn-outline-primary btn-sm"
+                              onClick={() => updateRoutine(task.id)}
+                            >
+                              <i className="bi bi-save" aria-hidden="true" /> Save
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-outline-secondary btn-sm ms-2"
+                              onClick={() => runRoutine(task.id)}
+                            >
+                              <i className="bi bi-play" aria-hidden="true" /> Run now
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {activeRoutineLogId ? (
+              <div className="panel panel--compact mt-3">
+                <div className="panel-header">
+                  <strong>Last runs</strong>
+                  <div className="d-flex gap-2">
+                    <button
+                      type="button"
+                      className="btn btn-outline-danger btn-sm"
+                      onClick={() => clearRoutineLogs(activeRoutineLogId)}
+                    >
+                      <i className="bi bi-trash" aria-hidden="true" /> Clear logs
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-link btn-sm"
+                      onClick={() => setActiveRoutineLogId(null)}
+                    >
+                      Hide
+                    </button>
+                  </div>
+                </div>
+                {routineLogs.length === 0 ? (
+                  <div className="muted">No runs recorded.</div>
+                ) : (
+                  <div className="table-responsive">
+                    <table className="table table-sm">
+                      <thead>
+                        <tr>
+                          <th>Run at</th>
+                          <th>Status</th>
+                          <th>Message</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {routineLogs.map((log: any) => (
+                          <tr key={log.id}>
+                            <td>{log.run_at ? formatTimeICT(log.run_at) : "n/a"}</td>
+                            <td>{log.status}</td>
+                            <td className="text-break">{log.message || "n/a"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            ) : null}
+          </div>
+          <div className="panel panel--compact mb-3">
+            <div className="panel-header">
+              <h3 className="mb-0">Health</h3>
+              {lastRefresh ? (
+                <span className="muted">Updated {formatTimeICT(lastRefresh)}</span>
+              ) : (
+                <span className="muted">Updated just now</span>
+              )}
+            </div>
+            <div className="d-flex justify-content-end mb-2">
+              <button
+                type="button"
+                className="btn btn-outline-danger btn-sm"
+                onClick={clearHealthHistory}
+              >
+                <i className="bi bi-trash" aria-hidden="true" /> Clear history
+              </button>
+            </div>
+            {healthError ? <div className="alert alert-warning">{healthError}</div> : null}
+            <div className="muted mb-2">Latest status</div>
+            {healthSummary.length === 0 ? (
+              <div className="muted">No health records yet.</div>
+            ) : (
+              <div className="table-responsive">
+                <table className="table table-sm">
+                  <thead>
+                    <tr>
+                      <th>Service</th>
+                      <th>Status</th>
+                      <th>Updated</th>
+                      <th>Message</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {healthSummary.map((item: any) => (
+                      <tr key={item.service}>
+                        <td className="text-break">{getHealthServiceTitle(item.service)}</td>
+                        <td>
+                          <span className={`badge ${getHealthBadgeClass(item.status)}`}>
+                            {item.status || "n/a"}
+                          </span>
+                        </td>
+                        <td>{item.checked_at ? formatTimeICT(item.checked_at) : "n/a"}</td>
+                        <td className="text-break">{item.message || "n/a"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
           <h3>Forms</h3>
+          <div className="d-flex flex-wrap gap-2 mb-2">
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm"
+              onClick={() => {
+                onNotice("Select a backup JSON file to restore.", "info");
+                formRestoreRef.current?.click();
+              }}
+            >
+              <i className="bi bi-upload" aria-hidden="true" /> Restore form
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm"
+              disabled={selectedForms.size === 0}
+              onClick={async () => {
+                const slugs = Array.from(selectedForms);
+                if (slugs.length === 0) return;
+                const formsBackup: any[] = [];
+                for (const slug of slugs) {
+                  const response = await apiFetch(
+                    `${API_BASE}/api/admin/forms/${encodeURIComponent(slug)}/backup`
+                  );
+                  const payload = await response.json().catch(() => null);
+                  if (!response.ok) {
+                    setActionError(payload?.error || `Backup failed for ${slug}.`);
+                    return;
+                  }
+                  if (payload?.data?.form) {
+                    formsBackup.push(payload.data.form);
+                  }
+                }
+                if (formsBackup.length === 0) {
+                  setActionError("No forms were included in the backup.");
+                  return;
+                }
+                const backupPayload = {
+                  type: "forms_backup",
+                  forms: formsBackup
+                };
+                const blob = new Blob([JSON.stringify(backupPayload, null, 2)], {
+                  type: "application/json"
+                });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = `forms-backup-${new Date().toISOString().slice(0, 10)}.json`;
+                link.rel = "noreferrer";
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                URL.revokeObjectURL(url);
+              }}
+            >
+              <i className="bi bi-box-arrow-down" aria-hidden="true" /> Backup selected
+            </button>
+            <input
+              ref={formRestoreRef}
+              type="file"
+              accept="application/json"
+              className="d-none"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  onNotice(`Selected restore file: ${file.name}`, "info");
+                  (async () => {
+                    try {
+                      await handleRestoreFormFile(file);
+                    } catch (error) {
+                      const message =
+                        error instanceof Error ? error.message : "Restore handler failed.";
+                      setActionError(message);
+                      onNotice(message, "error");
+                    } finally {
+                      if (formRestoreRef.current) formRestoreRef.current.value = "";
+                    }
+                  })();
+                }
+              }}
+            />
+          </div>
+          {restoreFormsPreview ? (
+            <div className="panel panel--compact mb-3">
+              <div className="panel-header">
+                <div>
+                  <strong>Restore preview</strong>
+                  {restoreFormsFileName ? (
+                    <div className="muted">Source: {restoreFormsFileName}</div>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  onClick={performRestoreForms}
+                >
+                  <i className="bi bi-check2-circle" aria-hidden="true" /> Restore{" "}
+                  {restoreFormsPreview.length}
+                </button>
+              </div>
+              <div className="table-responsive">
+                <table className="table table-sm">
+                  <thead>
+                    <tr>
+                      <th>Slug</th>
+                      <th>Title</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {restoreFormsPreview.map((form) => (
+                      <tr key={form.slug}>
+                        <td>{form.slug}</td>
+                        <td>{form.title || "n/a"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ) : null}
           <div className="table-responsive">
             <table className="table table-sm">
               <thead>
@@ -4158,8 +5429,8 @@ function AdminPage({
                   </th>
                   <th>Slug</th>
                   <th>Title</th>
-                  <th>Status</th>
-                  <th>Export</th>
+                  <th>Description</th>
+                  <th>Data export</th>
                   <th>Actions</th>
                 </tr>
               </thead>
@@ -4183,7 +5454,8 @@ function AdminPage({
                     </td>
                     <td>{form.title}</td>
                     <td>
-                      <div className="status-badges status-badges--forms">
+                      <div className="text-break">{form.description || "—"}</div>
+                      <div className="status-badges status-badges--forms mt-2">
                         <span
                           className={`badge status-pill status-pill--lock border-0 ${
                             form.is_locked ? "text-bg-danger" : "text-bg-success"
@@ -4277,6 +5549,59 @@ function AdminPage({
         </div>
         <div>
           <h3>Templates</h3>
+          <div className="d-flex flex-wrap gap-2 mb-2">
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm"
+              onClick={() => templateRestoreRef.current?.click()}
+            >
+              <i className="bi bi-upload" aria-hidden="true" /> Restore template
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm"
+              disabled={selectedTemplates.size === 0}
+              onClick={() => handleBackupSelectedTemplates(Array.from(selectedTemplates))}
+            >
+              <i className="bi bi-box-arrow-down" aria-hidden="true" /> Backup selected
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm"
+              onClick={() => formRestoreAsTemplateRef.current?.click()}
+            >
+              <i className="bi bi-box-arrow-in-down" aria-hidden="true" /> Restore form as template
+            </button>
+            <input
+              ref={templateRestoreRef}
+              type="file"
+              accept="application/json"
+              className="d-none"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  handleRestoreTemplateFile(file).finally(() => {
+                    if (templateRestoreRef.current) templateRestoreRef.current.value = "";
+                  });
+                }
+              }}
+            />
+            <input
+              ref={formRestoreAsTemplateRef}
+              type="file"
+              accept="application/json"
+              className="d-none"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) {
+                  handleRestoreFormAsTemplateFile(file).finally(() => {
+                    if (formRestoreAsTemplateRef.current)
+                      formRestoreAsTemplateRef.current.value = "";
+                  });
+                }
+              }}
+            />
+          </div>
           <div className="table-responsive">
             <table className="table table-sm">
               <thead>
@@ -4393,6 +5718,15 @@ function AdminPage({
                     <td>{item.provider_login || "n/a"}</td>
                     <td>{String(item.is_admin)}</td>
                     <td>
+                      {!item.is_admin ? (
+                        <button
+                          type="button"
+                          className="btn btn-outline-primary btn-sm me-2"
+                          onClick={() => handlePromoteUser(item.id)}
+                        >
+                          <i className="bi bi-shield-check" aria-hidden="true" /> Promote
+                        </button>
+                      ) : null}
                       <button
                         type="button"
                         className="btn btn-outline-danger btn-sm"
@@ -4511,6 +5845,1067 @@ function AdminPage({
   );
 }
 
+function AdminCanvasPage({
+  user,
+  onLogin,
+  onNotice
+}: {
+  user: UserInfo | null;
+  onLogin: (p: "google" | "github") => void;
+  onNotice: (message: string, type?: NoticeType) => void;
+}) {
+  const [status, setStatus] = useState<"loading" | "ok" | "forbidden">("loading");
+  const [courses, setCourses] = useState<any[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [testStatus, setTestStatus] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<string | null>(null);
+  const [lookupEmail, setLookupEmail] = useState("");
+  const [lookupCourseId, setLookupCourseId] = useState("");
+  const [lookupResult, setLookupResult] = useState<string | null>(null);
+  const [lookupError, setLookupError] = useState<string | null>(null);
+  const [lookupLoading, setLookupLoading] = useState(false);
+  const [retryQueue, setRetryQueue] = useState<any[]>([]);
+  const [deadletters, setDeadletters] = useState<any[]>([]);
+  const [retryError, setRetryError] = useState<string | null>(null);
+  const [retryLoading, setRetryLoading] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    async function loadCanvasOverview() {
+      setStatus("loading");
+      const [overviewRes, retryRes] = await Promise.all([
+        apiFetch(`${API_BASE}/api/admin/canvas/overview`),
+        apiFetch(`${API_BASE}/api/admin/canvas/retry-queue?limit=100`)
+      ]);
+      const payload = await overviewRes.json().catch(() => null);
+      const retryPayload = await retryRes.json().catch(() => null);
+      if (!active) return;
+      if (overviewRes.status === 401 || overviewRes.status === 403) {
+        setStatus("forbidden");
+        return;
+      }
+      if (!overviewRes.ok) {
+        setError(payload?.error || "Failed to load Canvas overview.");
+        setStatus("ok");
+        return;
+      }
+      setCourses(Array.isArray(payload?.data) ? payload.data : []);
+      if (retryRes.ok) {
+        setRetryQueue(Array.isArray(retryPayload?.queue) ? retryPayload.queue : []);
+        setDeadletters(Array.isArray(retryPayload?.deadletters) ? retryPayload.deadletters : []);
+        setRetryError(null);
+      } else {
+        setRetryError(retryPayload?.error || "Failed to load retry queue.");
+      }
+      setError(null);
+      setActionError(null);
+      setStatus("ok");
+    }
+    loadCanvasOverview();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!lookupCourseId && courses.length > 0) {
+      setLookupCourseId(String(courses[0].id));
+    }
+  }, [courses, lookupCourseId]);
+
+
+
+  async function handleRegistrationAction(
+    submissionId: string,
+    task: "deactivate" | "delete" | "reactivate"
+  ) {
+    setActionError(null);
+    if (
+      task === "delete" &&
+      !window.confirm("Remove this user from the course? This action cannot be undone.")
+    ) {
+      return;
+    }
+    const response = await apiFetch(
+      `${API_BASE}/api/admin/canvas/registrations/${encodeURIComponent(submissionId)}/${task}`,
+      { method: "POST" }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const detailMessage =
+        payload?.detail?.message ||
+        payload?.detail?.field ||
+        (typeof payload?.detail === "string" ? payload.detail : null);
+      setActionError(
+        detailMessage
+          ? `${payload?.error || "Failed to update enrollment"}: ${detailMessage}`
+          : payload?.error || "Failed to update enrollment."
+      );
+      return;
+    }
+    onNotice(
+      task === "delete"
+        ? "Enrollment deleted."
+        : task === "reactivate"
+        ? "Enrollment reactivated."
+        : "Enrollment deactivated.",
+      "success"
+    );
+    setCourses((prev) =>
+      prev.map((course) => ({
+        ...course,
+        registrations: Array.isArray(course.registrations)
+          ? course.registrations.map((reg: any) =>
+              reg.submission_id === submissionId
+                ? {
+                    ...reg,
+                    status:
+                      task === "delete"
+                        ? "deleted"
+                        : task === "reactivate"
+                        ? "invited"
+                        : "deactivated"
+                  }
+                : reg
+            )
+          : course.registrations
+      }))
+    );
+  }
+
+  async function handleRegistrationReinvite(submissionId: string) {
+    setActionError(null);
+    const response = await apiFetch(
+      `${API_BASE}/api/admin/canvas/registrations/${encodeURIComponent(submissionId)}/reinvite`,
+      { method: "POST" }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const detailMessage =
+        payload?.detail?.message ||
+        payload?.detail?.field ||
+        (typeof payload?.detail === "string" ? payload.detail : null);
+      setActionError(
+        detailMessage
+          ? `${payload?.error || "Failed to reinvite user"}: ${detailMessage}`
+          : payload?.error || "Failed to reinvite user."
+      );
+      return;
+    }
+    onNotice("Reinvite message is sent.", "success");
+    setCourses((prev) =>
+      prev.map((course) => ({
+        ...course,
+        registrations: Array.isArray(course.registrations)
+          ? course.registrations.map((reg: any) =>
+              reg.submission_id === submissionId
+                ? { ...reg, status: payload?.status || "invited", error: payload?.error || null }
+                : reg
+            )
+          : course.registrations
+      }))
+    );
+  }
+
+  async function handleRegistrationNotify(submissionId: string) {
+    setActionError(null);
+    const response = await apiFetch(
+      `${API_BASE}/api/admin/canvas/registrations/${encodeURIComponent(submissionId)}/notify`,
+      { method: "POST" }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const detailMessage =
+        payload?.detail?.message ||
+        payload?.detail?.field ||
+        (typeof payload?.detail === "string" ? payload.detail : null);
+      setActionError(
+        detailMessage
+          ? `${payload?.error || "Failed to notify user"}: ${detailMessage}`
+          : payload?.error || "Failed to notify user."
+      );
+      return;
+    }
+    onNotice("Alert message is sent.", "success");
+  }
+
+  async function handleRetryAction(
+    entryId: string,
+    action: "retry" | "drop",
+    source: "queue" | "deadletter"
+  ) {
+    setRetryError(null);
+    setRetryLoading(true);
+    const response = await apiFetch(
+      `${API_BASE}/api/admin/canvas/retry-queue/${encodeURIComponent(entryId)}/${action}?source=${source}`,
+      { method: "POST" }
+    );
+    const payload = await response.json().catch(() => null);
+    setRetryLoading(false);
+    if (!response.ok) {
+      setRetryError(payload?.error || "Action failed.");
+      return;
+    }
+    onNotice(action === "retry" ? "Retry queued." : "Entry removed.", "success");
+    if (action === "drop") {
+      if (source === "queue") {
+        setRetryQueue((prev) => prev.filter((item) => item.id !== entryId));
+      } else {
+        setDeadletters((prev) => prev.filter((item) => item.id !== entryId));
+      }
+    } else if (source === "deadletter") {
+      setDeadletters((prev) => prev.filter((item) => item.id !== entryId));
+    }
+  }
+
+  if (status === "loading") {
+    return (
+      <section className="panel">
+        <h2>Loading Canvas...</h2>
+      </section>
+    );
+  }
+
+  if (status === "forbidden") {
+    return (
+      <section className="panel panel--error">
+        <h2>Not authorized</h2>
+        <p>Please sign in with an admin account.</p>
+        <div className="auth-bar">
+          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+            <i className="bi bi-google" aria-hidden="true" /> Login with Google
+          </button>
+          <button type="button" className="btn btn-outline-primary" onClick={() => onLogin("github")}>
+            <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel-header">
+        <h2>Canvas</h2>
+        {user ? <span className="badge">{user.email || user.userId}</span> : null}
+      </div>
+      {error ? <div className="alert alert-warning">{error}</div> : null}
+      {actionError ? <div className="alert alert-warning">{actionError}</div> : null}
+      <div className="panel panel--compact mb-3">
+        <div className="panel-header">
+          <h3 className="mb-0">Canvas access test</h3>
+        </div>
+        <div className="d-flex flex-wrap gap-2 align-items-center mb-2">
+          <button
+            type="button"
+            className="btn btn-outline-secondary btn-sm"
+            onClick={async () => {
+              setTestStatus(null);
+              setTestResult(null);
+              const response = await apiFetch(`${API_BASE}/api/admin/canvas/test`);
+              const payload = await response.json().catch(() => null);
+              if (!response.ok) {
+                setTestStatus(payload?.error || "Canvas test failed.");
+                return;
+              }
+              setTestStatus("Canvas API reachable.");
+              setTestResult(
+                payload?.canvas_name
+                  ? `Authenticated as ${payload.canvas_name} (ID ${payload.canvas_user_id || "n/a"})`
+                  : "Canvas user retrieved."
+              );
+            }}
+          >
+            <i className="bi bi-plug" aria-hidden="true" /> Test Canvas access
+          </button>
+          {testStatus ? <span className="muted">{testStatus}</span> : null}
+        </div>
+        {testResult ? <div className="alert alert-info mt-2 mb-0">{testResult}</div> : null}
+      </div>
+      <div className="panel panel--compact mb-3">
+        <div className="panel-header">
+          <h3 className="mb-0">Canvas retry queue</h3>
+        </div>
+        {retryError ? <div className="alert alert-warning">{retryError}</div> : null}
+        <div className="row g-3">
+          <div className="col-lg-6">
+            <div className="muted mb-2">Queued retries</div>
+            <div className="table-responsive">
+              <table className="table table-sm">
+                <thead>
+                  <tr>
+                    <th>Submission</th>
+                    <th>Email</th>
+                    <th>Attempts</th>
+                    <th>Next run</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {retryQueue.length === 0 ? (
+                    <tr>
+                      <td colSpan={5}>No queued retries.</td>
+                    </tr>
+                  ) : (
+                    retryQueue.map((item: any) => (
+                      <tr key={item.id}>
+                        <td className="text-break">{item.submission_id}</td>
+                        <td>{item.submitter_email || "n/a"}</td>
+                        <td>{item.attempts ?? 0}</td>
+                        <td>{item.next_run_at ? formatTimeICT(item.next_run_at) : "n/a"}</td>
+                        <td>
+                          <div className="d-flex gap-2 flex-wrap">
+                            <button
+                              type="button"
+                              className="btn btn-outline-primary btn-sm"
+                              disabled={retryLoading}
+                              onClick={() => handleRetryAction(item.id, "retry", "queue")}
+                            >
+                              <i className="bi bi-arrow-clockwise" aria-hidden="true" /> Retry now
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-outline-danger btn-sm"
+                              disabled={retryLoading}
+                              onClick={() => handleRetryAction(item.id, "drop", "queue")}
+                            >
+                              <i className="bi bi-trash" aria-hidden="true" /> Drop
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div className="col-lg-6">
+            <div className="muted mb-2">Dead letters</div>
+            <div className="table-responsive">
+              <table className="table table-sm">
+                <thead>
+                  <tr>
+                    <th>Submission</th>
+                    <th>Email</th>
+                    <th>Attempts</th>
+                    <th>Created</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {deadletters.length === 0 ? (
+                    <tr>
+                      <td colSpan={5}>No dead letters.</td>
+                    </tr>
+                  ) : (
+                    deadletters.map((item: any) => (
+                      <tr key={item.id}>
+                        <td className="text-break">{item.submission_id}</td>
+                        <td>{item.submitter_email || "n/a"}</td>
+                        <td>{item.attempts ?? 0}</td>
+                        <td>{item.created_at ? formatTimeICT(item.created_at) : "n/a"}</td>
+                        <td>
+                          <div className="d-flex gap-2 flex-wrap">
+                            <button
+                              type="button"
+                              className="btn btn-outline-primary btn-sm"
+                              disabled={retryLoading}
+                              onClick={() => handleRetryAction(item.id, "retry", "deadletter")}
+                            >
+                              <i className="bi bi-arrow-clockwise" aria-hidden="true" /> Retry now
+                            </button>
+                            <button
+                              type="button"
+                              className="btn btn-outline-danger btn-sm"
+                              disabled={retryLoading}
+                              onClick={() => handleRetryAction(item.id, "drop", "deadletter")}
+                            >
+                              <i className="bi bi-trash" aria-hidden="true" /> Drop
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div className="panel panel--compact mb-3">
+        <div className="panel-header">
+          <h3 className="mb-0">Canvas user lookup</h3>
+        </div>
+        <div className="row g-3 align-items-end">
+          <div className="col-md-4">
+            <label className="form-label">Email</label>
+            <input
+              className="form-control"
+              value={lookupEmail}
+              onChange={(event) => setLookupEmail(event.target.value)}
+              placeholder="name@example.com"
+            />
+          </div>
+          <div className="col-md-4">
+            <label className="form-label">Course</label>
+            <select
+              className="form-select"
+              value={lookupCourseId}
+              onChange={(event) => setLookupCourseId(event.target.value)}
+              disabled={courses.length === 0}
+            >
+              <option value="">Select course</option>
+              {courses.map((course) => (
+                <option key={course.id} value={course.id}>
+                  {course.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="col-md-4">
+            <button
+              type="button"
+              className="btn btn-outline-primary w-100"
+              disabled={!lookupEmail.trim() || !lookupCourseId || lookupLoading}
+              onClick={async () => {
+                setLookupError(null);
+                setLookupResult(null);
+                if (!lookupEmail.trim() || !lookupCourseId) return;
+                setLookupLoading(true);
+                const params = new URLSearchParams({
+                  email: lookupEmail.trim(),
+                  courseId: lookupCourseId
+                });
+                const response = await apiFetch(
+                  `${API_BASE}/api/admin/canvas/user-lookup?${params.toString()}`
+                );
+                const payload = await response.json().catch(() => null);
+                setLookupLoading(false);
+                if (!response.ok) {
+                  setLookupError(payload?.error || "Lookup failed.");
+                  return;
+                }
+                const user = payload?.user || {};
+                const lines = [
+                  `Full Name: ${user.full_name || "n/a"}`,
+                  `Display Name: ${user.display_name || "n/a"}`,
+                  `Sortable Name: ${user.sortable_name || "n/a"}`,
+                  `Pronouns: ${user.pronouns || "n/a"}`
+                ];
+                setLookupResult(lines.join(" | "));
+              }}
+            >
+              <i className="bi bi-search" aria-hidden="true" />{" "}
+              {lookupLoading ? "Looking up..." : "Lookup"}
+            </button>
+          </div>
+        </div>
+        {lookupError ? <div className="alert alert-warning mt-2 mb-0">{lookupError}</div> : null}
+        {lookupResult ? <div className="alert alert-info mt-2 mb-0">{lookupResult}</div> : null}
+      </div>
+      {courses.length === 0 ? (
+        <p className="muted">No Canvas courses cached yet. Run a sync first.</p>
+      ) : (
+        courses.map((course) => (
+          <div key={course.id} className="panel panel--compact mb-3">
+            <div className="panel-header">
+              <div>
+                <h3 className="mb-1">{course.name}</h3>
+                <div className="muted">
+                  {course.code ? `${course.code} • ` : ""}ID {course.id}
+                </div>
+              </div>
+              <span className="badge text-bg-light">{course.workflow_state || "active"}</span>
+            </div>
+            <div className="table-responsive">
+              <table className="table table-sm">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Email / GitHub</th>
+                    <th>Status</th>
+                    <th>Section</th>
+                    <th>Form</th>
+                    <th>Submission</th>
+                    <th>Enrolled at</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Array.isArray(course.registrations) && course.registrations.length > 0 ? (
+                    course.registrations.map((reg: any) => (
+                      <tr key={reg.submission_id}>
+                        <td>
+                          {reg.name || "n/a"}
+                          {reg.name && !reg.canvas_user_name && reg.status !== "deleted" ? (
+                            <span className="badge text-bg-warning ms-2">
+                              <i className="bi bi-person-x" aria-hidden="true" /> Missing in Canvas
+                            </span>
+                          ) : reg.name &&
+                            reg.canvas_user_name &&
+                            reg.status !== "deleted" &&
+                            normalizeNameValue(reg.name) !== normalizeNameValue(reg.canvas_user_name) ? (
+                            <span className="badge text-bg-warning ms-2">
+                              <i className="bi bi-exclamation-triangle" aria-hidden="true" /> Mismatch
+                            </span>
+                          ) : null}
+                        </td>
+                        <td>{reg.email || reg.github_username || reg.user_id || "n/a"}</td>
+                        <td>
+                          <span
+                            className={`badge ${
+                              reg.status === "invited"
+                                ? "text-bg-success"
+                                : reg.status === "failed"
+                                ? "text-bg-danger"
+                                : reg.status === "deactivated"
+                                ? "text-bg-warning"
+                                : reg.status === "deleted"
+                                ? "text-bg-dark"
+                                : "text-bg-secondary"
+                            }`}
+                            title={reg.error || ""}
+                          >
+                            <i
+                              className={`bi ${
+                                reg.status === "invited"
+                                  ? "bi-check-circle"
+                                  : reg.status === "failed"
+                                  ? "bi-exclamation-triangle"
+                                  : reg.status === "deactivated"
+                                  ? "bi-person-dash"
+                                  : reg.status === "deleted"
+                                  ? "bi-person-x"
+                                  : "bi-clock"
+                              }`}
+                              aria-hidden="true"
+                            />{" "}
+                            {reg.status === "deleted" ? "unenrolled" : reg.status}
+                          </span>
+                        </td>
+                        <td>{reg.section_name || reg.section_id || "n/a"}</td>
+                        <td>{reg.form_title || reg.form_slug || "n/a"}</td>
+                        <td>
+                          {reg.submission_deleted ? (
+                            <span>{reg.submission_id}</span>
+                          ) : (
+                            <Link to={`/me/submissions/${reg.submission_id}`}>{reg.submission_id}</Link>
+                          )}
+                        </td>
+                        <td>{reg.enrolled_at ? formatTimeICT(reg.enrolled_at) : "n/a"}</td>
+                        <td>
+                          <div className="d-flex flex-wrap gap-2">
+                            {reg.name && !reg.canvas_user_name && reg.status !== "deleted" ? (
+                              <button
+                                type="button"
+                                className="btn btn-outline-warning"
+                                onClick={() => handleRegistrationNotify(reg.submission_id)}
+                              >
+                                <i className="bi bi-person-x" aria-hidden="true" /> Alert
+                              </button>
+                            ) : reg.name &&
+                            reg.canvas_user_name &&
+                            reg.status !== "deleted" &&
+                            normalizeNameValue(reg.name) !== normalizeNameValue(reg.canvas_user_name) ? (
+                              <button
+                                type="button"
+                                className="btn btn-outline-warning"
+                                onClick={() => handleRegistrationNotify(reg.submission_id)}
+                              >
+                                <i className="bi bi-exclamation-triangle" aria-hidden="true" /> Alert
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              className="btn btn-outline-primary"
+                              onClick={() => handleRegistrationReinvite(reg.submission_id)}
+                            >
+                              <i className="bi bi-send" aria-hidden="true" /> Reinvite
+                            </button>
+                            {reg.status === "deactivated" ? (
+                              <button
+                                type="button"
+                                className="btn btn-outline-success"
+                                onClick={() => handleRegistrationAction(reg.submission_id, "reactivate")}
+                              >
+                                <i className="bi bi-person-check" aria-hidden="true" /> Reactivate
+                              </button>
+                            ) : reg.status !== "deleted" ? (
+                              <button
+                                type="button"
+                                className="btn btn-outline-warning"
+                                onClick={() => handleRegistrationAction(reg.submission_id, "deactivate")}
+                              >
+                                <i className="bi bi-person-dash" aria-hidden="true" /> Deactivate
+                              </button>
+                            ) : null}
+                            {reg.status !== "deleted" ? (
+                              <button
+                                type="button"
+                                className="btn btn-outline-danger"
+                                onClick={() => handleRegistrationAction(reg.submission_id, "delete")}
+                              >
+                                <i className="bi bi-person-x" aria-hidden="true" /> Unenroll
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              className="btn btn-outline-danger"
+                              onClick={async () => {
+                                setActionError(null);
+                                if (!window.confirm("Move this form submission to trash?")) return;
+                                const response = await apiFetch(
+                                  `${API_BASE}/api/admin/canvas/registrations/${encodeURIComponent(
+                                    reg.submission_id
+                                  )}/submission-delete`,
+                                  { method: "POST" }
+                                );
+                                const payload = await response.json().catch(() => null);
+                                if (!response.ok) {
+                                  setActionError(payload?.error || "Failed to delete submission.");
+                                  return;
+                                }
+                                onNotice("Form submission deleted.", "success");
+                                setCourses((prev) =>
+                                  prev.map((course) => ({
+                                    ...course,
+                                    registrations: Array.isArray(course.registrations)
+                                      ? course.registrations.filter(
+                                          (item: any) => item.submission_id !== reg.submission_id
+                                        )
+                                      : course.registrations
+                                  }))
+                                );
+                              }}
+                            >
+                              <i className="bi bi-trash" aria-hidden="true" /> Delete
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={8}>No registrations recorded.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ))
+      )}
+    </section>
+  );
+}
+
+function AdminEmailsPage({
+  user,
+  onLogin
+}: {
+  user: UserInfo | null;
+  onLogin: (p: "google" | "github") => void;
+}) {
+  const [status, setStatus] = useState<"loading" | "ok" | "forbidden">("loading");
+  const [emails, setEmails] = useState<any[]>([]);
+  const [selectedEmailIds, setSelectedEmailIds] = useState<Set<string>>(new Set());
+  const [error, setError] = useState<string | null>(null);
+  const [page, setPage] = useState(1);
+  const [pageSize] = useState(50);
+  const [total, setTotal] = useState(0);
+  const [filterStatus, setFilterStatus] = useState("");
+  const [filterEmail, setFilterEmail] = useState("");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [testRecipient, setTestRecipient] = useState("");
+  const [testSubject, setTestSubject] = useState("Test email from Form App");
+  const [testBody, setTestBody] = useState("This is a test email from Form App.");
+  const [testStatus, setTestStatus] = useState<string | null>(null);
+  const [actionStatus, setActionStatus] = useState<{ message: string; type: NoticeType } | null>(
+    null
+  );
+
+  useEffect(() => {
+    let active = true;
+    async function loadEmails() {
+      setStatus("loading");
+      const params = new URLSearchParams();
+      params.set("page", String(page));
+      params.set("pageSize", String(pageSize));
+      params.set("includeBody", "1");
+      if (filterStatus) params.set("status", filterStatus);
+      if (filterEmail) params.set("email", filterEmail);
+      const response = await apiFetch(`${API_BASE}/api/admin/emails?${params.toString()}`);
+      const payload = await response.json().catch(() => null);
+      if (!active) return;
+      if (response.status === 401 || response.status === 403) {
+        setStatus("forbidden");
+        return;
+      }
+      if (!response.ok) {
+        setError(payload?.error || "Failed to load emails.");
+        setStatus("ok");
+        return;
+      }
+      setEmails(Array.isArray(payload?.data) ? payload.data : []);
+      setSelectedEmailIds(new Set());
+      setTotal(payload?.total || 0);
+      setError(null);
+      setStatus("ok");
+    }
+    loadEmails();
+    return () => {
+      active = false;
+    };
+  }, [page, pageSize, filterStatus, filterEmail]);
+
+  if (status === "loading") {
+    return (
+      <section className="panel">
+        <h2>Loading emails...</h2>
+      </section>
+    );
+  }
+
+  if (status === "forbidden") {
+    return (
+      <section className="panel panel--error">
+        <h2>Not authorized</h2>
+        <p>Please sign in with an admin account.</p>
+        <div className="auth-bar">
+          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+            <i className="bi bi-google" aria-hidden="true" /> Login with Google
+          </button>
+          <button type="button" className="btn btn-outline-primary" onClick={() => onLogin("github")}>
+            <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
+          </button>
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="panel">
+      <div className="panel-header">
+        <h2>Emails</h2>
+        {user ? <span className="badge">{user.email || user.userId}</span> : null}
+      </div>
+      {actionStatus ? (
+        <div className={`alert alert-${actionStatus.type === "success" ? "success" : "warning"}`}>
+          {actionStatus.message}
+        </div>
+      ) : null}
+      {error ? <div className="alert alert-warning">{error}</div> : null}
+      <div className="panel panel--compact mb-3">
+        <div className="panel-header">
+          <h3 className="mb-0">Test email</h3>
+        </div>
+        <div className="row g-3">
+          <div className="col-md-4">
+            <label className="form-label">Recipient</label>
+            <input
+              className="form-control"
+              value={testRecipient}
+              onChange={(event) => setTestRecipient(event.target.value)}
+              placeholder="example@domain.com"
+            />
+          </div>
+          <div className="col-md-8">
+            <label className="form-label">Subject</label>
+            <input
+              className="form-control"
+              value={testSubject}
+              onChange={(event) => setTestSubject(event.target.value)}
+            />
+          </div>
+          <div className="col-12">
+            <label className="form-label">Body</label>
+            <textarea
+              className="form-control"
+              rows={4}
+              value={testBody}
+              onChange={(event) => setTestBody(event.target.value)}
+            />
+          </div>
+          <div className="col-12 d-flex flex-wrap gap-2 align-items-center">
+            <button
+              type="button"
+              className="btn btn-outline-primary"
+              onClick={async () => {
+                setTestStatus(null);
+                if (!testRecipient.trim()) {
+                  setTestStatus("Recipient is required.");
+                  return;
+                }
+                const response = await apiFetch(`${API_BASE}/api/admin/emails/test`, {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({
+                    to: testRecipient.trim(),
+                    subject: testSubject.trim() || "Test email from Form App",
+                    body: testBody.trim() || "This is a test email from Form App."
+                  })
+                });
+                const payload = await response.json().catch(() => null);
+                if (!response.ok) {
+                  const detailMessage =
+                    payload?.detail?.message ||
+                    payload?.detail?.field ||
+                    (typeof payload?.detail === "string" ? payload.detail : null);
+                  setTestStatus(
+                    detailMessage
+                      ? `${payload?.error || "Failed to send test email"}: ${detailMessage}`
+                      : payload?.error || "Failed to send test email."
+                  );
+                  return;
+                }
+                setTestStatus("Test email is sent.");
+              }}
+            >
+              <i className="bi bi-send" aria-hidden="true" /> Send test email
+            </button>
+            {testStatus ? <span className="muted">{testStatus}</span> : null}
+          </div>
+        </div>
+      </div>
+      <div className="d-flex flex-wrap gap-2 align-items-end mb-3">
+        <div>
+          <label className="form-label">Status</label>
+          <select
+            className="form-select form-select-sm"
+            value={filterStatus}
+            onChange={(event) => {
+              setPage(1);
+              setFilterStatus(event.target.value);
+            }}
+          >
+            <option value="">All</option>
+            <option value="sent">Sent</option>
+            <option value="failed">Failed</option>
+          </select>
+        </div>
+        <div>
+          <label className="form-label">Recipient</label>
+          <input
+            className="form-control form-control-sm"
+            value={filterEmail}
+            onChange={(event) => {
+              setPage(1);
+              setFilterEmail(event.target.value);
+            }}
+            placeholder="Search email"
+          />
+        </div>
+        <div className="ms-auto muted">Total: {total}</div>
+        {selectedEmailIds.size > 0 ? (
+          <button
+            type="button"
+            className="btn btn-outline-danger btn-sm"
+            onClick={async () => {
+              setActionStatus(null);
+              if (!window.confirm("Move selected emails to trash?")) {
+                return;
+              }
+              const ids = Array.from(selectedEmailIds);
+              let failed = 0;
+              for (const id of ids) {
+                const response = await apiFetch(
+                  `${API_BASE}/api/admin/emails/${encodeURIComponent(id)}`,
+                  { method: "DELETE" }
+                );
+                if (!response.ok) {
+                  failed += 1;
+                }
+              }
+              setEmails((prev) => prev.filter((entry) => !selectedEmailIds.has(entry.id)));
+              setTotal((prev) => Math.max(0, prev - (ids.length - failed)));
+              setSelectedEmailIds(new Set());
+              setActionStatus({
+                message:
+                  failed > 0
+                    ? `Moved ${ids.length - failed} email(s) to trash. ${failed} failed.`
+                    : `Moved ${ids.length} email(s) to trash.`,
+                type: failed > 0 ? "warning" : "success"
+              });
+            }}
+          >
+            <i className="bi bi-trash" aria-hidden="true" /> Delete selected
+          </button>
+        ) : null}
+      </div>
+      <div className="table-responsive">
+        <table className="table table-sm">
+          <thead>
+            <tr>
+              <th>
+                <input
+                  type="checkbox"
+                  aria-label="Select all emails"
+                  checked={emails.length > 0 && selectedEmailIds.size === emails.length}
+                  onChange={(event) => {
+                    if (event.target.checked) {
+                      setSelectedEmailIds(new Set(emails.map((item) => item.id)));
+                    } else {
+                      setSelectedEmailIds(new Set());
+                    }
+                  }}
+                />
+              </th>
+              <th>Sent at</th>
+              <th>To</th>
+              <th>Subject</th>
+              <th>Status</th>
+              <th>Submission</th>
+              <th>Source</th>
+              <th>Error</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {emails.length === 0 ? (
+              <tr>
+                <td colSpan={9}>No emails found.</td>
+              </tr>
+            ) : (
+              emails.map((item) => {
+                const isExpanded = expanded.has(item.id);
+                return (
+                  <Fragment key={item.id}>
+                    <tr>
+                      <td>
+                        <input
+                          type="checkbox"
+                          aria-label={`Select email ${item.id}`}
+                          checked={selectedEmailIds.has(item.id)}
+                          onChange={(event) => {
+                            const next = new Set(selectedEmailIds);
+                            if (event.target.checked) {
+                              next.add(item.id);
+                            } else {
+                              next.delete(item.id);
+                            }
+                            setSelectedEmailIds(next);
+                          }}
+                        />
+                      </td>
+                      <td>{item.created_at ? formatTimeICT(item.created_at) : "n/a"}</td>
+                      <td>{item.to_email}</td>
+                      <td>{item.subject}</td>
+                      <td>
+                        <span
+                          className={`badge ${
+                            item.status === "sent"
+                              ? "text-bg-success"
+                              : item.status === "failed"
+                              ? "text-bg-danger"
+                              : "text-bg-secondary"
+                          }`}
+                        >
+                          {item.status}
+                        </span>
+                      </td>
+                      <td>
+                        {item.submission_id ? (
+                          <Link to={`/me/submissions/${item.submission_id}`}>
+                            {item.submission_id}
+                          </Link>
+                        ) : (
+                          <span className="muted">n/a</span>
+                        )}
+                      </td>
+                      <td>{item.trigger_source || "n/a"}</td>
+                      <td className="text-break">{item.error || "—"}</td>
+                      <td>
+                        <div className="d-flex gap-2">
+                          <button
+                            type="button"
+                            className="btn btn-outline-secondary btn-sm"
+                            onClick={() => {
+                              const next = new Set(expanded);
+                              if (isExpanded) {
+                                next.delete(item.id);
+                              } else {
+                                next.add(item.id);
+                              }
+                              setExpanded(next);
+                            }}
+                          >
+                            <i className="bi bi-eye" aria-hidden="true" />{" "}
+                            {isExpanded ? "Hide" : "View"}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-outline-danger btn-sm"
+                            onClick={async () => {
+                              setActionStatus(null);
+                              if (!window.confirm("Move this email to trash?")) {
+                                return;
+                              }
+                              const response = await apiFetch(
+                                `${API_BASE}/api/admin/emails/${encodeURIComponent(item.id)}`,
+                                { method: "DELETE" }
+                              );
+                              const payload = await response.json().catch(() => null);
+                              if (!response.ok) {
+                                setActionStatus({
+                                  message: payload?.error || "Delete failed.",
+                                  type: "warning"
+                                });
+                                return;
+                              }
+                              setEmails((prev) => prev.filter((entry) => entry.id !== item.id));
+                              setTotal((prev) => Math.max(0, prev - 1));
+                              setActionStatus({ message: "Email moved to trash.", type: "success" });
+                            }}
+                          >
+                            <i className="bi bi-trash" aria-hidden="true" /> Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                    {isExpanded ? (
+                      <tr>
+                        <td colSpan={9}>
+                          <div className="panel panel--compact">
+                            <div className="panel-header">
+                              <strong>Body</strong>
+                            </div>
+                            <pre className="m-0">{item.body}</pre>
+                          </div>
+                        </td>
+                      </tr>
+                    ) : null}
+                  </Fragment>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+      <div className="d-flex gap-2 justify-content-end">
+        <button
+          type="button"
+          className="btn btn-outline-secondary btn-sm"
+          disabled={page <= 1}
+          onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+        >
+          <i className="bi bi-arrow-left" aria-hidden="true" /> Prev
+        </button>
+        <button
+          type="button"
+          className="btn btn-outline-secondary btn-sm"
+          disabled={page * pageSize >= total}
+          onClick={() => setPage((prev) => prev + 1)}
+        >
+          Next <i className="bi bi-arrow-right" aria-hidden="true" />
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function TrashPage({
   user,
   onLogin,
@@ -4540,7 +6935,8 @@ function TrashPage({
         { value: "templates", label: "Templates" },
         { value: "users", label: "Users" },
         { value: "submissions", label: "Submissions" },
-        { value: "files", label: "Files" }
+        { value: "files", label: "Files" },
+        { value: "emails", label: "Emails" }
       ]
     : [
         { value: "all", label: "All" },
@@ -4655,7 +7051,19 @@ function TrashPage({
       setError(payload?.error || "Restore failed.");
       return;
     }
-    onNotice("Item restored.", "success");
+    if (type === "submission") {
+      if (payload?.canvasAction) {
+        const canvasLabel = String(payload.canvasAction);
+        onNotice(
+          `Item restored. Canvas status: ${canvasLabel}.`,
+          payload?.canvasWarning ? "warning" : "success"
+        );
+      } else {
+        onNotice("Item restored.", "success");
+      }
+    } else {
+      onNotice("Item restored.", "success");
+    }
     await loadTrash();
   }
 
@@ -4732,6 +7140,7 @@ function TrashPage({
   const users = Array.isArray(data.users) ? data.users : [];
   const submissions = Array.isArray(data.submissions) ? data.submissions : [];
   const files = Array.isArray(data.files) ? data.files : [];
+  const emails = Array.isArray(data.emails) ? data.emails : [];
 
   function renderBulkControls(type: string, rowIds: string[]) {
     return (
@@ -4744,14 +7153,16 @@ function TrashPage({
         >
           <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore selected
         </button>
-        <button
-          type="button"
-          className="btn btn-outline-danger btn-sm"
-          disabled={(selected[type] ?? new Set()).size === 0}
-          onClick={() => bulkPurge(type)}
-        >
-          <i className="bi bi-trash" aria-hidden="true" /> Delete selected
-        </button>
+        {isAdmin ? (
+          <button
+            type="button"
+            className="btn btn-outline-danger btn-sm"
+            disabled={(selected[type] ?? new Set()).size === 0}
+            onClick={() => bulkPurge(type)}
+          >
+            <i className="bi bi-trash" aria-hidden="true" /> Delete selected
+          </button>
+        ) : null}
       </div>
     );
   }
@@ -4784,13 +7195,15 @@ function TrashPage({
           ))}
         </select>
         {loading ? <span className="muted">Loading...</span> : null}
-        <button
-          type="button"
-          className="btn btn-outline-danger btn-sm ms-auto"
-          onClick={emptyTrash}
-        >
-          <i className="bi bi-trash3" aria-hidden="true" /> Empty trash
-        </button>
+        {isAdmin ? (
+          <button
+            type="button"
+            className="btn btn-outline-danger btn-sm ms-auto"
+            onClick={emptyTrash}
+          >
+            <i className="bi bi-trash3" aria-hidden="true" /> Empty trash
+          </button>
+        ) : null}
       </div>
 
       {(trashType === "all" || trashType === "forms") && isAdmin ? (
@@ -4847,13 +7260,15 @@ function TrashPage({
                       >
                         <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore
                       </button>
-                      <button
-                        type="button"
-                        className="btn btn-outline-danger btn-sm"
-                        onClick={() => purgeItem("form", item.slug)}
-                      >
-                        <i className="bi bi-trash" aria-hidden="true" /> Delete
-                      </button>
+                      {isAdmin ? (
+                        <button
+                          type="button"
+                          className="btn btn-outline-danger btn-sm"
+                          onClick={() => purgeItem("form", item.slug)}
+                        >
+                          <i className="bi bi-trash" aria-hidden="true" /> Delete
+                        </button>
+                      ) : null}
                     </td>
                   </tr>
                 ))
@@ -4918,13 +7333,15 @@ function TrashPage({
                       >
                         <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore
                       </button>
-                      <button
-                        type="button"
-                        className="btn btn-outline-danger btn-sm"
-                        onClick={() => purgeItem("template", item.key)}
-                      >
-                        <i className="bi bi-trash" aria-hidden="true" /> Delete
-                      </button>
+                      {isAdmin ? (
+                        <button
+                          type="button"
+                          className="btn btn-outline-danger btn-sm"
+                          onClick={() => purgeItem("template", item.key)}
+                        >
+                          <i className="bi bi-trash" aria-hidden="true" /> Delete
+                        </button>
+                      ) : null}
                     </td>
                   </tr>
                 ))
@@ -4989,13 +7406,15 @@ function TrashPage({
                       >
                         <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore
                       </button>
-                      <button
-                        type="button"
-                        className="btn btn-outline-danger btn-sm"
-                        onClick={() => purgeItem("user", item.id)}
-                      >
-                        <i className="bi bi-trash" aria-hidden="true" /> Delete
-                      </button>
+                      {isAdmin ? (
+                        <button
+                          type="button"
+                          className="btn btn-outline-danger btn-sm"
+                          onClick={() => purgeItem("user", item.id)}
+                        >
+                          <i className="bi bi-trash" aria-hidden="true" /> Delete
+                        </button>
+                      ) : null}
                     </td>
                   </tr>
                 ))
@@ -5062,13 +7481,15 @@ function TrashPage({
                       >
                         <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore
                       </button>
-                      <button
-                        type="button"
-                        className="btn btn-outline-danger btn-sm"
-                        onClick={() => purgeItem("submission", item.id)}
-                      >
-                        <i className="bi bi-trash" aria-hidden="true" /> Delete
-                      </button>
+                      {isAdmin ? (
+                        <button
+                          type="button"
+                          className="btn btn-outline-danger btn-sm"
+                          onClick={() => purgeItem("submission", item.id)}
+                        >
+                          <i className="bi bi-trash" aria-hidden="true" /> Delete
+                        </button>
+                      ) : null}
                     </td>
                   </tr>
                 ))
@@ -5137,10 +7558,101 @@ function TrashPage({
                       >
                         <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore
                       </button>
+                      {isAdmin ? (
+                        <button
+                          type="button"
+                          className="btn btn-outline-danger btn-sm"
+                          onClick={() => purgeItem("file", item.id)}
+                        >
+                          <i className="bi bi-trash" aria-hidden="true" /> Delete
+                        </button>
+                      ) : null}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+          {renderBulkControls("files", files.map((item: any) => item.id).filter(Boolean))}
+        </div>
+      ) : null}
+
+      {(trashType === "all" || trashType === "emails") && isAdmin ? (
+        <div className="table-responsive mb-4">
+          <table className="table table-sm">
+            <thead>
+              <tr>
+                <th>
+                  <input
+                    type="checkbox"
+                    className="form-check-input"
+                    checked={
+                      emails.length > 0 &&
+                      emails.every((item: any) => (selected.emails ?? new Set()).has(item.id))
+                    }
+                    onChange={() =>
+                      toggleAllSelected(
+                        "emails",
+                        emails.map((item: any) => item.id).filter(Boolean)
+                      )
+                    }
+                  />
+                </th>
+                <th>To</th>
+                <th>Subject</th>
+                <th>Status</th>
+                <th>Submission</th>
+                <th>Deleted</th>
+                <th>Reason</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {emails.length === 0 ? (
+                <tr>
+                  <td colSpan={8}>No deleted emails.</td>
+                </tr>
+              ) : (
+                emails.map((item: any) => (
+                  <tr key={item.id}>
+                    <td>
+                      <input
+                        type="checkbox"
+                        className="form-check-input"
+                        checked={(selected.emails ?? new Set()).has(item.id)}
+                        onChange={() => toggleSelected("emails", item.id)}
+                      />
+                    </td>
+                    <td>{item.to_email || "n/a"}</td>
+                    <td>{item.subject || "n/a"}</td>
+                    <td>
+                      <span
+                        className={`badge ${
+                          item.status === "sent"
+                            ? "text-bg-success"
+                            : item.status === "failed"
+                            ? "text-bg-danger"
+                            : "text-bg-secondary"
+                        }`}
+                      >
+                        {item.status || "n/a"}
+                      </span>
+                    </td>
+                    <td>{item.submission_id || "n/a"}</td>
+                    <td>{item.deleted_at ? formatTimeICT(item.deleted_at) : "n/a"}</td>
+                    <td>{item.deleted_reason || "n/a"}</td>
+                    <td className="d-flex gap-2">
+                      <button
+                        type="button"
+                        className="btn btn-outline-secondary btn-sm"
+                        onClick={() => restoreItem("email", item.id)}
+                      >
+                        <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore
+                      </button>
                       <button
                         type="button"
                         className="btn btn-outline-danger btn-sm"
-                        onClick={() => purgeItem("file", item.id)}
+                        onClick={() => purgeItem("email", item.id)}
                       >
                         <i className="bi bi-trash" aria-hidden="true" /> Delete
                       </button>
@@ -5150,7 +7662,7 @@ function TrashPage({
               )}
             </tbody>
           </table>
-          {renderBulkControls("files", files.map((item: any) => item.id).filter(Boolean))}
+          {renderBulkControls("emails", emails.map((item: any) => item.id).filter(Boolean))}
         </div>
       ) : null}
     </section>
@@ -5183,6 +7695,8 @@ function BuilderPage({
   const [builderMultiple, setBuilderMultiple] = useState(false);
   const [builderEmailDomain, setBuilderEmailDomain] = useState("");
   const [builderAutofillFromLogin, setBuilderAutofillFromLogin] = useState(false);
+  const [templateFromFormSlug, setTemplateFromFormSlug] = useState("");
+  const [templateFromFormStatus, setTemplateFromFormStatus] = useState<string | null>(null);
   const [templateFieldEditId, setTemplateFieldEditId] = useState("");
   const [fileFieldId, setFileFieldId] = useState("");
   const [fileFieldLabel, setFileFieldLabel] = useState("");
@@ -5199,6 +7713,12 @@ function BuilderPage({
   const [formBuilderPublic, setFormBuilderPublic] = useState(true);
   const [formBuilderLocked, setFormBuilderLocked] = useState(false);
   const [formBuilderAuthPolicy, setFormBuilderAuthPolicy] = useState("optional");
+  const [formBuilderCanvasEnabled, setFormBuilderCanvasEnabled] = useState(false);
+  const [formBuilderCanvasCourseId, setFormBuilderCanvasCourseId] = useState("");
+  const [formBuilderCanvasAllowedSections, setFormBuilderCanvasAllowedSections] = useState<
+    string[] | null
+  >(null);
+  const [formBuilderCanvasPosition, setFormBuilderCanvasPosition] = useState("bottom");
   const [formBuilderMode, setFormBuilderMode] = useState<"create" | "edit">("edit");
   const [formFieldType, setFormFieldType] = useState("text");
   const [formFieldCustomType, setFormFieldCustomType] = useState("");
@@ -5226,7 +7746,22 @@ function BuilderPage({
   const [formCreateAuthPolicy, setFormCreateAuthPolicy] = useState("optional");
   const [formCreatePublic, setFormCreatePublic] = useState(true);
   const [formCreateLocked, setFormCreateLocked] = useState(false);
+  const [formCreateCanvasEnabled, setFormCreateCanvasEnabled] = useState(false);
+  const [formCreateCanvasCourseId, setFormCreateCanvasCourseId] = useState("");
+  const [formCreateCanvasAllowedSections, setFormCreateCanvasAllowedSections] = useState<
+    string[] | null
+  >(null);
+  const [formCreateCanvasPosition, setFormCreateCanvasPosition] = useState("bottom");
   const [formCreateStatus, setFormCreateStatus] = useState<string | null>(null);
+  const [canvasCourses, setCanvasCourses] = useState<any[]>([]);
+  const [canvasCourseQuery, setCanvasCourseQuery] = useState("");
+  const [canvasCoursesLoading, setCanvasCoursesLoading] = useState(false);
+  const [canvasCoursesNeedsSync, setCanvasCoursesNeedsSync] = useState(false);
+  const [canvasSections, setCanvasSections] = useState<any[]>([]);
+  const [canvasSectionsCourseId, setCanvasSectionsCourseId] = useState<string | null>(null);
+  const [canvasSectionsNeedsSync, setCanvasSectionsNeedsSync] = useState(false);
+  const [canvasSyncing, setCanvasSyncing] = useState(false);
+  const [canvasError, setCanvasError] = useState<string | null>(null);
 
   async function loadBuilder() {
     const healthRes = await apiFetch(`${API_BASE}/api/admin/health`);
@@ -5250,6 +7785,121 @@ function BuilderPage({
     setLastRefresh(new Date().toISOString());
   }
 
+  async function loadCanvasCourses(query: string) {
+    setCanvasError(null);
+    setCanvasCoursesLoading(true);
+    const response = await apiFetch(
+      `${API_BASE}/api/admin/canvas/courses?q=${encodeURIComponent(query)}&page=1&pageSize=50`
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setCanvasError(payload?.error || "Failed to load Canvas courses.");
+      setCanvasCourses([]);
+      setCanvasCoursesNeedsSync(false);
+      setCanvasCoursesLoading(false);
+      return;
+    }
+    setCanvasCourses(Array.isArray(payload?.data) ? payload.data : []);
+    setCanvasCoursesNeedsSync(Boolean(payload?.needsSync));
+    setCanvasCoursesLoading(false);
+  }
+
+  async function loadCanvasSections(courseId: string) {
+    if (!courseId) {
+      setCanvasSections([]);
+      setCanvasSectionsCourseId(null);
+      setCanvasSectionsNeedsSync(false);
+      return;
+    }
+    setCanvasError(null);
+    const response = await apiFetch(
+      `${API_BASE}/api/admin/canvas/courses/${encodeURIComponent(
+        courseId
+      )}/sections?page=1&pageSize=200`
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setCanvasError(payload?.error || "Failed to load Canvas sections.");
+      setCanvasSections([]);
+      setCanvasSectionsCourseId(courseId);
+      setCanvasSectionsNeedsSync(false);
+      return;
+    }
+    setCanvasSections(Array.isArray(payload?.data) ? payload.data : []);
+    setCanvasSectionsCourseId(courseId);
+    setCanvasSectionsNeedsSync(Boolean(payload?.needsSync));
+  }
+
+  async function syncCanvas(mode: "courses" | "course_sections", courseId?: string) {
+    setCanvasSyncing(true);
+    setCanvasError(null);
+    const response = await apiFetch(`${API_BASE}/api/admin/canvas/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mode, courseId })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setCanvasError(payload?.error || "Canvas sync failed.");
+      setCanvasSyncing(false);
+      return;
+    }
+    if (mode === "courses") {
+      await loadCanvasCourses(canvasCourseQuery);
+    } else if (mode === "course_sections" && courseId) {
+      await loadCanvasSections(courseId);
+    }
+    setCanvasSyncing(false);
+  }
+
+  async function handleCreateTemplateFromForm(slug: string) {
+    if (!slug) {
+      setTemplateEditorStatus("Select exactly one form to create a template.");
+      return false;
+    }
+    setTemplateEditorStatus(null);
+    const backupRes = await apiFetch(
+      `${API_BASE}/api/admin/forms/${encodeURIComponent(slug)}/backup`
+    );
+    const backupPayload = await backupRes.json().catch(() => null);
+    if (!backupRes.ok) {
+      setTemplateEditorStatus(backupPayload?.error || "Failed to load form backup.");
+      return false;
+    }
+    const schema = backupPayload?.data?.form?.schema_json;
+    if (!schema) {
+      setTemplateEditorStatus("Form backup does not include schema.");
+      return false;
+    }
+    const key = window.prompt("Template key for this form?");
+    if (!key || !key.trim()) {
+      setTemplateEditorStatus("Template key is required.");
+      return false;
+    }
+    const name = window.prompt("Template name?") || key.trim();
+    const response = await apiFetch(`${API_BASE}/api/admin/templates/restore`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "template",
+        template: {
+          key: key.trim(),
+          name: name.trim(),
+          schema_json: schema,
+          file_rules_json: backupPayload?.data?.form?.file_rules_json ?? null
+        }
+      })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setTemplateEditorStatus(payload?.error || "Template create failed.");
+      return false;
+    }
+    setTemplateEditorStatus("Template created from form.");
+    return true;
+  }
+
+
   useEffect(() => {
     let active = true;
     loadBuilder().catch(() => {
@@ -5259,6 +7909,12 @@ function BuilderPage({
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!formBuilderCanvasEnabled && !formCreateCanvasEnabled) return;
+    if (canvasCourses.length > 0 || canvasCoursesLoading) return;
+    loadCanvasCourses(canvasCourseQuery).catch(() => null);
+  }, [formBuilderCanvasEnabled, formCreateCanvasEnabled, canvasCourses.length, canvasCoursesLoading, canvasCourseQuery]);
 
   if (status === "loading") {
     return (
@@ -5565,6 +8221,10 @@ function BuilderPage({
       setFormBuilderPublic(true);
       setFormBuilderLocked(false);
       setFormBuilderAuthPolicy("optional");
+      setFormBuilderCanvasEnabled(false);
+      setFormBuilderCanvasCourseId("");
+      setFormBuilderCanvasAllowedSections(null);
+      setFormBuilderCanvasPosition("bottom");
       return;
     }
     const response = await apiFetch(`${API_BASE}/api/forms/${encodeURIComponent(slug)}`);
@@ -5594,6 +8254,26 @@ function BuilderPage({
       setFormBuilderPublic(Boolean(selected.is_public));
       setFormBuilderLocked(Boolean(selected.is_locked));
       setFormBuilderAuthPolicy(String(selected.auth_policy || "optional"));
+      setFormBuilderCanvasEnabled(Boolean(selected.canvas_enabled));
+      setFormBuilderCanvasCourseId(String(selected.canvas_course_id || ""));
+      setFormBuilderCanvasPosition(String(selected.canvas_fields_position || "bottom"));
+      if (selected.canvas_allowed_section_ids_json) {
+        try {
+          const parsed = JSON.parse(String(selected.canvas_allowed_section_ids_json));
+          if (Array.isArray(parsed)) {
+            setFormBuilderCanvasAllowedSections(parsed.map((id: any) => String(id)));
+          } else {
+            setFormBuilderCanvasAllowedSections(null);
+          }
+        } catch (error) {
+          setFormBuilderCanvasAllowedSections(null);
+        }
+      } else {
+        setFormBuilderCanvasAllowedSections(null);
+      }
+      if (selected.canvas_course_id) {
+        loadCanvasSections(String(selected.canvas_course_id));
+      }
     }
   }
 
@@ -5624,7 +8304,15 @@ function BuilderPage({
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      setFormBuilderStatus(payload?.error || "Failed to update form.");
+      const detailMessage =
+        payload?.detail?.message ||
+        payload?.detail?.field ||
+        (typeof payload?.detail === "string" ? payload.detail : null);
+      setFormBuilderStatus(
+        detailMessage
+          ? `${payload?.error || "Failed to update form"}: ${detailMessage}`
+          : payload?.error || "Failed to update form."
+      );
       return;
     }
     setFormBuilderStatus("Form schema updated.");
@@ -5637,6 +8325,21 @@ function BuilderPage({
       setFormBuilderStatus("Select a form to update.");
       return;
     }
+    if (formBuilderCanvasEnabled && !formBuilderCanvasCourseId) {
+      setFormBuilderStatus("Select a Canvas course or disable Canvas enrollment.");
+      return;
+    }
+    if (
+      formBuilderCanvasEnabled &&
+      formBuilderCanvasAllowedSections !== null &&
+      formBuilderCanvasAllowedSections.length === 0
+    ) {
+      setFormBuilderStatus("Select at least one section or allow all sections.");
+      return;
+    }
+    const canvasAllowedSectionIds = Array.isArray(formBuilderCanvasAllowedSections)
+      ? formBuilderCanvasAllowedSections
+      : undefined;
     const response = await apiFetch(`${API_BASE}/api/admin/forms/${encodeURIComponent(formBuilderSlug)}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
@@ -5644,12 +8347,26 @@ function BuilderPage({
         description: formBuilderDescription || null,
         is_public: formBuilderPublic,
         is_locked: formBuilderLocked,
-        auth_policy: formBuilderAuthPolicy
+        auth_policy: formBuilderAuthPolicy,
+        canvasEnabled: formBuilderCanvasEnabled,
+        canvasCourseId: formBuilderCanvasEnabled ? formBuilderCanvasCourseId || null : null,
+        ...(formBuilderCanvasEnabled && canvasAllowedSectionIds
+          ? { canvasAllowedSectionIds }
+          : {}),
+        canvasFieldsPosition: formBuilderCanvasPosition
       })
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      setFormBuilderStatus(payload?.error || "Failed to update form settings.");
+      const detailMessage =
+        payload?.detail?.message ||
+        payload?.detail?.field ||
+        (typeof payload?.detail === "string" ? payload.detail : null);
+      setFormBuilderStatus(
+        detailMessage
+          ? `${payload?.error || "Failed to update form settings"}: ${detailMessage}`
+          : payload?.error || "Failed to update form settings."
+      );
       return;
     }
     setFormBuilderStatus("Form settings updated.");
@@ -5860,6 +8577,21 @@ function BuilderPage({
       setFormCreateStatus("Slug, title, and template are required.");
       return;
     }
+    if (formCreateCanvasEnabled && !formCreateCanvasCourseId) {
+      setFormCreateStatus("Select a Canvas course or disable Canvas enrollment.");
+      return;
+    }
+    if (
+      formCreateCanvasEnabled &&
+      formCreateCanvasAllowedSections !== null &&
+      formCreateCanvasAllowedSections.length === 0
+    ) {
+      setFormCreateStatus("Select at least one section or allow all sections.");
+      return;
+    }
+    const createCanvasAllowedSectionIds = Array.isArray(formCreateCanvasAllowedSections)
+      ? formCreateCanvasAllowedSections
+      : undefined;
     const response = await apiFetch(`${API_BASE}/api/admin/forms`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -5870,7 +8602,13 @@ function BuilderPage({
         description: formCreateDescription || null,
         is_public: formCreatePublic,
         is_locked: formCreateLocked,
-        auth_policy: formCreateAuthPolicy
+        auth_policy: formCreateAuthPolicy,
+        canvasEnabled: formCreateCanvasEnabled,
+        canvasCourseId: formCreateCanvasEnabled ? formCreateCanvasCourseId || null : null,
+        ...(formCreateCanvasEnabled && createCanvasAllowedSectionIds
+          ? { canvasAllowedSectionIds: createCanvasAllowedSectionIds }
+          : {}),
+        canvasFieldsPosition: formCreateCanvasPosition
       })
     });
     const payload = await response.json().catch(() => null);
@@ -5883,7 +8621,189 @@ function BuilderPage({
     setFormCreateTitle("");
     setFormCreateDescription("");
     setFormCreateLocked(false);
+    setFormCreateCanvasEnabled(false);
+    setFormCreateCanvasCourseId("");
+    setFormCreateCanvasAllowedSections(null);
+    setFormCreateCanvasPosition("bottom");
     await loadBuilder();
+  }
+
+  function renderCanvasConfig(options: {
+    enabled: boolean;
+    onEnabledChange: (value: boolean) => void;
+    courseId: string;
+    onCourseIdChange: (value: string) => void;
+    allowedSectionIds: string[] | null;
+    onAllowedSectionIdsChange: (value: string[] | null) => void;
+    fieldsPosition: string;
+    onFieldsPositionChange: (value: string) => void;
+    idPrefix: string;
+  }) {
+    const sections =
+      options.courseId && canvasSectionsCourseId === options.courseId ? canvasSections : [];
+    const allowAll = options.allowedSectionIds === null;
+    const selectedSet = new Set(
+      allowAll ? sections.map((section) => String(section.id)) : options.allowedSectionIds || []
+    );
+    return (
+      <div className="panel panel--compact mt-3">
+        <div className="panel-header">
+          <h4 className="mb-0">Canvas enrollment</h4>
+        </div>
+        <div className="form-check mt-2">
+          <input
+            className="form-check-input"
+            type="checkbox"
+            checked={options.enabled}
+            onChange={(event) => options.onEnabledChange(event.target.checked)}
+            id={`${options.idPrefix}-canvas-enabled`}
+          />
+          <label className="form-check-label" htmlFor={`${options.idPrefix}-canvas-enabled`}>
+            Enable Canvas enrollment
+          </label>
+        </div>
+        {options.enabled ? (
+          <>
+            <div className="row g-3 mt-1">
+              <div className="col-md-6">
+                <label className="form-label">Course</label>
+                <div className="input-group mb-2">
+                  <input
+                    className="form-control"
+                    placeholder="Search courses"
+                    value={canvasCourseQuery}
+                    onChange={(event) => setCanvasCourseQuery(event.target.value)}
+                  />
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary"
+                    onClick={() => loadCanvasCourses(canvasCourseQuery)}
+                    disabled={canvasCoursesLoading}
+                  >
+                    <i className="bi bi-search" aria-hidden="true" />{" "}
+                    {canvasCoursesLoading ? "Searching..." : "Search"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-primary"
+                    onClick={() => syncCanvas("courses")}
+                    disabled={canvasSyncing}
+                  >
+                    <i className="bi bi-arrow-repeat" aria-hidden="true" /> Sync
+                  </button>
+                </div>
+                {canvasCoursesNeedsSync ? (
+                  <div className="alert alert-warning py-2">No cached courses. Sync first.</div>
+                ) : null}
+                <select
+                  className="form-select"
+                  value={options.courseId}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    options.onCourseIdChange(next);
+                    options.onAllowedSectionIdsChange(null);
+                    loadCanvasSections(next);
+                  }}
+                >
+                  <option value="">Select course</option>
+                  {canvasCourses.map((course) => (
+                    <option key={course.id} value={String(course.id)}>
+                      {course.name} {course.code ? `(${course.code})` : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-md-6">
+                <label className="form-label">Sections</label>
+                <div className="d-flex flex-wrap gap-2 mb-2">
+                  <button
+                    type="button"
+                    className="btn btn-outline-primary btn-sm"
+                    onClick={() => syncCanvas("course_sections", options.courseId)}
+                    disabled={canvasSyncing || !options.courseId}
+                  >
+                    <i className="bi bi-arrow-repeat" aria-hidden="true" /> Sync sections
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary btn-sm"
+                    onClick={() => options.onAllowedSectionIdsChange(null)}
+                    disabled={!options.courseId}
+                  >
+                    <i className="bi bi-check2-all" aria-hidden="true" /> Select all
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary btn-sm"
+                    onClick={() => options.onAllowedSectionIdsChange([])}
+                    disabled={!options.courseId}
+                  >
+                    <i className="bi bi-x-circle" aria-hidden="true" /> Clear
+                  </button>
+                </div>
+                {canvasSectionsNeedsSync && options.courseId ? (
+                  <div className="alert alert-warning py-2">No cached sections. Sync first.</div>
+                ) : null}
+                {sections.length > 0 ? (
+                  <div className="section-picker">
+                    {sections.map((section) => {
+                      const id = String(section.id);
+                      const checked = selectedSet.has(id);
+                      return (
+                        <label key={id} className="d-flex align-items-center gap-2 mb-1">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(event) => {
+                              const next = new Set(selectedSet);
+                              if (event.target.checked) {
+                                next.add(id);
+                              } else {
+                                next.delete(id);
+                              }
+                              const nextList = Array.from(next);
+                              if (nextList.length === sections.length) {
+                                options.onAllowedSectionIdsChange(null);
+                              } else {
+                                options.onAllowedSectionIdsChange(nextList);
+                              }
+                            }}
+                          />
+                          <span>{section.name}</span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                ) : (
+                  <div className="muted">Select a course to view sections.</div>
+                )}
+                {options.allowedSectionIds !== null && options.allowedSectionIds.length === 0 ? (
+                  <div className="alert alert-warning py-2 mt-2">
+                    Select at least one section or allow all sections.
+                  </div>
+                ) : null}
+              </div>
+            </div>
+            <div className="mt-3">
+              <label className="form-label">Canvas fields position</label>
+              <select
+                className="form-select"
+                value={options.fieldsPosition}
+                onChange={(event) => options.onFieldsPositionChange(event.target.value)}
+              >
+                <option value="top">Top of form</option>
+                <option value="after_identity">After name/email</option>
+                <option value="bottom">Bottom of form</option>
+              </select>
+              <div className="muted mt-1">
+                Controls where the Canvas course info and section selector appear.
+              </div>
+            </div>
+            {canvasError ? <div className="alert alert-danger mt-2">{canvasError}</div> : null}
+          </>
+        ) : null}
+      </div>
+    );
   }
 
   const safeForms = Array.isArray(forms) ? forms.filter((form) => form && typeof form === "object") : [];
@@ -5931,6 +8851,10 @@ function BuilderPage({
                     setFormBuilderSlug("");
                     setFormBuilderSchema("");
                     setFormBuilderStatus(null);
+                    setFormCreateCanvasEnabled(false);
+                    setFormCreateCanvasCourseId("");
+                    setFormCreateCanvasAllowedSections(null);
+                    setFormCreateCanvasPosition("bottom");
                   }}
                 >
                   <i className="bi bi-plus-circle" aria-hidden="true" /> New form
@@ -6034,6 +8958,19 @@ function BuilderPage({
                     </label>
                   </div>
                 </div>
+                <div className="col-12">
+                {renderCanvasConfig({
+                  enabled: formCreateCanvasEnabled,
+                  onEnabledChange: setFormCreateCanvasEnabled,
+                  courseId: formCreateCanvasCourseId,
+                  onCourseIdChange: setFormCreateCanvasCourseId,
+                  allowedSectionIds: formCreateCanvasAllowedSections,
+                  onAllowedSectionIdsChange: setFormCreateCanvasAllowedSections,
+                  fieldsPosition: formCreateCanvasPosition,
+                  onFieldsPositionChange: setFormCreateCanvasPosition,
+                  idPrefix: "form-create"
+                })}
+                </div>
                 <div className="col-12 d-flex flex-wrap gap-2 mt-2">
                   <button type="button" className="btn btn-primary" onClick={handleCreateForm}>
                     <i className="bi bi-plus-square" aria-hidden="true" /> Create form
@@ -6044,7 +8981,7 @@ function BuilderPage({
             ) : null}
             {formBuilderMode === "edit" ? (
               <div>
-            <div className="row g-3">
+                <div className="row g-3">
               <div className="col-md-4">
                 <label className="form-label">Form</label>
                 <select
@@ -6121,6 +9058,19 @@ function BuilderPage({
                     Yes
                   </label>
                 </div>
+              </div>
+              <div className="col-12">
+                {renderCanvasConfig({
+                  enabled: formBuilderCanvasEnabled,
+                  onEnabledChange: setFormBuilderCanvasEnabled,
+                  courseId: formBuilderCanvasCourseId,
+                  onCourseIdChange: setFormBuilderCanvasCourseId,
+                  allowedSectionIds: formBuilderCanvasAllowedSections,
+                  onAllowedSectionIdsChange: setFormBuilderCanvasAllowedSections,
+                  fieldsPosition: formBuilderCanvasPosition,
+                  onFieldsPositionChange: setFormBuilderCanvasPosition,
+                  idPrefix: "form-edit"
+                })}
               </div>
               <div className="col-12">
                 <label className="form-label">Schema JSON</label>
@@ -6384,40 +9334,85 @@ function BuilderPage({
                   </div>
                 ) : null}
               </div>
-            </div>
-            <div className="d-flex flex-wrap gap-2 mt-3">
-              <button
-                type="button"
-                className="btn btn-outline-secondary"
-                onClick={handleUpdateFormSettings}
-                disabled={!formBuilderSlug}
-              >
-                <i className="bi bi-sliders" aria-hidden="true" /> Update form settings
-              </button>
-              <button
-                type="button"
-                className="btn btn-outline-primary"
-                onClick={handleCopyFormLink}
-                disabled={!formBuilderSlug}
-              >
-                <i className="bi bi-link-45deg" aria-hidden="true" /> Copy form link
-              </button>
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={handleUpdateFormSchema}
-                disabled={!formBuilderSlug}
-              >
-                <i className="bi bi-save" aria-hidden="true" /> Save form schema
-              </button>
-              {formBuilderStatus ? <span className="muted">{formBuilderStatus}</span> : null}
-            </div>
-            </div>
+                </div>
+                <div className="d-flex flex-wrap gap-2 mt-3">
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary"
+                    onClick={handleUpdateFormSettings}
+                    disabled={!formBuilderSlug}
+                  >
+                    <i className="bi bi-sliders" aria-hidden="true" /> Update form settings
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-primary"
+                    onClick={handleCopyFormLink}
+                    disabled={!formBuilderSlug}
+                  >
+                    <i className="bi bi-link-45deg" aria-hidden="true" /> Copy form link
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-primary"
+                    onClick={handleUpdateFormSchema}
+                    disabled={!formBuilderSlug}
+                  >
+                    <i className="bi bi-save" aria-hidden="true" /> Save form schema
+                  </button>
+                  {formBuilderStatus ? <span className="muted">{formBuilderStatus}</span> : null}
+                </div>
+              </div>
             ) : null}
           </div>
         </div>
         <div>
           <h3>Template editor</h3>
+          <div className="panel panel--compact mb-3">
+            <div className="panel-header">
+              <h4 className="mb-0">Create template from form</h4>
+            </div>
+            <div className="d-flex flex-wrap gap-2 align-items-center">
+              <select
+                className="form-select form-select-sm w-auto"
+                value={templateFromFormSlug}
+                onChange={(event) => setTemplateFromFormSlug(event.target.value)}
+              >
+                <option value="">Select a form</option>
+                {safeForms
+                  .filter((form) => form && typeof form.slug === "string")
+                  .map((form) => (
+                    <option key={form.slug} value={form.slug}>
+                      {form.title || form.slug}
+                    </option>
+                  ))}
+              </select>
+              <button
+                type="button"
+                className="btn btn-outline-secondary btn-sm"
+                disabled={!templateFromFormSlug}
+                onClick={async () => {
+                  if (!templateFromFormSlug) {
+                    setTemplateFromFormStatus("Select a form to create a template.");
+                    return;
+                  }
+                  setTemplateFromFormStatus(null);
+                  const ok = await handleCreateTemplateFromForm(templateFromFormSlug);
+                  if (ok) {
+                    await loadBuilder();
+                    setTemplateFromFormStatus("Template created from form.");
+                  } else {
+                    setTemplateFromFormStatus("Unable to create template from form.");
+                  }
+                }}
+              >
+                <i className="bi bi-box-arrow-right" aria-hidden="true" /> Create template
+              </button>
+              {templateFromFormStatus ? (
+                <span className="muted">{templateFromFormStatus}</span>
+              ) : null}
+            </div>
+          </div>
           <div className="panel panel--compact">
             <div className="d-flex flex-wrap gap-2 mb-3">
               <div className="btn-group" role="group">
@@ -6861,6 +9856,10 @@ function AppShell() {
     let pageTitle = "Home";
     if (path.startsWith("/admin/builder")) {
       pageTitle = "Builder";
+    } else if (path.startsWith("/admin/canvas")) {
+      pageTitle = "Canvas";
+    } else if (path.startsWith("/canvas")) {
+      pageTitle = "Canvas";
     } else if (path.startsWith("/trash")) {
       pageTitle = "Trash";
     } else if (path.startsWith("/account")) {
@@ -6889,12 +9888,14 @@ function AppShell() {
     window.location.assign(loginUrl);
   }
 
-  function handleLogout() {
+  function handleLogout(silent: boolean = false) {
     apiFetch(`${API_BASE}/auth/logout`).finally(() => {
       clearToken();
       setUser(null);
       setRouteKey((prev) => prev + 1);
-      pushNotice("Logged out successfully.", "success");
+      if (!silent) {
+        pushNotice("Logged out successfully.", "success");
+      }
       navigate("/", { replace: true });
     });
   }
@@ -6940,6 +9941,11 @@ function AppShell() {
               My Dashboard
             </Link>
           ) : null}
+          {user && !user.isAdmin ? (
+            <Link className="nav-link" to="/canvas">
+              Canvas
+            </Link>
+          ) : null}
           {user ? (
             <Link className="nav-link" to="/trash">
               Trash
@@ -6953,6 +9959,16 @@ function AppShell() {
           {user?.isAdmin ? (
             <Link className="nav-link" to="/admin">
               Admin Dashboard
+            </Link>
+          ) : null}
+          {user?.isAdmin ? (
+            <Link className="nav-link" to="/admin/emails">
+              Emails
+            </Link>
+          ) : null}
+          {user?.isAdmin ? (
+            <Link className="nav-link" to="/admin/canvas">
+              Canvas
             </Link>
           ) : null}
           {user?.isAdmin ? (
@@ -6981,24 +9997,40 @@ function AppShell() {
         />
         <Route
           path="/me"
-          element={<DashboardPage user={user} onLogin={handleLogin} />}
+          element={<DashboardPage user={user} onLogin={handleLogin} onNotice={pushNotice} />}
         />
         <Route
           path="/dashboard"
-          element={<DashboardPage user={user} onLogin={handleLogin} />}
+          element={<DashboardPage user={user} onLogin={handleLogin} onNotice={pushNotice} />}
         />
         <Route
           path="/account"
-          element={<AccountPage user={user} onLogin={handleLogin} onLogout={handleLogout} />}
+          element={
+            <AccountPage
+              user={user}
+              onLogin={handleLogin}
+              onLogout={handleLogout}
+              onNotice={pushNotice}
+            />
+          }
         />
+        <Route path="/canvas" element={<CanvasPage user={user} onLogin={handleLogin} />} />
         <Route
           path="/me/submissions/:id"
-          element={<SubmissionDetailPage user={user} onLogin={handleLogin} />}
+          element={<SubmissionDetailPage user={user} onLogin={handleLogin} onNotice={pushNotice} />}
         />
         <Route path="/docs" element={<DocsPage />} />
         <Route
           path="/admin"
           element={<AdminPage user={user} onLogin={handleLogin} onNotice={pushNotice} />}
+        />
+        <Route
+          path="/admin/canvas"
+          element={<AdminCanvasPage user={user} onLogin={handleLogin} onNotice={pushNotice} />}
+        />
+        <Route
+          path="/admin/emails"
+          element={<AdminEmailsPage user={user} onLogin={handleLogin} />}
         />
         <Route
           path="/trash"

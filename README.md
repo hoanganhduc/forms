@@ -41,10 +41,38 @@ with VirusTotal scanning, and optional Google Drive finalization.
 
 ## Smoke test
 - `API_BASE=http://127.0.0.1:8787 TOKEN=your_jwt npm run smoke:api`
+- `API_BASE=http://127.0.0.1:8787 TOKEN=your_jwt npm run smoke:canvas`
 
 ## Admin exports
 - CSV: `GET /api/admin/forms/:slug/export.csv`
 - TXT (JSONL): `GET /api/admin/forms/:slug/export.txt`
+
+## Routine tasks + health
+- Admin dashboard shows routine tasks (cron-based) and health status history.
+- Built-in tasks:
+  - Canvas sync (courses + sections)
+  - Canvas name mismatch checker
+  - Canvas retry queue processor
+  - Backup forms + templates (R2 + Drive `/backups`)
+  - Empty trash
+  - Test notice
+- Routine run logs are retained (last 100 per task, last 30 days).
+- Admin Canvas page shows retry queue + dead letters with Retry/Drop actions.
+- Health endpoints:
+  - `GET /api/admin/health/summary`
+  - `GET /api/admin/health/history?service=...&limit=...`
+
+## Canvas enrollment
+- Configure Canvas vars (API):
+  - `CANVAS_API_TOKEN` (secret)
+  - `CANVAS_BASE_URL` (default `https://canvas.instructure.com`)
+  - `CANVAS_ACCOUNT_ID` (optional fallback if `accounts/self` is unavailable)
+- Admin workflow:
+  - Go to Builder, enable Canvas enrollment for a form.
+  - Sync courses + sections and select the course/sections.
+  - Ensure the form includes **Full Name** and **Email** fields.
+- Submission flow:
+  - User submits the form; API enrolls them and stores status in the submission.
 
 ## Deploy: GitHub Pages (web)
 - Build:
@@ -68,6 +96,17 @@ with VirusTotal scanning, and optional Google Drive finalization.
 - `GET /api/me/submissions`
 - `GET /api/me/submissions/:id`
 - `GET /api/me/submission?formSlug=...`
+- `GET /api/admin/canvas/courses`
+- `GET /api/admin/canvas/courses/:id/sections`
+- `POST /api/admin/canvas/sync`
+- `GET /api/admin/canvas/retry-queue`
+- `POST /api/admin/canvas/retry-queue/:id/retry`
+- `POST /api/admin/canvas/retry-queue/:id/drop`
+- `GET /api/admin/health/summary`
+- `GET /api/admin/health/history`
+- `GET /api/admin/routines`
+- `POST /api/admin/routines`
+- `POST /api/admin/routines/run`
 - `POST /api/uploads/init`
 - `PUT /api/uploads/put`
 - `POST /api/uploads/complete`
@@ -101,6 +140,14 @@ The API uses a staged upload flow:
 3) `POST /api/uploads/complete` to create a DB row and kick off VirusTotal.
 4) `POST /api/uploads/vt/recheck` (admin) or per-file "Check status" to update VT status.
 5) Finalization happens when scans are clean and Drive is configured.
+
+## Backups
+- Admin can export selected forms/templates into JSON backups.
+- Backup routine task stores JSON in R2 and Google Drive:
+  - R2: `backups/forms-<timestamp>.json`, `backups/templates-<timestamp>.json`
+  - Drive: `<drive root>/backups/forms/` and `<drive root>/backups/templates/`
+- Restore flow handles slug conflicts:
+  - If a matching slug is in trash, you can restore it instead of overwriting.
 
 ## Template visibility
 - Template visibility is deprecated. The `templates.is_public` column remains for compatibility,
@@ -150,6 +197,9 @@ The API uses a staged upload flow:
 - `VT_STRICT` (optional): `true` to block finalization when scans are pending or malicious.
 - `DRIVE_SERVICE_ACCOUNT_JSON`: Service account JSON (shared drive access required).
 - `DRIVE_PARENT_FOLDER_ID`: Shared drive folder ID where form folders are created.
+- `CANVAS_BASE_URL`: Canvas base URL (default `https://canvas.instructure.com`).
+- `CANVAS_API_TOKEN`: Canvas admin token (secret).
+- `CANVAS_ACCOUNT_ID` (optional): fallback account for user creation.
 
 ## Drive setup notes
 - Ensure the service account has access to the shared drive (add it as a member).
