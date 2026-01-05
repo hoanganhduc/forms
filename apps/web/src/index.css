@@ -769,8 +769,18 @@ h1 {
     min-height: 44px;
   }
 
-  .table {
+  .btn {
     font-size: 14px;
+    padding: 0.45rem 0.75rem;
+  }
+
+  .form-control,
+  .form-select {
+    font-size: 15px;
+  }
+
+  .table {
+    font-size: 13px;
   }
 
   .table th,
