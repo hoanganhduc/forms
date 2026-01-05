@@ -663,16 +663,9 @@ h1 {
 }
 
 .btn {
-  min-height: 40px;
   display: inline-flex;
   align-items: center;
   gap: 8px;
-}
-
-.form-control,
-.form-select,
-.form-check-input {
-  min-height: 40px;
 }
 
 .admin-grid {
@@ -767,6 +760,12 @@ h1 {
   .form-select,
   .form-check-input {
     min-height: 44px;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
   }
 
   .btn {
