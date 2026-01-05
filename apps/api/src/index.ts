@@ -1,4 +1,5 @@
 const BUILD_TIME = new Date().toISOString();
+let EMAIL_LOGS_SOFT_DELETE: boolean | null = null;
 
 type CorsHeaders = Record<string, string>;
 
@@ -284,6 +285,20 @@ async function hasColumn(env: Env, table: string, column: string): Promise<boole
     .bind(column)
     .first<{ "1": number }>();
   return Boolean(row);
+}
+
+async function hasEmailLogsSoftDelete(env: Env): Promise<boolean> {
+  if (EMAIL_LOGS_SOFT_DELETE === null) {
+    EMAIL_LOGS_SOFT_DELETE = await hasColumn(env, "email_logs", "deleted_at");
+    if (EMAIL_LOGS_SOFT_DELETE) {
+      try {
+        await env.DB.prepare("SELECT deleted_at FROM email_logs LIMIT 1").first();
+      } catch {
+        EMAIL_LOGS_SOFT_DELETE = false;
+      }
+    }
+  }
+  return EMAIL_LOGS_SOFT_DELETE;
 }
 
 async function parseJsonBody<T>(request: Request): Promise<T> {
@@ -1627,15 +1642,17 @@ async function emptyAllTrash(env: Env): Promise<{
     if (row?.id) await hardDeleteFileItem(env, row.id);
   }
   counts.files = files.length;
-  const { results: emails } = await env.DB.prepare(
-    "SELECT id FROM email_logs WHERE deleted_at IS NOT NULL"
-  ).all<{ id: string }>();
-  for (const row of emails) {
-    if (row?.id) {
-      await env.DB.prepare("DELETE FROM email_logs WHERE id=?").bind(row.id).run();
+  if (await hasEmailLogsSoftDelete(env)) {
+    const { results: emails } = await env.DB.prepare(
+      "SELECT id FROM email_logs WHERE deleted_at IS NOT NULL"
+    ).all<{ id: string }>();
+    for (const row of emails) {
+      if (row?.id) {
+        await env.DB.prepare("DELETE FROM email_logs WHERE id=?").bind(row.id).run();
+      }
     }
+    counts.emails = emails.length;
   }
-  counts.emails = emails.length;
   return counts;
 }
 
@@ -7135,44 +7152,82 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname === "/api/admin/emails") {
+        let canSoftDelete = await hasEmailLogsSoftDelete(env);
         const page = Math.max(toNumber(url.searchParams.get("page"), 1), 1);
         const pageSize = Math.min(Math.max(toNumber(url.searchParams.get("pageSize"), 50), 1), 200);
         const status = (url.searchParams.get("status") || "").trim();
         const email = (url.searchParams.get("email") || "").trim();
         const submissionId = (url.searchParams.get("submissionId") || "").trim();
+        const formSlug = (url.searchParams.get("formSlug") || "").trim();
         const includeBody = url.searchParams.get("includeBody") === "1";
         const where: string[] = [];
         const params: Array<string | number> = [];
         if (status) {
-          where.push("status=?");
+          where.push("l.status=?");
           params.push(status);
         }
         if (email) {
-          where.push("to_email LIKE ?");
+          where.push("l.to_email LIKE ?");
           params.push(`%${email}%`);
         }
         if (submissionId) {
-          where.push("submission_id=?");
+          where.push("l.submission_id=?");
           params.push(submissionId);
         }
-        where.push("deleted_at IS NULL");
-        const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
-        const totalRow = await env.DB.prepare(
-          `SELECT COUNT(1) as total FROM email_logs ${whereClause}`
-        )
-          .bind(...params)
-          .first<{ total: number }>();
-        const total = totalRow?.total ?? 0;
+        if (formSlug) {
+          where.push("(l.form_slug=? OR f.slug=?)");
+          params.push(formSlug, formSlug);
+        }
+        if (canSoftDelete) {
+          where.push("l.deleted_at IS NULL");
+        }
+        let whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+        let total = 0;
         const limit = pageSize;
         const offset = (page - 1) * pageSize;
         const selectFields = includeBody
           ? "l.id,l.to_email,l.subject,l.body,l.status,l.error,l.submission_id,l.canvas_course_id,l.canvas_section_id,l.triggered_by,l.trigger_source,l.created_at,COALESCE(l.form_slug,f.slug) as form_slug,COALESCE(l.form_title,f.title) as form_title"
           : "l.id,l.to_email,l.subject,l.status,l.error,l.submission_id,l.canvas_course_id,l.canvas_section_id,l.triggered_by,l.trigger_source,l.created_at,COALESCE(l.form_slug,f.slug) as form_slug,COALESCE(l.form_title,f.title) as form_title";
-        const { results } = await env.DB.prepare(
-          `SELECT ${selectFields} FROM email_logs l LEFT JOIN forms f ON f.id=l.form_id ${whereClause} ORDER BY l.created_at DESC LIMIT ? OFFSET ?`
-        )
-          .bind(...params, limit, offset)
-          .all();
+        let results: unknown[] = [];
+        try {
+          const totalRow = await env.DB.prepare(
+            `SELECT COUNT(1) as total FROM email_logs ${whereClause}`
+          )
+            .bind(...params)
+            .first<{ total: number }>();
+          total = totalRow?.total ?? 0;
+          const response = await env.DB.prepare(
+            `SELECT ${selectFields} FROM email_logs l LEFT JOIN forms f ON f.id=l.form_id ${whereClause} ORDER BY l.created_at DESC LIMIT ? OFFSET ?`
+          )
+            .bind(...params, limit, offset)
+            .all();
+          results = response.results;
+        } catch (error) {
+          const message = String((error as Error)?.message || error);
+          if (canSoftDelete && message.includes("no such column: l.deleted_at")) {
+            EMAIL_LOGS_SOFT_DELETE = false;
+            canSoftDelete = false;
+            const idx = where.indexOf("l.deleted_at IS NULL");
+            if (idx >= 0) {
+              where.splice(idx, 1);
+            }
+            whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+            const totalRow = await env.DB.prepare(
+              `SELECT COUNT(1) as total FROM email_logs ${whereClause}`
+            )
+              .bind(...params)
+              .first<{ total: number }>();
+            total = totalRow?.total ?? 0;
+            const response = await env.DB.prepare(
+              `SELECT ${selectFields} FROM email_logs l LEFT JOIN forms f ON f.id=l.form_id ${whereClause} ORDER BY l.created_at DESC LIMIT ? OFFSET ?`
+            )
+              .bind(...params, limit, offset)
+              .all();
+            results = response.results;
+          } else {
+            throw error;
+          }
+        }
         return jsonResponse(
           200,
           { data: results, page, pageSize, total, requestId },
@@ -7190,11 +7245,17 @@ export default {
             message: "required"
           });
         }
-        await env.DB.prepare(
-          "UPDATE email_logs SET deleted_at=datetime('now'), deleted_by=?, deleted_reason=? WHERE id=? AND deleted_at IS NULL"
-        )
-          .bind(adminPayload?.userId ?? null, "admin_deleted", emailId)
-          .run();
+        if (await hasEmailLogsSoftDelete(env)) {
+          await env.DB.prepare(
+            "UPDATE email_logs SET deleted_at=datetime('now'), deleted_by=?, deleted_reason=? WHERE id=? AND deleted_at IS NULL"
+          )
+            .bind(adminPayload?.userId ?? null, "admin_deleted", emailId)
+            .run();
+        } else {
+          await env.DB.prepare("DELETE FROM email_logs WHERE id=?")
+            .bind(emailId)
+            .run();
+        }
         return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
       }
 
@@ -7814,17 +7875,22 @@ export default {
         }
 
         if (type === "all" || type === "emails") {
-          const total = await env.DB.prepare(
-            "SELECT COUNT(1) as total FROM email_logs WHERE deleted_at IS NOT NULL"
-          )
-            .first<{ total: number }>();
-          totals.emails = total?.total ?? 0;
-          const { results } = await env.DB.prepare(
-            "SELECT l.id,l.to_email,l.subject,l.status,l.error,l.submission_id,COALESCE(l.form_slug,f.slug) as form_slug,COALESCE(l.form_title,f.title) as form_title,l.deleted_at,l.deleted_by,l.deleted_reason,(SELECT email FROM user_identities ui WHERE ui.user_id=l.deleted_by ORDER BY ui.created_at DESC LIMIT 1) as deleted_by_email FROM email_logs l LEFT JOIN forms f ON f.id=l.form_id WHERE l.deleted_at IS NOT NULL ORDER BY l.deleted_at DESC LIMIT ? OFFSET ?"
-          )
-            .bind(limit, offset)
-            .all();
-          data.emails = results;
+          if (await hasEmailLogsSoftDelete(env)) {
+            const total = await env.DB.prepare(
+              "SELECT COUNT(1) as total FROM email_logs WHERE deleted_at IS NOT NULL"
+            )
+              .first<{ total: number }>();
+            totals.emails = total?.total ?? 0;
+            const { results } = await env.DB.prepare(
+              "SELECT l.id,l.to_email,l.subject,l.status,l.error,l.submission_id,COALESCE(l.form_slug,f.slug) as form_slug,COALESCE(l.form_title,f.title) as form_title,l.deleted_at,l.deleted_by,l.deleted_reason,(SELECT email FROM user_identities ui WHERE ui.user_id=l.deleted_by ORDER BY ui.created_at DESC LIMIT 1) as deleted_by_email FROM email_logs l LEFT JOIN forms f ON f.id=l.form_id WHERE l.deleted_at IS NOT NULL ORDER BY l.deleted_at DESC LIMIT ? OFFSET ?"
+            )
+              .bind(limit, offset)
+              .all();
+            data.emails = results;
+          } else {
+            totals.emails = 0;
+            data.emails = [];
+          }
         }
 
         return jsonResponse(200, { data, totals, page, pageSize, requestId }, requestId, corsHeaders);
@@ -7861,6 +7927,11 @@ export default {
         } else if (type === "file") {
           ok = await restoreFileItem(env, id);
         } else if (type === "email") {
+          if (!(await hasEmailLogsSoftDelete(env))) {
+            return errorResponse(400, "not_supported", requestId, corsHeaders, {
+              message: "email_soft_delete_unavailable"
+            });
+          }
           await env.DB.prepare("UPDATE email_logs SET deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?")
             .bind(id)
             .run();
@@ -8050,13 +8121,15 @@ export default {
           }
         }
         if (type === "all" || type === "emails") {
-          const { results } = await env.DB.prepare("SELECT id FROM email_logs WHERE deleted_at IS NOT NULL")
-            .all<{ id: string }>();
-          for (const row of results) {
-            if (row?.id) {
-              await env.DB.prepare("DELETE FROM email_logs WHERE id=?")
-                .bind(row.id)
-                .run();
+          if (await hasEmailLogsSoftDelete(env)) {
+            const { results } = await env.DB.prepare("SELECT id FROM email_logs WHERE deleted_at IS NOT NULL")
+              .all<{ id: string }>();
+            for (const row of results) {
+              if (row?.id) {
+                await env.DB.prepare("DELETE FROM email_logs WHERE id=?")
+                  .bind(row.id)
+                  .run();
+              }
             }
           }
         }

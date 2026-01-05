@@ -341,6 +341,13 @@ h1 {
   align-items: center;
 }
 
+.btn-auth {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .auth-user {
   text-align: right;
 }

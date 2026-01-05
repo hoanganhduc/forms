@@ -1627,12 +1627,12 @@ function AuthBar({
         </>
       ) : (
         <>
-          <button type="button" className="btn btn-primary btn-sm" onClick={() => onLogin("google")}>
+          <button type="button" className="btn btn-primary btn-sm btn-auth" onClick={() => onLogin("google")}>
             <i className="bi bi-google" aria-hidden="true" /> Login with Google
           </button>
           <button
             type="button"
-            className="btn btn-outline-dark btn-sm"
+            className="btn btn-dark btn-auth"
             onClick={() => onLogin("github")}
           >
             <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
@@ -3481,10 +3481,10 @@ function FormPage({
             Please sign in to continue.
           </p>
           <div className="auth-bar">
-            <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+            <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
               <i className="bi bi-google" aria-hidden="true" /> Login with Google
             </button>
-            <button type="button" className="btn btn-outline-dark" onClick={() => onLogin("github")}>
+            <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
               <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
             </button>
           </div>
@@ -4017,10 +4017,10 @@ function DashboardPage({
         <h2>Sign in required</h2>
         <p>Please sign in to view your dashboard.</p>
         <div className="auth-bar">
-          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+          <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
             <i className="bi bi-google" aria-hidden="true" /> Login with Google
           </button>
-          <button type="button" className="btn btn-outline-dark" onClick={() => onLogin("github")}>
+          <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
             <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
           </button>
         </div>
@@ -4209,10 +4209,10 @@ function AccountPage({
           </div>
         ) : null}
         <div className="auth-bar">
-          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+          <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
             <i className="bi bi-google" aria-hidden="true" /> Login with Google
           </button>
-          <button type="button" className="btn btn-outline-dark" onClick={() => onLogin("github")}>
+          <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
             <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
           </button>
         </div>
@@ -4406,10 +4406,10 @@ function CanvasPage({
         <h2>Sign in required</h2>
         <p>Please sign in to view Canvas details.</p>
         <div className="auth-bar">
-          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+          <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
             <i className="bi bi-google" aria-hidden="true" /> Login with Google
           </button>
-          <button type="button" className="btn btn-outline-dark" onClick={() => onLogin("github")}>
+          <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
             <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
           </button>
         </div>
@@ -4695,10 +4695,10 @@ function SubmissionDetailPage({
         <h2>Sign in required</h2>
         <p>Please sign in to view your submission.</p>
         <div className="auth-bar">
-          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+          <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
             <i className="bi bi-google" aria-hidden="true" /> Login with Google
           </button>
-          <button type="button" className="btn btn-outline-dark" onClick={() => onLogin("github")}>
+          <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
             <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
           </button>
         </div>
@@ -5298,10 +5298,10 @@ function AdminCanvasPage({
         <h2>Not authorized</h2>
         <p>Please sign in with an admin account.</p>
         <div className="auth-bar">
-          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+          <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
             <i className="bi bi-google" aria-hidden="true" /> Login with Google
           </button>
-          <button type="button" className="btn btn-outline-primary" onClick={() => onLogin("github")}>
+          <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
             <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
           </button>
         </div>
@@ -5999,6 +5999,10 @@ function AdminPage({
   const [routines, setRoutines] = useState<any[]>([]);
   const [healthSummary, setHealthSummary] = useState<any[]>([]);
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
+  const [formStatusFilter, setFormStatusFilter] = useState("all");
+  const [userRoleFilter, setUserRoleFilter] = useState("all");
+  const [submissionFormFilter, setSubmissionFormFilter] = useState("");
+  const [submissionUserFilter, setSubmissionUserFilter] = useState("");
   const [settingsTimezone, setSettingsTimezone] = useState(appDefaultTimezone);
   const [routineEdits, setRoutineEdits] = useState<Record<string, { cron: string; enabled: boolean }>>(
     {}
@@ -6031,6 +6035,52 @@ function AdminPage({
     });
     return next;
   }, [forms]);
+  const filteredForms = useMemo(() => {
+    if (formStatusFilter === "all") return forms;
+    return forms.filter((form) => {
+      if (formStatusFilter === "locked") return Boolean(form.is_locked);
+      if (formStatusFilter === "unlocked") return !Boolean(form.is_locked);
+      if (formStatusFilter === "public") return Boolean(form.is_public);
+      if (formStatusFilter === "private") return !Boolean(form.is_public);
+      if (formStatusFilter.startsWith("auth:")) {
+        const policy = formStatusFilter.replace("auth:", "");
+        return String(form.auth_policy || "optional") === policy;
+      }
+      return true;
+    });
+  }, [forms, formStatusFilter]);
+  const filteredUsers = useMemo(() => {
+    if (userRoleFilter === "all") return users;
+    return users.filter((entry) =>
+      userRoleFilter === "admin" ? Boolean(entry.is_admin) : !Boolean(entry.is_admin)
+    );
+  }, [users, userRoleFilter]);
+  const userOptions = useMemo(
+    () =>
+      users
+        .filter((entry) => entry?.id)
+        .map((entry) => ({
+          id: String(entry.id),
+          label:
+            entry.email ||
+            entry.provider_login ||
+            entry.github_username ||
+            entry.google_email ||
+            String(entry.id)
+        })),
+    [users]
+  );
+  const filteredSubmissions = useMemo(() => {
+    return submissions.filter((entry) => {
+      if (submissionFormFilter && String(entry.form_slug || "") !== submissionFormFilter) {
+        return false;
+      }
+      if (submissionUserFilter && String(entry.user_id || "") !== submissionUserFilter) {
+        return false;
+      }
+      return true;
+    });
+  }, [submissions, submissionFormFilter, submissionUserFilter]);
   const [routineStatus, setRoutineStatus] = useState<string | null>(null);
   const [routineSelected, setRoutineSelected] = useState<Set<string>>(new Set());
   const [routineBulkStatus, setRoutineBulkStatus] = useState<{
@@ -6387,9 +6437,9 @@ function AdminPage({
         <h2>Not authorized</h2>
         <p>Please sign in with an admin account.</p>
         <div className="auth-bar">
-          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>            <i className="bi bi-google" aria-hidden="true" /> Login with Google
+          <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>            <i className="bi bi-google" aria-hidden="true" /> Login with Google
           </button>
-          <button type="button" className="btn btn-outline-primary" onClick={() => onLogin("github")}>            <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
+          <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>            <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
           </button>
         </div>
       </section>
@@ -6497,8 +6547,32 @@ function AdminPage({
             <i className="bi bi-pencil-square" aria-hidden="true" /> Builder
           </Link>
         </div>
+        <div className="d-flex flex-wrap gap-2 align-items-end mb-2">
+          <div>
+            <label className="form-label">Status</label>
+            <select
+              className="form-select form-select-sm"
+              value={formStatusFilter}
+              onChange={(event) => setFormStatusFilter(event.target.value)}
+            >
+              <option value="all">All</option>
+              <option value="locked">Locked</option>
+              <option value="unlocked">Unlocked</option>
+              <option value="public">Public</option>
+              <option value="private">Private</option>
+              <option value="auth:optional">Auth: Optional</option>
+              <option value="auth:required">Auth: Required</option>
+              <option value="auth:google">Auth: Google</option>
+              <option value="auth:github">Auth: GitHub</option>
+              <option value="auth:either">Auth: Either</option>
+            </select>
+          </div>
+          <div className="ms-auto muted">Showing: {filteredForms.length}</div>
+        </div>
         {forms.length === 0 ? (
           <div className="muted">No forms yet.</div>
+        ) : filteredForms.length === 0 ? (
+          <div className="muted">No forms match the selected filters.</div>
         ) : (
           <div className="table-responsive">
             <table className="table table-sm">
@@ -6509,13 +6583,18 @@ function AdminPage({
                       type="checkbox"
                       className="form-check-input"
                       checked={
-                        forms.length > 0 &&
-                        forms.slice(0, 10).every((item: any) => adminSelected.forms.has(item.slug))
+                        filteredForms.length > 0 &&
+                        filteredForms
+                          .slice(0, 10)
+                          .every((item: any) => adminSelected.forms.has(item.slug))
                       }
                       onChange={() =>
                         toggleAdminAll(
                           "forms",
-                          forms.slice(0, 10).map((item: any) => item.slug).filter(Boolean)
+                          filteredForms
+                            .slice(0, 10)
+                            .map((item: any) => item.slug)
+                            .filter(Boolean)
                         )
                       }
                     />
@@ -6527,7 +6606,7 @@ function AdminPage({
                 </tr>
               </thead>
               <tbody>
-                {forms.slice(0, 10).map((form) => (
+                {filteredForms.slice(0, 10).map((form) => (
                   <tr key={form.slug}>
                     <td>
                       <input
@@ -6695,6 +6774,9 @@ function AdminPage({
             <i className="bi bi-pencil-square" aria-hidden="true" /> Builder
           </Link>
         </div>
+        <div className="d-flex flex-wrap gap-2 align-items-end mb-2">
+          <div className="ms-auto muted">Showing: {templates.length}</div>
+        </div>
         {templates.length === 0 ? (
           <div className="muted">No templates yet.</div>
         ) : (
@@ -6808,8 +6890,25 @@ function AdminPage({
         <div className="panel-header">
           <h3 className="mb-0">Users</h3>
         </div>
+        <div className="d-flex flex-wrap gap-2 align-items-end mb-2">
+          <div>
+            <label className="form-label">Role</label>
+            <select
+              className="form-select form-select-sm"
+              value={userRoleFilter}
+              onChange={(event) => setUserRoleFilter(event.target.value)}
+            >
+              <option value="all">All</option>
+              <option value="admin">Admin</option>
+              <option value="user">User</option>
+            </select>
+          </div>
+          <div className="ms-auto muted">Showing: {filteredUsers.length}</div>
+        </div>
         {users.length === 0 ? (
           <div className="muted">No users yet.</div>
+        ) : filteredUsers.length === 0 ? (
+          <div className="muted">No users match the selected filters.</div>
         ) : (
           <div className="table-responsive">
             <table className="table table-sm">
@@ -6820,13 +6919,18 @@ function AdminPage({
                       type="checkbox"
                       className="form-check-input"
                       checked={
-                        users.length > 0 &&
-                        users.slice(0, 10).every((item: any) => adminSelected.users.has(item.id))
+                        filteredUsers.length > 0 &&
+                        filteredUsers
+                          .slice(0, 10)
+                          .every((item: any) => adminSelected.users.has(item.id))
                       }
                       onChange={() =>
                         toggleAdminAll(
                           "users",
-                          users.slice(0, 10).map((item: any) => item.id).filter(Boolean)
+                          filteredUsers
+                            .slice(0, 10)
+                            .map((item: any) => item.id)
+                            .filter(Boolean)
                         )
                       }
                     />
@@ -6838,7 +6942,7 @@ function AdminPage({
                 </tr>
               </thead>
               <tbody>
-                {users.slice(0, 10).map((item) => {
+                {filteredUsers.slice(0, 10).map((item) => {
                   const isAdmin = Boolean(item.is_admin ?? item.isAdmin);
                   const googleEmail = item.email || item.google_email || "";
                   const githubLogin = item.github_login || item.provider_login || "";
@@ -6969,9 +7073,44 @@ function AdminPage({
         <div className="panel-header">
           <h3 className="mb-0">Submissions</h3>
         </div>
+        <div className="d-flex flex-wrap gap-2 align-items-end mb-2">
+          <div>
+            <label className="form-label">Form</label>
+            <select
+              className="form-select form-select-sm"
+              value={submissionFormFilter}
+              onChange={(event) => setSubmissionFormFilter(event.target.value)}
+            >
+              <option value="">All</option>
+              {forms.map((form) => (
+                <option key={form.slug} value={form.slug}>
+                  {form.title || form.slug}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="form-label">User</label>
+            <select
+              className="form-select form-select-sm"
+              value={submissionUserFilter}
+              onChange={(event) => setSubmissionUserFilter(event.target.value)}
+            >
+              <option value="">All</option>
+              {userOptions.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="ms-auto muted">Showing: {filteredSubmissions.length}</div>
+        </div>
         {submissionsError ? <div className="alert alert-warning">{submissionsError}</div> : null}
         {submissions.length === 0 ? (
           <div className="muted">No submissions yet.</div>
+        ) : filteredSubmissions.length === 0 ? (
+          <div className="muted">No submissions match the selected filters.</div>
         ) : (
           <div className="table-responsive">
             <table className="table table-sm">
@@ -6982,13 +7121,18 @@ function AdminPage({
                       type="checkbox"
                       className="form-check-input"
                       checked={
-                        submissions.length > 0 &&
-                        submissions.slice(0, 10).every((item: any) => adminSelected.submissions.has(item.id))
+                        filteredSubmissions.length > 0 &&
+                        filteredSubmissions
+                          .slice(0, 10)
+                          .every((item: any) => adminSelected.submissions.has(item.id))
                       }
                       onChange={() =>
                         toggleAdminAll(
                           "submissions",
-                          submissions.slice(0, 10).map((item: any) => item.id).filter(Boolean)
+                          filteredSubmissions
+                            .slice(0, 10)
+                            .map((item: any) => item.id)
+                            .filter(Boolean)
                         )
                       }
                     />
@@ -7000,7 +7144,7 @@ function AdminPage({
                 </tr>
               </thead>
               <tbody>
-                {submissions.slice(0, 10).map((item) => {
+                {filteredSubmissions.slice(0, 10).map((item) => {
                   const title = item.form_title || formTitleBySlug[item.form_slug] || item.id;
                   return (
                     <tr key={item.id}>
@@ -7025,7 +7169,13 @@ function AdminPage({
                           </div>
                         ) : null}
                       </td>
-                    <td>{item.submitter_email || item.submitter_github_username || item.user_id || "n/a"}</td>
+                    <td>
+                      {item.submitter_email ||
+                        item.submitter_github_username ||
+                        userOptions.find((option) => option.id === item.user_id)?.label ||
+                        item.user_id ||
+                        "n/a"}
+                    </td>
                     <td>{item.created_at ? formatTimeICT(item.created_at) : "n/a"}</td>
                     <td>
                       <div className="d-flex flex-wrap gap-2">
@@ -7484,6 +7634,8 @@ function AdminEmailsPage({
   const [total, setTotal] = useState(0);
   const [filterStatus, setFilterStatus] = useState("");
   const [filterEmail, setFilterEmail] = useState("");
+  const [filterForm, setFilterForm] = useState("");
+  const [forms, setForms] = useState<Array<{ slug: string; title: string }>>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [testRecipient, setTestRecipient] = useState("");
   const [testSubject, setTestSubject] = useState("Test email from Form App");
@@ -7495,6 +7647,28 @@ function AdminEmailsPage({
 
   useEffect(() => {
     let active = true;
+    async function loadForms() {
+      const response = await apiFetch(`${API_BASE}/api/admin/forms`);
+      const payload = await response.json().catch(() => null);
+      if (!active) return;
+      if (!response.ok || !Array.isArray(payload?.data)) {
+        setForms([]);
+        return;
+      }
+      setForms(
+        payload.data
+          .filter((item: any) => item?.slug)
+          .map((item: any) => ({ slug: String(item.slug), title: String(item.title || item.slug) }))
+      );
+    }
+    loadForms();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
     async function loadEmails() {
       setStatus("loading");
       const params = new URLSearchParams();
@@ -7503,6 +7677,7 @@ function AdminEmailsPage({
       params.set("includeBody", "1");
       if (filterStatus) params.set("status", filterStatus);
       if (filterEmail) params.set("email", filterEmail);
+      if (filterForm) params.set("formSlug", filterForm);
       const response = await apiFetch(`${API_BASE}/api/admin/emails?${params.toString()}`);
       const payload = await response.json().catch(() => null);
       if (!active) return;
@@ -7525,7 +7700,7 @@ function AdminEmailsPage({
     return () => {
       active = false;
     };
-  }, [page, pageSize, filterStatus, filterEmail]);
+  }, [page, pageSize, filterStatus, filterEmail, filterForm]);
 
   if (status === "loading") {
     return (
@@ -7541,10 +7716,10 @@ function AdminEmailsPage({
         <h2>Not authorized</h2>
         <p>Please sign in with an admin account.</p>
         <div className="auth-bar">
-          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+          <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
             <i className="bi bi-google" aria-hidden="true" /> Login with Google
           </button>
-          <button type="button" className="btn btn-outline-primary" onClick={() => onLogin("github")}>
+          <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
             <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
           </button>
         </div>
@@ -7664,41 +7839,68 @@ function AdminEmailsPage({
             placeholder="Search email"
           />
         </div>
-        <div className="ms-auto muted">Total: {total}</div>
-        {selectedEmailIds.size > 0 ? (
-          <button
-            type="button"
-            className="btn btn-outline-danger btn-sm"
-            onClick={async () => {
-              setActionStatus(null);
-              if (!window.confirm("Move selected emails to trash?")) {
-                return;
-              }
-              const ids = Array.from(selectedEmailIds);
-              let failed = 0;
-              for (const id of ids) {
-                const response = await apiFetch(
-                  `${API_BASE}/api/admin/emails/${encodeURIComponent(id)}`,
-                  { method: "DELETE" }
-                );
-                if (!response.ok) {
-                  failed += 1;
-                }
-              }
-              setEmails((prev) => prev.filter((entry) => !selectedEmailIds.has(entry.id)));
-              setTotal((prev) => Math.max(0, prev - (ids.length - failed)));
-              setSelectedEmailIds(new Set());
-              setActionStatus({
-                message:
-                  failed > 0
-                    ? `Moved ${ids.length - failed} email(s) to trash. ${failed} failed.`
-                    : `Moved ${ids.length} email(s) to trash.`,
-                type: failed > 0 ? "warning" : "success"
-              });
+        <div>
+          <label className="form-label">Form</label>
+          <select
+            className="form-select form-select-sm"
+            value={filterForm}
+            onChange={(event) => {
+              setPage(1);
+              setFilterForm(event.target.value);
             }}
           >
-            <i className="bi bi-trash" aria-hidden="true" /> Delete selected
-          </button>
+            <option value="">All</option>
+            {forms.map((form) => (
+              <option key={form.slug} value={form.slug}>
+                {form.title}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="ms-auto muted">Total: {total}</div>
+        {selectedEmailIds.size > 0 ? (
+          <>
+            <button
+              type="button"
+              className="btn btn-outline-danger btn-sm"
+              onClick={async () => {
+                setActionStatus(null);
+                if (!window.confirm("Move selected emails to trash?")) {
+                  return;
+                }
+                const ids = Array.from(selectedEmailIds);
+                let failed = 0;
+                for (const id of ids) {
+                  const response = await apiFetch(
+                    `${API_BASE}/api/admin/emails/${encodeURIComponent(id)}`,
+                    { method: "DELETE" }
+                  );
+                  if (!response.ok) {
+                    failed += 1;
+                  }
+                }
+                setEmails((prev) => prev.filter((entry) => !selectedEmailIds.has(entry.id)));
+                setTotal((prev) => Math.max(0, prev - (ids.length - failed)));
+                setSelectedEmailIds(new Set());
+                setActionStatus({
+                  message:
+                    failed > 0
+                      ? `Moved ${ids.length - failed} email(s) to trash. ${failed} failed.`
+                      : `Moved ${ids.length} email(s) to trash.`,
+                  type: failed > 0 ? "warning" : "success"
+                });
+              }}
+            >
+              <i className="bi bi-trash" aria-hidden="true" /> Delete selected
+            </button>
+            <button
+              type="button"
+              className="btn btn-outline-secondary btn-sm"
+              onClick={() => setSelectedEmailIds(new Set())}
+            >
+              <i className="bi bi-x-circle" aria-hidden="true" /> Clear selection
+            </button>
+          </>
         ) : null}
       </div>
       <div className="table-responsive">
@@ -7997,10 +8199,10 @@ function TrashPage({
         <h2>Sign in required</h2>
         <p>Please sign in to view trash.</p>
         <div className="auth-bar">
-          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+          <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
             <i className="bi bi-google" aria-hidden="true" /> Login with Google
           </button>
-          <button type="button" className="btn btn-outline-dark" onClick={() => onLogin("github")}>
+          <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
             <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
           </button>
         </div>
@@ -9001,10 +9203,10 @@ function BuilderPage({
         <h2>Not authorized</h2>
         <p>Please sign in with an admin account.</p>
         <div className="auth-bar">
-          <button type="button" className="btn btn-primary" onClick={() => onLogin("google")}>
+          <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
             <i className="bi bi-google" aria-hidden="true" /> Login with Google
           </button>
-          <button type="button" className="btn btn-outline-primary" onClick={() => onLogin("github")}>
+          <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
             <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
           </button>
         </div>
