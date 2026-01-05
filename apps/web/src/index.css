@@ -131,7 +131,7 @@ a:hover {
 .app {
   max-width: 1040px;
   margin: 0 auto;
-  padding: 48px 24px calc(64px + env(safe-area-inset-bottom));
+  padding: 40px 24px calc(64px + env(safe-area-inset-bottom));
 }
 
 .app-header {
@@ -368,6 +368,7 @@ h1 {
   border: 1px solid var(--card-border);
   box-shadow: var(--card-shadow);
   margin-bottom: 20px;
+  width: 100%;
 }
 
 .panel--error {
@@ -634,6 +635,7 @@ h1 {
 
 .table-responsive {
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .table th,
@@ -658,6 +660,19 @@ h1 {
 
 .form-actions--sticky {
   width: 100%;
+}
+
+.btn {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.form-control,
+.form-select,
+.form-check-input {
+  min-height: 40px;
 }
 
 .admin-grid {
@@ -764,6 +779,15 @@ h1 {
     word-break: break-word;
   }
 
+  .table td .d-flex {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .table td .d-flex .btn {
+    width: 100%;
+  }
+
   .panel {
     padding: 18px;
   }
@@ -772,6 +796,10 @@ h1 {
     flex-direction: column;
     align-items: flex-start;
     gap: 8px;
+  }
+
+  .panel-header .btn {
+    width: 100%;
   }
 
   .upload-actions,
