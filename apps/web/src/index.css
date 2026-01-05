@@ -826,6 +826,10 @@ h1 {
     min-width: 160px;
   }
 
+  .table {
+    min-width: 720px;
+  }
+
   .panel {
     padding: 18px;
   }
