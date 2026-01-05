@@ -6944,7 +6944,7 @@ function AdminPage({
               <tbody>
                 {filteredUsers.slice(0, 10).map((item) => {
                   const isAdmin = Boolean(item.is_admin ?? item.isAdmin);
-                  const googleEmail = item.email || item.google_email || "";
+                  const googleEmail = item.google_email || item.email || "";
                   const githubLogin = item.github_login || item.provider_login || "";
                   const canvasStatus = item.canvas_status || "";
                   const canvasBadge =

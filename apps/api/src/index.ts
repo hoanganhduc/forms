@@ -7745,7 +7745,7 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/admin/users") {
         const { results } = await env.DB.prepare(
-          "SELECT u.id,u.is_admin,u.created_at,(SELECT provider FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as provider,(SELECT email FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as email,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as provider_login,(SELECT s.canvas_enroll_status FROM submissions s WHERE s.user_id=u.id AND s.canvas_course_id IS NOT NULL AND s.deleted_at IS NULL ORDER BY COALESCE(s.updated_at, s.created_at) DESC LIMIT 1) as canvas_status FROM users u WHERE u.deleted_at IS NULL ORDER BY u.created_at DESC"
+          "SELECT u.id,u.is_admin,u.created_at,(SELECT provider FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as provider,(SELECT email FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as email,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as provider_login,(SELECT email FROM user_identities ui WHERE ui.user_id=u.id AND ui.provider='google' ORDER BY ui.created_at DESC LIMIT 1) as google_email,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=u.id AND ui.provider='github' ORDER BY ui.created_at DESC LIMIT 1) as github_login,(SELECT s.canvas_enroll_status FROM submissions s WHERE s.user_id=u.id AND s.canvas_course_id IS NOT NULL AND s.deleted_at IS NULL ORDER BY COALESCE(s.updated_at, s.created_at) DESC LIMIT 1) as canvas_status FROM users u WHERE u.deleted_at IS NULL ORDER BY u.created_at DESC"
         ).all();
         const data = results.map((row: any) => ({
           id: row.id,
@@ -7753,6 +7753,8 @@ export default {
           provider: row.provider ?? null,
           email: row.email ?? null,
           provider_login: row.provider_login ?? null,
+          google_email: row.google_email ?? null,
+          github_login: row.github_login ?? null,
           canvas_status: row.canvas_status ?? null,
           created_at: row.created_at
         }));
