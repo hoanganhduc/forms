@@ -797,6 +797,35 @@ h1 {
     width: 100%;
   }
 
+  .table thead th {
+    white-space: nowrap;
+  }
+
+  .table td.table-actions {
+    white-space: nowrap;
+  }
+
+  .table td.table-actions .d-flex {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .table td.table-actions .btn {
+    width: auto;
+    white-space: nowrap;
+  }
+
+  .table th:first-child,
+  .table td:first-child {
+    width: 40px;
+  }
+
+  .table th:last-child,
+  .table td.table-actions {
+    min-width: 160px;
+  }
+
   .panel {
     padding: 18px;
   }
