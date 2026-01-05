@@ -42,6 +42,9 @@ type FormListRow = {
   auth_policy?: string | null;
   canvas_enabled?: number | null;
   canvas_course_id?: string | null;
+  available_from?: string | null;
+  available_until?: string | null;
+  password_required?: number | null;
 };
 
 type FormDetailRow = {
@@ -59,6 +62,11 @@ type FormDetailRow = {
   canvas_enabled?: number | null;
   canvas_course_id?: string | null;
   canvas_allowed_section_ids_json?: string | null;
+  available_from?: string | null;
+  available_until?: string | null;
+  password_required?: number | null;
+  password_salt?: string | null;
+  password_hash?: string | null;
 };
 
 type FormSubmissionRow = {
@@ -80,6 +88,9 @@ type AdminFormRow = {
   canvas_enabled?: number | null;
   canvas_course_id?: string | null;
   canvas_allowed_section_ids_json?: string | null;
+  available_from?: string | null;
+  available_until?: string | null;
+  password_required?: number | null;
 };
 
 type TemplateRow = {
@@ -187,6 +198,32 @@ function parseAllowedOrigins(value: string | undefined): string[] {
     .filter((origin) => origin.length > 0);
 }
 
+const APP_SETTING_DEFAULT_TIMEZONE = "timezone_default";
+const APP_SETTING_CANVAS_COURSE_SYNC_MODE = "canvas_course_sync_mode";
+
+async function getAppSetting(env: Env, key: string): Promise<string | null> {
+  try {
+    const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key=?")
+      .bind(key)
+      .first<{ value: string }>();
+    return row?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function setAppSetting(env: Env, key: string, value: string): Promise<void> {
+  await env.DB.prepare(
+    "INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')"
+  )
+    .bind(key, value)
+    .run();
+}
+
+async function deleteAppSetting(env: Env, key: string): Promise<void> {
+  await env.DB.prepare("DELETE FROM app_settings WHERE key=?").bind(key).run();
+}
+
 function getCorsHeaders(request: Request, env: Env): CorsHeaders {
   const origin = request.headers.get("Origin");
   if (!origin) return {};
@@ -273,6 +310,67 @@ async function hashSha256(buffer: ArrayBuffer) {
   return bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+function parseIsoTime(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const time = Date.parse(value);
+  return Number.isNaN(time) ? null : time;
+}
+
+function normalizeDateTimeInput(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const time = parseIsoTime(trimmed);
+  if (!time) return null;
+  return new Date(time).toISOString();
+}
+
+function getFormAvailability(form: {
+  available_from?: string | null;
+  available_until?: string | null;
+  is_locked?: number | boolean;
+}) {
+  if (toBoolean(form.is_locked ?? false)) {
+    return { open: false, reason: "locked" as const };
+  }
+  const now = Date.now();
+  const start = parseIsoTime(form.available_from);
+  const end = parseIsoTime(form.available_until);
+  if (start && now < start) {
+    return { open: false, reason: "not_started" as const };
+  }
+  if (end && now > end) {
+    return { open: false, reason: "ended" as const };
+  }
+  return { open: true, reason: null as const };
+}
+
+async function hashPasswordWithSalt(password: string, salt: string) {
+  const encoder = new TextEncoder();
+  const buffer = encoder.encode(`${salt}:${password}`);
+  return hashSha256(buffer.buffer);
+}
+
+async function verifyFormPassword(
+  form: { password_required?: number | null; password_salt?: string | null; password_hash?: string | null },
+  rawPassword: string | null | undefined
+) {
+  if (!toBoolean(form.password_required ?? 0)) {
+    return { ok: true };
+  }
+  if (!rawPassword) {
+    return { ok: false, message: "password_required" as const };
+  }
+  if (!form.password_salt || !form.password_hash) {
+    return { ok: false, message: "password_not_configured" as const };
+  }
+  const hashed = await hashPasswordWithSalt(rawPassword, form.password_salt);
+  if (hashed !== form.password_hash) {
+    return { ok: false, message: "invalid_password" as const };
+  }
+  return { ok: true };
+}
+
 function sanitizeFilename(name: string) {
   return name.replace(/[/\\?%*:|"<>]/g, "_").slice(0, 150);
 }
@@ -283,6 +381,7 @@ async function parseSubmissionRequest(request: Request): Promise<{
   files?: Array<{ fieldKey: string; file: File }>;
   uploads?: UploadCompleteFile[];
   fileRefs?: Array<{ fieldKey: string; uploadId: string }>;
+  formPassword?: string;
 }> {
   const contentType = request.headers.get("content-type") || "";
   if (contentType.includes("multipart/form-data")) {
@@ -291,10 +390,15 @@ async function parseSubmissionRequest(request: Request): Promise<{
     const dataFields: Record<string, unknown> = {};
     let dataJson: Record<string, unknown> | null = null;
     let formSlug: string | undefined;
+    let formPassword: string | undefined;
 
     for (const [key, value] of formData.entries()) {
       if (key === "formSlug" && typeof value === "string") {
         formSlug = value;
+        continue;
+      }
+      if (key === "formPassword" && typeof value === "string") {
+        formPassword = value;
         continue;
       }
       if (key === "data" && typeof value === "string") {
@@ -326,7 +430,8 @@ async function parseSubmissionRequest(request: Request): Promise<{
     return {
       formSlug,
       data: dataJson ?? dataFields,
-      files
+      files,
+      formPassword
     };
   }
 
@@ -335,13 +440,15 @@ async function parseSubmissionRequest(request: Request): Promise<{
     data?: Record<string, unknown>;
     uploads?: UploadCompleteFile[];
     fileRefs?: Array<{ fieldKey: string; uploadId: string }>;
+    formPassword?: string;
   }>(request);
   return {
     formSlug: body?.formSlug,
     data: body?.data,
     uploads: body?.uploads,
     files: [],
-    fileRefs: body?.fileRefs
+    fileRefs: body?.fileRefs,
+    formPassword: body?.formPassword
   };
 }
 
@@ -631,6 +738,7 @@ async function handleSubmissionUploadInit(
     contentType?: string;
     sizeBytes?: number;
     sha256?: string;
+    formPassword?: string;
   }
 ): Promise<Response> {
   // Create a draft submission (if needed) and a draft upload session for the file.
@@ -653,14 +761,25 @@ async function handleSubmissionUploadInit(
   if (!formRow) {
     return errorResponse(404, "not_found", requestId, corsHeaders);
   }
-  if (toBoolean(formRow.is_locked)) {
-    return errorResponse(409, "locked", requestId, corsHeaders);
+  const availability = getFormAvailability(formRow);
+  if (!availability.open) {
+    return errorResponse(403, "form_closed", requestId, corsHeaders, {
+      reason: availability.reason
+    });
   }
 
   const authPayload = await getAuthPayload(request, env);
   const authCheck = checkAuthPolicy(formRow.auth_policy, authPayload);
   if (!authCheck.ok) {
     return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
+  }
+
+  const passwordCheck = await verifyFormPassword(formRow, body.formPassword);
+  if (!passwordCheck.ok) {
+    return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
+      field: "formPassword",
+      message: passwordCheck.message
+    });
   }
 
   let schema: unknown = null;
@@ -843,6 +962,37 @@ function isValidGithubUsername(value: string): boolean {
   return /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/.test(value);
 }
 
+function isValidHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function ensureUrlWithScheme(rawValue: string): string {
+  const trimmed = rawValue.trim();
+  if (!trimmed) return trimmed;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(trimmed)) {
+    return trimmed;
+  }
+  return `https://${trimmed}`;
+}
+
+async function githubUserExists(username: string): Promise<boolean> {
+  const response = await fetch(`https://api.github.com/users/${encodeURIComponent(username)}`, {
+    headers: {
+      "user-agent": "form-app"
+    }
+  });
+  if (response.status === 404) return false;
+  if (!response.ok) {
+    throw new Error(`github_lookup_failed:${response.status}`);
+  }
+  return true;
+}
+
 async function getGithubLoginForUser(env: Env, userId: string): Promise<string | null> {
   const row = await env.DB.prepare(
     "SELECT provider_login FROM user_identities WHERE user_id=? AND provider='github' ORDER BY created_at DESC LIMIT 1"
@@ -854,7 +1004,7 @@ async function getGithubLoginForUser(env: Env, userId: string): Promise<string |
 
 async function getFormWithRules(env: Env, slug: string) {
   return env.DB.prepare(
-    "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,t.key as templateKey,fv.schema_json,t.file_rules_json as template_file_rules_json,f.file_rules_json as form_file_rules_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+    "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_salt,f.password_hash,t.key as templateKey,fv.schema_json,t.file_rules_json as template_file_rules_json,f.file_rules_json as form_file_rules_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
   )
     .bind(slug)
     .first<
@@ -910,6 +1060,7 @@ type CanvasCourseUser = {
   sortableName?: string | null;
   pronouns?: string | null;
   email?: string | null;
+  roles?: string[];
   error?: string | null;
 };
 
@@ -960,6 +1111,28 @@ function maskEmail(email: string): string {
     return "***";
   }
   return `${trimmed[0]}***${trimmed.slice(at - 1)}`;
+}
+
+function normalizeCanvasCourseSyncMode(value: string | null): "active" | "concluded" | "all" {
+  const mode = (value || "").trim().toLowerCase();
+  if (mode === "concluded") return "concluded";
+  if (mode === "all") return "all";
+  return "active";
+}
+
+async function getCanvasCourseSyncMode(env: Env): Promise<"active" | "concluded" | "all"> {
+  const value = await getAppSetting(env, APP_SETTING_CANVAS_COURSE_SYNC_MODE);
+  return normalizeCanvasCourseSyncMode(value);
+}
+
+function buildCanvasCourseFilter(mode: "active" | "concluded" | "all"): string {
+  if (mode === "concluded") {
+    return "workflow_state IN ('completed','concluded')";
+  }
+  if (mode === "all") {
+    return "(workflow_state IS NULL OR workflow_state != 'deleted')";
+  }
+  return "(workflow_state IS NULL OR workflow_state NOT IN ('completed','concluded','deleted'))";
 }
 
 function cronFieldMatches(expr: string, value: number): boolean {
@@ -1042,16 +1215,34 @@ async function recordRoutineRun(
     .run();
 }
 
+function getHealthServiceTitle(service: string, fallback?: string | null) {
+  const serviceTitleById: Record<string, string> = {
+    canvas_sync: "Canvas sync",
+    canvas_retry_queue: "Canvas retry queue",
+    canvas_name_mismatch_checker: "Canvas name mismatch checker",
+    canvas_name_mismatch: "Canvas name mismatch checker",
+    gmail_send: "Gmail send",
+    backup_forms: "Backup forms",
+    backup_templates: "Backup templates",
+    backup_forms_templates: "Backup forms + templates",
+    empty_trash: "Empty trash",
+    health_summary: "Health summary",
+    health_history: "Health history"
+  };
+  return fallback || serviceTitleById[service] || service;
+}
+
 async function recordHealthStatus(
   env: Env,
   service: string,
   status: string,
   message: string | null
 ) {
+  const serviceTitle = getHealthServiceTitle(service);
   await env.DB.prepare(
-    "INSERT INTO health_status_logs (id, service, status, message) VALUES (?, ?, ?, ?)"
+    "INSERT INTO health_status_logs (id, service, status, message, service_title) VALUES (?, ?, ?, ?, ?)"
   )
-    .bind(crypto.randomUUID(), service, status, message)
+    .bind(crypto.randomUUID(), service, status, message, serviceTitle)
     .run();
 }
 
@@ -1208,7 +1399,8 @@ async function runRoutineTaskById(env: Env, taskId: string) {
       await recordHealthStatus(env, "canvas_sync", "skipped", "canvas_token_missing");
       return;
     }
-    const courseCount = await syncCanvasCourses(env);
+    const mode = await getCanvasCourseSyncMode(env);
+    const courseCount = await syncCanvasCourses(env, mode);
     const { results } = await env.DB.prepare(
       "SELECT DISTINCT canvas_course_id as course_id FROM forms WHERE canvas_enabled=1 AND canvas_course_id IS NOT NULL AND deleted_at IS NULL"
     ).all<{ course_id: string | null }>();
@@ -1304,7 +1496,7 @@ async function backupFormsAndTemplates(env: Env) {
     throw new Error("drive_access_failed");
   }
   const { results: formRows } = await env.DB.prepare(
-    "SELECT f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.template_id,t.key as templateKey,f.file_rules_json,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.deleted_at IS NULL"
+    "SELECT f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.template_id,t.key as templateKey,f.file_rules_json,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_salt,f.password_hash,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.deleted_at IS NULL"
   ).all<Record<string, unknown>>();
   const { results: templateRows } = await env.DB.prepare(
     "SELECT key,name,schema_json,file_rules_json FROM templates WHERE deleted_at IS NULL"
@@ -1326,7 +1518,12 @@ async function backupFormsAndTemplates(env: Env) {
       canvas_enabled: Boolean(row.canvas_enabled),
       canvas_course_id: row.canvas_course_id ?? null,
       canvas_allowed_section_ids_json: row.canvas_allowed_section_ids_json ?? null,
-      canvas_fields_position: row.canvas_fields_position ?? null
+      canvas_fields_position: row.canvas_fields_position ?? null,
+      available_from: row.available_from ?? null,
+      available_until: row.available_until ?? null,
+      password_required: Boolean(row.password_required),
+      password_salt: row.password_salt ?? null,
+      password_hash: row.password_hash ?? null
     }))
   };
   const templatesPayload = {
@@ -1474,9 +1671,19 @@ async function canvasFetchAll<T>(env: Env, url: string): Promise<T[]> {
   return results;
 }
 
-async function syncCanvasCourses(env: Env): Promise<number> {
+async function syncCanvasCourses(
+  env: Env,
+  mode: "active" | "concluded" | "all"
+): Promise<number> {
   const base = getCanvasBaseUrl(env);
-  const url = `${base}/api/v1/courses?enrollment_state=active&state[]=available&per_page=100`;
+  let url = `${base}/api/v1/courses?per_page=100`;
+  if (mode === "active") {
+    url += "&enrollment_state=active&state[]=available";
+  } else if (mode === "concluded") {
+    url += "&state[]=completed&state[]=concluded";
+  } else {
+    url += "&state[]=available&state[]=completed&state[]=concluded";
+  }
   const courses = await canvasFetchAll<CanvasCourse & Record<string, unknown>>(env, url);
   const now = new Date().toISOString();
   for (const course of courses) {
@@ -1602,16 +1809,31 @@ async function canvasFindUserByEmailInCourse(
   courseId: string,
   email: string
 ): Promise<CanvasCourseUser> {
+  const results = await canvasSearchUsersInCourse(env, courseId, email);
+  const target = email.toLowerCase();
+  const match =
+    results.find((user) => {
+      const loginId = user?.loginId?.toLowerCase();
+      const userEmail = user?.email?.toLowerCase();
+      return loginId === target || userEmail === target;
+    }) || results[0];
+  if (match?.id) {
+    return match;
+  }
+  return { id: null, error: "not_found" };
+}
+
+async function canvasSearchUsersInCourse(
+  env: Env,
+  courseId: string,
+  query: string
+): Promise<CanvasCourseUser[]> {
   const base = getCanvasBaseUrl(env);
   const url = `${base}/api/v1/courses/${encodeURIComponent(
     courseId
-  )}/users?search_term=${encodeURIComponent(email)}&per_page=100&include[]=email&include[]=sis_user_id`;
+  )}/users?search_term=${encodeURIComponent(query)}&per_page=100&include[]=email&include[]=sis_user_id&include[]=enrollments`;
   try {
-    const res = await canvasFetch(env, url);
-    if (!res.ok) {
-      return { id: null, error: `${res.status}:${await res.text().catch(() => "")}` };
-    }
-    const users = (await res.json()) as Array<{
+    const users = await canvasFetchAll<{
       id?: string | number;
       name?: string;
       login_id?: string;
@@ -1620,32 +1842,116 @@ async function canvasFindUserByEmailInCourse(
       pronouns?: string;
       email?: string;
       sis_user_id?: string;
-    }>;
-    if (Array.isArray(users) && users.length > 0) {
-      const target = email.toLowerCase();
-      const match = users.find((user) => {
-        const loginId = user?.login_id?.toLowerCase();
-        const userEmail = user?.email?.toLowerCase();
-        const sis = user?.sis_user_id?.toLowerCase();
-        return loginId === target || userEmail === target || sis === target;
-      });
-      const hit = match ?? users[0];
-      if (hit?.id !== undefined && hit?.id !== null) {
-        return {
-          id: String(hit.id),
-          name: hit?.name ?? null,
-          loginId: hit?.login_id ?? null,
-          shortName: hit?.short_name ?? null,
-          sortableName: hit?.sortable_name ?? null,
-          pronouns: hit?.pronouns ?? null,
-          email: hit?.email ?? null
-        };
-      }
+      enrollments?: Array<{ type?: string }>;
+    }>(env, url);
+    if (!Array.isArray(users) || users.length === 0) {
+      return [];
     }
-    return { id: null, error: "not_found" };
+    return users
+      .filter((user) => user?.id !== undefined && user?.id !== null)
+      .map((user) => ({
+        id: String(user.id),
+        name: user?.name ?? null,
+        loginId: user?.login_id ?? null,
+        shortName: user?.short_name ?? null,
+        sortableName: user?.sortable_name ?? null,
+        pronouns: user?.pronouns ?? null,
+        email: user?.email ?? null,
+        roles: Array.isArray(user?.enrollments)
+          ? Array.from(
+              new Set(
+                user.enrollments
+                  .map((enrollment) => enrollment?.type || "")
+                  .filter((value) => value.length > 0)
+                  .map((value) => value.replace("Enrollment", ""))
+              )
+            )
+          : []
+      }));
   } catch (error) {
-    return { id: null, error: String((error as Error | undefined)?.message || error) };
+    return [];
   }
+}
+
+async function canvasSearchUsersGlobal(
+  env: Env,
+  query: string
+): Promise<CanvasCourseUser[]> {
+  const base = getCanvasBaseUrl(env);
+  const accountId = getCanvasAccountId(env);
+  const url = accountId
+    ? `${base}/api/v1/accounts/${encodeURIComponent(
+        accountId
+      )}/users?search_term=${encodeURIComponent(query)}&per_page=100&include[]=email&include[]=sis_user_id`
+    : `${base}/api/v1/accounts/self/users?search_term=${encodeURIComponent(
+        query
+      )}&per_page=100&include[]=email&include[]=sis_user_id`;
+  try {
+    const users = await canvasFetchAll<{
+      id?: string | number;
+      name?: string;
+      login_id?: string;
+      short_name?: string;
+      sortable_name?: string;
+      pronouns?: string;
+      email?: string;
+      sis_user_id?: string;
+    }>(env, url);
+    if (!Array.isArray(users) || users.length === 0) {
+      return [];
+    }
+    return users
+      .filter((user) => user?.id !== undefined && user?.id !== null)
+      .map((user) => ({
+        id: String(user.id),
+        name: user?.name ?? null,
+        loginId: user?.login_id ?? null,
+        shortName: user?.short_name ?? null,
+        sortableName: user?.sortable_name ?? null,
+        pronouns: user?.pronouns ?? null,
+        email: user?.email ?? null,
+        roles: []
+      }));
+  } catch {
+    return [];
+  }
+}
+
+async function canvasSearchUsersAllCourses(
+  env: Env,
+  query: string
+): Promise<Array<CanvasCourseUser & { courses: Array<{ id: string; name: string; roles: string[] }> }>> {
+  const { results: courses } = await env.DB.prepare(
+    "SELECT id,name FROM canvas_courses_cache WHERE (workflow_state IS NULL OR workflow_state NOT IN ('completed','concluded','deleted')) ORDER BY name"
+  ).all<{ id: string; name: string }>();
+  if (courses.length === 0) {
+    return [];
+  }
+  const map = new Map<
+    string,
+    CanvasCourseUser & { courses: Array<{ id: string; name: string; roles: string[] }> }
+  >();
+  for (const course of courses) {
+    const matches = await canvasSearchUsersInCourse(env, String(course.id), query);
+    matches.forEach((user) => {
+      if (!user?.id) return;
+      const existing = map.get(user.id);
+      const courseEntry = {
+        id: String(course.id),
+        name: course.name,
+        roles: Array.isArray(user.roles) ? user.roles : []
+      };
+      if (existing) {
+        existing.courses.push(courseEntry);
+      } else {
+        map.set(user.id, {
+          ...user,
+          courses: [courseEntry]
+        });
+      }
+    });
+  }
+  return Array.from(map.values());
 }
 
 async function canvasCreateUser(
@@ -1712,7 +2018,8 @@ async function canvasEnrollUser(
   courseId: string,
   userId: string,
   sectionId: string | null,
-  enrollmentState = "active"
+  enrollmentState = "active",
+  enrollmentType = "StudentEnrollment"
 ): Promise<{ ok: boolean; status: number; error?: string }> {
   const trimmedUserId = `${userId}`.trim();
   const isSpecialId =
@@ -1727,7 +2034,7 @@ async function canvasEnrollUser(
   }
   const base = getCanvasBaseUrl(env);
   const params = new URLSearchParams();
-  params.set("enrollment[type]", "StudentEnrollment");
+  params.set("enrollment[type]", enrollmentType);
   params.set("enrollment[enrollment_state]", enrollmentState);
   params.set("enrollment[notify]", "true");
   params.set("enrollment[user_id]", trimmedUserId);
@@ -2036,11 +2343,15 @@ async function runCanvasNameMismatchChecks(
       continue;
     }
     const canvasUser = await canvasFindUserByEmailInCourse(env, row.course_id, email);
-    const canvasDisplayName = canvasUser ? getCanvasDisplayName(canvasUser) : null;
-    if (
-      canvasDisplayName &&
-      normalizeNameForCompare(canvasDisplayName) === normalizeNameForCompare(submittedName)
-    ) {
+    const canvasFullName = canvasUser?.name?.trim() || null;
+    const canvasDisplayName = canvasUser?.shortName?.trim() || null;
+    const trimmedSubmitted = submittedName.trim();
+    const namesMissing = !canvasFullName || !canvasDisplayName;
+    const namesMatch =
+      Boolean(trimmedSubmitted) &&
+      canvasFullName === trimmedSubmitted &&
+      canvasDisplayName === trimmedSubmitted;
+    if (!namesMissing && namesMatch) {
       await env.DB.prepare(
         "UPDATE canvas_name_checks SET resolved_at=datetime('now'), last_checked_at=datetime('now') WHERE user_id=? AND course_id=?"
       )
@@ -2055,7 +2366,8 @@ async function runCanvasNameMismatchChecks(
       baseWeb && submission.form_slug ? `${baseWeb}/#/f/${submission.form_slug}` : null;
     const message = buildCanvasNameAlertMessage({
       submittedName,
-      canvasName: canvasDisplayName,
+      canvasFullName,
+      canvasDisplayName,
       formLink
     });
     const result = await sendGmailMessage(env, {
@@ -2085,18 +2397,6 @@ async function runCanvasNameMismatchChecks(
   return { checked, mismatched, resolved, skipped };
 }
 
-function normalizeNameForCompare(value: string): string {
-  return value
-    .normalize("NFKC")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
-}
-
-function getCanvasDisplayName(user: CanvasCourseUser): string | null {
-  return user.shortName?.trim() || user.name?.trim() || null;
-}
-
 function pickFirstStringValue(
   data: Record<string, unknown> | null,
   keys: string[]
@@ -2111,6 +2411,58 @@ function pickFirstStringValue(
   return null;
 }
 
+function pickFirstStringEntry(
+  data: Record<string, unknown> | null,
+  keys: string[]
+): { key: string; value: string } | null {
+  if (!data) return null;
+  for (const key of keys) {
+    const value = data[key];
+    if (typeof value === "string" && value.trim()) {
+      return { key, value: value.trim() };
+    }
+  }
+  return null;
+}
+
+function formatDateValueForMessage(
+  rawValue: string,
+  mode: "date" | "time" | "datetime",
+  timeZone: string | null,
+  showTimezone: boolean
+): string {
+  const date = new Date(rawValue);
+  if (Number.isNaN(date.getTime())) {
+    return rawValue;
+  }
+  const options: Intl.DateTimeFormatOptions =
+    mode === "time"
+      ? { hour: "2-digit", minute: "2-digit" }
+      : mode === "date"
+      ? { year: "numeric", month: "2-digit", day: "2-digit" }
+      : {
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit"
+        };
+  let formatted = "";
+  if (timeZone) {
+    try {
+      formatted = new Intl.DateTimeFormat("en-GB", { ...options, timeZone }).format(date);
+    } catch {
+      formatted = new Intl.DateTimeFormat("en-GB", options).format(date);
+    }
+  } else {
+    formatted = new Intl.DateTimeFormat("en-GB", options).format(date);
+  }
+  if (showTimezone && timeZone) {
+    return `${formatted} (${timeZone})`;
+  }
+  return formatted;
+}
+
 function joinLines(lines: Array<string | null | undefined>): string {
   return lines
     .filter((line): line is string => line !== null && line !== undefined)
@@ -2119,13 +2471,15 @@ function joinLines(lines: Array<string | null | undefined>): string {
 
 function buildCanvasNameAlertMessage(input: {
   submittedName: string;
-  canvasName: string | null;
+  canvasFullName: string | null;
+  canvasDisplayName: string | null;
   formLink?: string | null;
 }): { subject: string; body: string } {
   const subject =
     "Update your Canvas display name (C\u1eadp nh\u1eadt t\u00ean hi\u1ec3n th\u1ecb tr\u00ean Canvas)";
   const submittedName = input.submittedName.trim();
-  const canvasName = input.canvasName?.trim() || "n/a";
+  const canvasFullName = input.canvasFullName?.trim() || "n/a";
+  const canvasDisplayName = input.canvasDisplayName?.trim() || "n/a";
   const englishLines = [
     "Hello,",
     "",
@@ -2134,7 +2488,8 @@ function buildCanvasNameAlertMessage(input: {
     "Please check your email for the Canvas invitation.",
     "",
     `Name in form: ${submittedName}`,
-    `Name in Canvas: ${canvasName}`,
+    `Canvas full name: ${canvasFullName}`,
+    `Canvas display name: ${canvasDisplayName}`,
     "",
     input.formLink ? `Form link: ${input.formLink}` : null,
     "",
@@ -2148,7 +2503,8 @@ function buildCanvasNameAlertMessage(input: {
     "Vui l\u00f2ng ki\u1ec3m tra email \u0111\u1ec3 nh\u1eadn l\u1eddi m\u1eddi t\u1eeb Canvas.",
     "",
     `T\u00ean \u0111\u00e3 \u0111i\u1ec1n trong form: ${submittedName}`,
-    `T\u00ean hi\u1ec3n th\u1ecb tr\u00ean Canvas: ${canvasName}`,
+    `H\u1ecd t\u00ean tr\u00ean Canvas: ${canvasFullName}`,
+    `T\u00ean hi\u1ec3n th\u1ecb tr\u00ean Canvas: ${canvasDisplayName}`,
     "",
     input.formLink ? `Link form: ${input.formLink}` : null,
     "",
@@ -2164,8 +2520,19 @@ function buildCanvasWelcomeMessage(input: {
   formTitle?: string | null;
   courseLabel?: string | null;
   sectionLabel?: string | null;
+  submittedName: string;
+  submittedEmail?: string | null;
+  studentId?: string | null;
+  className?: string | null;
+  dob?: string | null;
+  formLink?: string | null;
 }): { subject: string; body: string } {
   const subject = "Welcome to the course (Ch\u00e0o m\u1eebng b\u1ea1n)";
+  const submittedName = input.submittedName.trim();
+  const submittedEmail = input.submittedEmail?.trim() || "n/a";
+  const studentId = input.studentId?.trim() || "n/a";
+  const className = input.className?.trim() || "n/a";
+  const dob = input.dob?.trim() || null;
   const englishLines = [
     "Hello,",
     "",
@@ -2173,11 +2540,16 @@ function buildCanvasWelcomeMessage(input: {
     "We received your information.",
     "Please check your email for the Canvas invitation.",
     "",
-    input.formTitle ? `Form: ${input.formTitle}` : null,
-    input.courseLabel ? `Course: ${input.courseLabel}` : null,
-    input.sectionLabel
-      ? `Section (L\u1edbp h\u1ecdc ph\u1ea7n): ${input.sectionLabel}`
-      : null,
+    "Your submission summary:",
+    `- Form: ${input.formTitle || "n/a"}`,
+    `- Course: ${input.courseLabel || "n/a"}`,
+    `- Section (L\u1edbp h\u1ecdc ph\u1ea7n): ${input.sectionLabel || "n/a"}`,
+    `- Full name: ${submittedName}`,
+    `- Email: ${submittedEmail}`,
+    `- Student ID: ${studentId}`,
+    `- Class: ${className}`,
+    dob ? `- Date of birth: ${dob}` : null,
+    input.formLink ? `Form link: ${input.formLink}` : null,
     "",
     "This message was sent automatically."
   ];
@@ -2188,9 +2560,16 @@ function buildCanvasWelcomeMessage(input: {
     "Ch\u00fang t\u00f4i \u0111\u00e3 nh\u1eadn \u0111\u01b0\u1ee3c th\u00f4ng tin t\u1eeb b\u1ea1n.",
     "Vui l\u00f2ng ki\u1ec3m tra email \u0111\u1ec3 nh\u1eadn l\u1eddi m\u1eddi t\u1eeb Canvas.",
     "",
-    input.formTitle ? `Form: ${input.formTitle}` : null,
-    input.courseLabel ? `M\u00f4n h\u1ecdc: ${input.courseLabel}` : null,
-    input.sectionLabel ? `L\u1edbp h\u1ecdc ph\u1ea7n: ${input.sectionLabel}` : null,
+    "T\u00f3m t\u1eaft n\u1ed9i dung b\u1ea1n \u0111\u00e3 \u0111i\u1ec1n:",
+    `- Form: ${input.formTitle || "n/a"}`,
+    `- M\u00f4n h\u1ecdc: ${input.courseLabel || "n/a"}`,
+    `- L\u1edbp h\u1ecdc ph\u1ea7n: ${input.sectionLabel || "n/a"}`,
+    `- H\u1ecd v\u00e0 t\u00ean: ${submittedName}`,
+    `- Email: ${submittedEmail}`,
+    `- M\u00e3 sinh vi\u00ean: ${studentId}`,
+    `- L\u1edbp: ${className}`,
+    dob ? `- Ng\u00e0y sinh: ${dob}` : null,
+    input.formLink ? `Link form: ${input.formLink}` : null,
     "",
     "Th\u00f4ng b\u00e1o n\u00e0y \u0111\u01b0\u1ee3c g\u1eedi t\u1ef1 \u0111\u1ed9ng."
   ];
@@ -2216,7 +2595,7 @@ function buildCanvasInformMessage(input: {
   const submittedEmail = input.submittedEmail?.trim() || "n/a";
   const studentId = input.studentId?.trim() || "n/a";
   const className = input.className?.trim() || "n/a";
-  const dob = input.dob?.trim() || "n/a";
+  const dob = input.dob?.trim() || null;
   const englishLines = [
     "Hello,",
     "",
@@ -2230,7 +2609,7 @@ function buildCanvasInformMessage(input: {
     `- Email: ${submittedEmail}`,
     `- Student ID: ${studentId}`,
     `- Class: ${className}`,
-    `- Date of birth: ${dob}`,
+    dob ? `- Date of birth: ${dob}` : null,
     "",
     input.formLink ? `Form link: ${input.formLink}` : null,
     "",
@@ -2249,7 +2628,7 @@ function buildCanvasInformMessage(input: {
     `- Email: ${submittedEmail}`,
     `- M\u00e3 sinh vi\u00ean: ${studentId}`,
     `- L\u1edbp: ${className}`,
-    `- Ng\u00e0y sinh: ${dob}`,
+    dob ? `- Ng\u00e0y sinh: ${dob}` : null,
     "",
     input.formLink ? `Link form: ${input.formLink}` : null,
     "",
@@ -2894,6 +3273,113 @@ async function handleCanvasEnrollment(
     canvasUserId,
     canvasUserName
   };
+}
+
+async function adminEnrollCanvasUser(env: Env, input: {
+  courseId: string;
+  sectionId: string | null;
+  name: string;
+  email: string;
+  role: "student" | "teacher" | "ta" | "observer" | "designer";
+}): Promise<{ ok: boolean; status: string; error: string | null; canvasUserId: string | null }> {
+  if (!env.CANVAS_API_TOKEN) {
+    return { ok: false, status: "failed", error: "canvas_not_configured", canvasUserId: null };
+  }
+  const roleMap: Record<string, string> = {
+    student: "StudentEnrollment",
+    teacher: "TeacherEnrollment",
+    ta: "TaEnrollment",
+    observer: "ObserverEnrollment",
+    designer: "DesignerEnrollment"
+  };
+  const enrollmentType = roleMap[input.role] || "StudentEnrollment";
+  let canvasUserId: string | null = null;
+  let createError: string | null = null;
+  const user = await canvasFindUserByEmail(env, input.email);
+  canvasUserId = user?.id || null;
+  let accountIdOverride: string | null = null;
+  if (!canvasUserId) {
+    accountIdOverride = await getCanvasCourseAccountId(env, input.courseId);
+    const created = await canvasCreateUser(env, input.name, input.email, accountIdOverride);
+    canvasUserId = created?.id || null;
+    createError = created?.error || user?.error || null;
+  }
+  if (!canvasUserId && accountIdOverride) {
+    const retry = await canvasFindUserByEmail(env, input.email, accountIdOverride);
+    if (retry?.id) {
+      canvasUserId = retry.id;
+    } else if (retry?.error) {
+      createError = `${createError || "user_lookup_failed"}:${retry.error}`;
+    }
+  }
+  if (!canvasUserId) {
+    const courseLookup = await canvasFindUserByEmailInCourse(env, input.courseId, input.email);
+    if (courseLookup?.id) {
+      canvasUserId = courseLookup.id;
+    } else if (courseLookup?.error) {
+      createError = `${createError || "user_lookup_failed"}:${courseLookup.error}`;
+    }
+  }
+  if (!canvasUserId && createError && createError.includes("403")) {
+    const fallbackId = `sis_login_id:${input.email}`;
+    let fallbackEnroll = await canvasEnrollUser(
+      env,
+      input.courseId,
+      fallbackId,
+      input.sectionId,
+      "invited",
+      enrollmentType
+    );
+    if (!fallbackEnroll.ok && input.sectionId) {
+      fallbackEnroll = await canvasEnrollUser(
+        env,
+        input.courseId,
+        fallbackId,
+        null,
+        "invited",
+        enrollmentType
+      );
+    }
+    if (fallbackEnroll.ok) {
+      return { ok: true, status: "invited", error: null, canvasUserId: null };
+    }
+    return {
+      ok: false,
+      status: "failed",
+      error: fallbackEnroll.error || "enroll_failed",
+      canvasUserId: null
+    };
+  }
+  if (!canvasUserId) {
+    return {
+      ok: false,
+      status: "failed",
+      error: createError ? `user_lookup_failed:${createError}` : "user_lookup_failed",
+      canvasUserId: null
+    };
+  }
+  let enrollment = await canvasEnrollUser(
+    env,
+    input.courseId,
+    canvasUserId,
+    input.sectionId,
+    "invited",
+    enrollmentType
+  );
+  if (!enrollment.ok && input.sectionId) {
+    enrollment = await canvasEnrollUser(
+      env,
+      input.courseId,
+      canvasUserId,
+      null,
+      "invited",
+      enrollmentType
+    );
+  }
+  if (!enrollment.ok) {
+    return { ok: false, status: "failed", error: enrollment.error || "enroll_failed", canvasUserId };
+  }
+  return { ok: true, status: "invited", error: null, canvasUserId };
 }
 
 function isMissingDeletedReasonColumn(error: unknown) {
@@ -5652,6 +6138,21 @@ export default {
       );
     }
 
+    if (request.method === "GET" && url.pathname === "/api/settings") {
+      const timezoneDefault = await getAppSetting(env, APP_SETTING_DEFAULT_TIMEZONE);
+      const canvasCourseSyncMode = await getAppSetting(env, APP_SETTING_CANVAS_COURSE_SYNC_MODE);
+      return jsonResponse(
+        200,
+        {
+          timezoneDefault,
+          canvasCourseSyncMode: normalizeCanvasCourseSyncMode(canvasCourseSyncMode),
+          requestId
+        },
+        requestId,
+        corsHeaders
+      );
+    }
+
     if (url.pathname.startsWith("/api/admin")) {
       const adminPayload = await requireAdmin(request, env);
       if (!adminPayload) {
@@ -5677,20 +6178,25 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/admin/health/summary") {
         const { results } = await env.DB.prepare(
-          "SELECT h1.service,h1.status,h1.message,h1.checked_at FROM health_status_logs h1 JOIN (SELECT service, MAX(checked_at) as max_checked FROM health_status_logs GROUP BY service) h2 ON h1.service=h2.service AND h1.checked_at=h2.max_checked ORDER BY h1.service"
+          "SELECT h1.service,h1.service_title,h1.status,h1.message,h1.checked_at FROM health_status_logs h1 JOIN (SELECT service, MAX(checked_at) as max_checked FROM health_status_logs GROUP BY service) h2 ON h1.service=h2.service AND h1.checked_at=h2.max_checked ORDER BY h1.service"
         ).all<{
           service: string;
+          service_title: string | null;
           status: string;
           message: string | null;
           checked_at: string;
         }>();
-        return jsonResponse(200, { data: results, requestId }, requestId, corsHeaders);
+        const data = results.map((row) => ({
+          ...row,
+          service_title: getHealthServiceTitle(row.service, row.service_title)
+        }));
+        return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
       }
 
       if (request.method === "GET" && url.pathname === "/api/admin/health/history") {
         const service = (url.searchParams.get("service") || "").trim();
         const limit = Math.min(Math.max(toNumber(url.searchParams.get("limit"), 50), 1), 200);
-        let query = "SELECT id,service,status,message,created_at FROM health_status_logs";
+        let query = "SELECT id,service,service_title,status,message,created_at FROM health_status_logs";
         const params: unknown[] = [];
         if (service) {
           query += " WHERE service=?";
@@ -5708,7 +6214,11 @@ export default {
             message: string | null;
             checked_at: string;
           }>();
-        return jsonResponse(200, { data: results, requestId }, requestId, corsHeaders);
+        const data = results.map((row) => ({
+          ...row,
+          service_title: getHealthServiceTitle(row.service, (row as any).service_title ?? null)
+        }));
+        return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
       }
 
       if (request.method === "POST" && url.pathname === "/api/admin/health/clear") {
@@ -5738,14 +6248,16 @@ export default {
         const limit = pageSize;
         const offset = (page - 1) * pageSize;
         const like = `%${q}%`;
+        const mode = await getCanvasCourseSyncMode(env);
+        const filter = buildCanvasCourseFilter(mode);
         const totalRow = await env.DB.prepare(
-          "SELECT COUNT(1) as total FROM canvas_courses_cache WHERE (workflow_state IS NULL OR workflow_state NOT IN ('completed','concluded','deleted')) AND (?='' OR name LIKE ? OR code LIKE ?)"
+          `SELECT COUNT(1) as total FROM canvas_courses_cache WHERE ${filter} AND (?='' OR name LIKE ? OR code LIKE ?)`
         )
           .bind(q, like, like)
           .first<{ total: number }>();
         const total = totalRow?.total ?? 0;
         const { results } = await env.DB.prepare(
-          "SELECT id,name,code,workflow_state,account_id,term_id,updated_at FROM canvas_courses_cache WHERE (workflow_state IS NULL OR workflow_state NOT IN ('completed','concluded','deleted')) AND (?='' OR name LIKE ? OR code LIKE ?) ORDER BY name LIMIT ? OFFSET ?"
+          `SELECT id,name,code,workflow_state,account_id,term_id,updated_at FROM canvas_courses_cache WHERE ${filter} AND (?='' OR name LIKE ? OR code LIKE ?) ORDER BY name LIMIT ? OFFSET ?`
         )
           .bind(q, like, like, limit, offset)
           .all();
@@ -5759,8 +6271,10 @@ export default {
 
 
       if (request.method === "GET" && url.pathname === "/api/admin/canvas/overview") {
+        const mode = await getCanvasCourseSyncMode(env);
+        const filter = buildCanvasCourseFilter(mode);
         const { results: courses } = await env.DB.prepare(
-          "SELECT id,name,code,workflow_state,updated_at FROM canvas_courses_cache WHERE (workflow_state IS NULL OR workflow_state NOT IN ('completed','concluded','deleted')) ORDER BY name"
+          `SELECT id,name,code,workflow_state,updated_at FROM canvas_courses_cache WHERE ${filter} ORDER BY name`
         ).all<{
           id: string;
           name: string;
@@ -5814,8 +6328,8 @@ export default {
           }>();
 
         const submissionsByCourse = new Map<string, any[]>();
-        submissions.forEach((row) => {
-          if (!row.canvas_course_id) return;
+        for (const row of submissions) {
+          if (!row.canvas_course_id) continue;
           const courseId = String(row.canvas_course_id);
           const sectionId = row.canvas_section_id ? String(row.canvas_section_id) : null;
           let payloadData: Record<string, unknown> | null = null;
@@ -5832,18 +6346,26 @@ export default {
             typeof payloadData?.email === "string" && payloadData.email.trim()
               ? payloadData.email.trim()
               : null;
+          const email = dataEmail || row.submitter_email;
           const status = row.canvas_enroll_status || "not_invited";
           const sectionName =
             sectionId && sectionNameMap.get(courseId)
               ? sectionNameMap.get(courseId)!.get(sectionId) || null
               : null;
+          let canvasFullName: string | null = null;
+          let canvasDisplayName: string | null = row.canvas_user_name || null;
+          if (email) {
+            const canvasUser = await canvasFindUserByEmailInCourse(env, courseId, email);
+            canvasFullName = canvasUser?.name?.trim() || null;
+            canvasDisplayName = canvasUser?.shortName?.trim() || canvasDisplayName;
+          }
           const entry = {
             submission_id: row.id,
             submission_link: `/forms/#/me/submissions/${row.id}`,
             submission_deleted: Boolean(row.submission_deleted),
             user_id: row.user_id,
             name: displayName,
-            email: dataEmail || row.submitter_email,
+            email,
             github_username: row.submitter_github_username,
             status,
             error: row.canvas_enroll_error,
@@ -5852,6 +6374,8 @@ export default {
             section_name: sectionName,
             canvas_user_id: row.canvas_user_id,
             canvas_user_name: row.canvas_user_name,
+            canvas_full_name: canvasFullName,
+            canvas_display_name: canvasDisplayName,
             form_slug: row.form_slug,
             form_title: row.form_title
           };
@@ -5859,7 +6383,7 @@ export default {
             submissionsByCourse.set(courseId, []);
           }
           submissionsByCourse.get(courseId)!.push(entry);
-        });
+        }
 
         const data = courses.map((course) => ({
           id: String(course.id),
@@ -5972,8 +6496,101 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname === "/api/admin/canvas/user-lookup") {
-        const email = (url.searchParams.get("email") || "").trim();
+        const query = (url.searchParams.get("q") || url.searchParams.get("email") || "").trim();
         const courseId = (url.searchParams.get("courseId") || "").trim();
+        if (!query) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "q",
+            message: "required"
+          });
+        }
+        if (courseId) {
+          const users = await canvasSearchUsersInCourse(env, courseId, query);
+          if (users.length === 0) {
+            return errorResponse(404, "not_found", requestId, corsHeaders, {
+              message: "not_found"
+            });
+          }
+          return jsonResponse(
+            200,
+            {
+              ok: true,
+              requestId,
+              data: users.map((user) => ({
+                id: user.id,
+                full_name: user.name ?? null,
+                display_name: user.shortName ?? null,
+                sortable_name: user.sortableName ?? null,
+                pronouns: user.pronouns ?? null,
+                email: user.email ?? null,
+                login_id: user.loginId ?? null,
+                roles: Array.isArray(user.roles) ? user.roles : []
+              }))
+            },
+            requestId,
+            corsHeaders
+          );
+        }
+
+        const users = await canvasSearchUsersAllCourses(env, query);
+        if (users.length === 0) {
+          return errorResponse(404, "not_found", requestId, corsHeaders, {
+            message: "not_found"
+          });
+        }
+        return jsonResponse(
+          200,
+          {
+            ok: true,
+            requestId,
+            data: users.map((user) => ({
+              id: user.id,
+              full_name: user.name ?? null,
+              display_name: user.shortName ?? null,
+              sortable_name: user.sortableName ?? null,
+              pronouns: user.pronouns ?? null,
+              email: user.email ?? null,
+              login_id: user.loginId ?? null,
+              roles: Array.isArray(user.roles) ? user.roles : [],
+              courses: user.courses
+            }))
+          },
+          requestId,
+          corsHeaders
+        );
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/canvas/enroll") {
+        const body = (await request.json().catch(() => null)) as {
+          name?: string;
+          email?: string;
+          role?: string;
+          courseId?: string;
+          sectionId?: string | null;
+        } | null;
+        if (!body || typeof body !== "object") {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "expected_object"
+          });
+        }
+        const name = typeof body.name === "string" ? body.name.trim() : "";
+        const email = typeof body.email === "string" ? body.email.trim() : "";
+        const courseId = typeof body.courseId === "string" ? body.courseId.trim() : "";
+        const sectionId =
+          typeof body.sectionId === "string" && body.sectionId.trim()
+            ? body.sectionId.trim()
+            : null;
+        const roleRaw = typeof body.role === "string" ? body.role.trim().toLowerCase() : "student";
+        const role =
+          roleRaw === "teacher" || roleRaw === "ta" || roleRaw === "observer" || roleRaw === "designer"
+            ? roleRaw
+            : "student";
+        if (!name) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "name",
+            message: "required"
+          });
+        }
         if (!email) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             field: "email",
@@ -5986,35 +6603,98 @@ export default {
             message: "required"
           });
         }
-        const user = await canvasFindUserByEmailInCourse(env, courseId, email);
-        if (!user.id) {
-          return errorResponse(404, "not_found", requestId, corsHeaders, {
-            message: user.error || "not_found"
+        const result = await adminEnrollCanvasUser(env, {
+          courseId,
+          sectionId,
+          name,
+          email,
+          role: role as "student" | "teacher" | "ta" | "observer" | "designer"
+        });
+        if (!result.ok) {
+          return errorResponse(500, "canvas_enroll_failed", requestId, corsHeaders, {
+            message: result.error || "canvas_enroll_failed"
           });
         }
         return jsonResponse(
           200,
           {
             ok: true,
-            requestId,
-            user: {
-              id: user.id,
-              full_name: user.name ?? null,
-              display_name: user.shortName ?? null,
-              sortable_name: user.sortableName ?? null,
-              pronouns: user.pronouns ?? null,
-              email: user.email ?? null
-            }
+            status: result.status,
+            canvasUserId: result.canvasUserId,
+            requestId
           },
           requestId,
           corsHeaders
         );
       }
+
+      if (request.method === "PATCH" && url.pathname === "/api/admin/settings") {
+        const body = (await request.json().catch(() => null)) as {
+          timezoneDefault?: string | null;
+          canvasCourseSyncMode?: string | null;
+        } | null;
+        if (!body || (!("timezoneDefault" in body) && !("canvasCourseSyncMode" in body))) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "settings_required"
+          });
+        }
+
+        const responsePayload: Record<string, unknown> = { ok: true, requestId };
+        if ("timezoneDefault" in body) {
+          if (body.timezoneDefault === null) {
+            await deleteAppSetting(env, APP_SETTING_DEFAULT_TIMEZONE);
+            responsePayload.timezoneDefault = null;
+          } else if (typeof body.timezoneDefault !== "string" || !body.timezoneDefault.trim()) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "timezoneDefault",
+              message: "invalid_timezone"
+            });
+          } else {
+            const value = body.timezoneDefault.trim();
+            await setAppSetting(env, APP_SETTING_DEFAULT_TIMEZONE, value);
+            responsePayload.timezoneDefault = value;
+          }
+        }
+
+        if ("canvasCourseSyncMode" in body) {
+          if (body.canvasCourseSyncMode === null) {
+            await deleteAppSetting(env, APP_SETTING_CANVAS_COURSE_SYNC_MODE);
+            responsePayload.canvasCourseSyncMode = "active";
+          } else if (typeof body.canvasCourseSyncMode !== "string") {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "canvasCourseSyncMode",
+              message: "invalid_mode"
+            });
+          } else {
+            const mode = normalizeCanvasCourseSyncMode(body.canvasCourseSyncMode);
+            await setAppSetting(env, APP_SETTING_CANVAS_COURSE_SYNC_MODE, mode);
+            responsePayload.canvasCourseSyncMode = mode;
+          }
+        }
+
+        return jsonResponse(200, responsePayload, requestId, corsHeaders);
+      }
       if (request.method === "GET" && url.pathname === "/api/admin/routines") {
+        const routineTitleById: Record<string, string> = {
+          backup_forms: "Backup forms",
+          backup_templates: "Backup templates",
+          backup_forms_templates: "Backup forms + templates",
+          canvas_name_mismatch_checker: "Canvas name mismatch checker",
+          canvas_name_mismatch: "Canvas name mismatch checker",
+          canvas_retry_queue: "Canvas retry queue",
+          canvas_sync: "Canvas sync",
+          gmail_send: "Gmail send",
+          test_notice: "Test notice",
+          empty_trash: "Empty trash"
+        };
         const { results } = await env.DB.prepare(
           "SELECT id,name,cron,enabled,last_run_at,last_status,last_error,last_log_id FROM routine_tasks ORDER BY id"
         ).all<RoutineTaskRow>();
-        return jsonResponse(200, { data: results, requestId }, requestId, corsHeaders);
+        const data = results.map((row) => ({
+          ...row,
+          title: row.name || routineTitleById[row.id] || row.id
+        }));
+        return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
       }
       if (request.method === "GET" && url.pathname === "/api/admin/routines/logs") {
         const taskId = url.searchParams.get("taskId")?.trim() || "";
@@ -6226,7 +6906,7 @@ export default {
             message: "required"
           });
         }
-        await softDeleteSubmissionById(env, submissionId, authPayload?.userId ?? null, "admin_delete");
+        await softDeleteSubmissionById(env, submissionId, adminPayload?.userId ?? null, "admin_delete");
         return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
       }
 
@@ -6377,7 +7057,17 @@ export default {
             message: "required"
           });
         }
-        const canvasUserName = submission.canvas_user_name || null;
+        let canvasFullName: string | null = null;
+        let canvasDisplayName: string | null = submission.canvas_user_name || null;
+        if (submission.canvas_course_id && email) {
+          const canvasUser = await canvasFindUserByEmailInCourse(
+            env,
+            submission.canvas_course_id,
+            email
+          );
+          canvasFullName = canvasUser?.name?.trim() || null;
+          canvasDisplayName = canvasUser?.shortName?.trim() || canvasDisplayName;
+        }
         let courseTitle: string | null = null;
         let courseCode: string | null = null;
         let sectionName: string | null = null;
@@ -6413,7 +7103,8 @@ export default {
           baseWeb && submission.form_slug ? `${baseWeb}/#/f/${submission.form_slug}` : null;
         const message = buildCanvasNameAlertMessage({
           submittedName: submittedName || titleCaseFromEmail(email),
-          canvasName: canvasUserName,
+          canvasFullName,
+          canvasDisplayName,
           formLink
         });
         const result = await sendGmailMessage(env, {
@@ -6475,10 +7166,10 @@ export default {
         const limit = pageSize;
         const offset = (page - 1) * pageSize;
         const selectFields = includeBody
-          ? "id,to_email,subject,body,status,error,submission_id,form_slug,form_title,canvas_course_id,canvas_section_id,triggered_by,trigger_source,created_at"
-          : "id,to_email,subject,status,error,submission_id,form_slug,form_title,canvas_course_id,canvas_section_id,triggered_by,trigger_source,created_at";
+          ? "l.id,l.to_email,l.subject,l.body,l.status,l.error,l.submission_id,l.canvas_course_id,l.canvas_section_id,l.triggered_by,l.trigger_source,l.created_at,COALESCE(l.form_slug,f.slug) as form_slug,COALESCE(l.form_title,f.title) as form_title"
+          : "l.id,l.to_email,l.subject,l.status,l.error,l.submission_id,l.canvas_course_id,l.canvas_section_id,l.triggered_by,l.trigger_source,l.created_at,COALESCE(l.form_slug,f.slug) as form_slug,COALESCE(l.form_title,f.title) as form_title";
         const { results } = await env.DB.prepare(
-          `SELECT ${selectFields} FROM email_logs ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+          `SELECT ${selectFields} FROM email_logs l LEFT JOIN forms f ON f.id=l.form_id ${whereClause} ORDER BY l.created_at DESC LIMIT ? OFFSET ?`
         )
           .bind(...params, limit, offset)
           .all();
@@ -6593,9 +7284,10 @@ export default {
         }
         let coursesSynced = 0;
         let sectionsSynced = 0;
+        const syncMode = await getCanvasCourseSyncMode(env);
         try {
           if (mode === "courses") {
-            coursesSynced = await syncCanvasCourses(env);
+            coursesSynced = await syncCanvasCourses(env, syncMode);
           } else if (mode === "course_sections") {
             if (!courseId) {
               return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
@@ -6605,7 +7297,7 @@ export default {
             }
             sectionsSynced = await syncCanvasSections(env, courseId);
           } else if (mode === "all") {
-            coursesSynced = await syncCanvasCourses(env);
+            coursesSynced = await syncCanvasCourses(env, syncMode);
             const { results } = await env.DB.prepare(
               "SELECT DISTINCT canvas_course_id as course_id FROM forms WHERE canvas_enabled=1 AND canvas_course_id IS NOT NULL AND deleted_at IS NULL"
             ).all<{ course_id: string | null }>();
@@ -6634,8 +7326,8 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/admin/forms") {
         const { results } = await env.DB.prepare(
-          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,t.key as templateKey FROM forms f LEFT JOIN templates t ON t.id=f.template_id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC"
-        ).all<AdminFormRow>();
+          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC"
+        ).all<AdminFormRow & { submission_count?: number; updated_at?: string | null; created_at?: string | null }>();
 
         const data = results.map((row) => ({
           id: row.id,
@@ -6646,10 +7338,16 @@ export default {
           is_public: toBoolean(row.is_public),
           auth_policy: row.auth_policy,
           templateKey: row.templateKey,
+          submission_count: Number(row.submission_count ?? 0),
+          updated_at: row.updated_at ?? null,
+          created_at: row.created_at ?? null,
           canvas_enabled: toBoolean(row.canvas_enabled),
           canvas_course_id: row.canvas_course_id ?? null,
           canvas_allowed_section_ids_json: row.canvas_allowed_section_ids_json ?? null,
-          canvas_fields_position: row.canvas_fields_position ?? "bottom"
+          canvas_fields_position: row.canvas_fields_position ?? "bottom",
+          available_from: row.available_from ?? null,
+          available_until: row.available_until ?? null,
+          password_required: toBoolean(row.password_required ?? 0)
         }));
 
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -6659,7 +7357,7 @@ export default {
       if (request.method === "GET" && formBackupMatch) {
         const slug = decodeURIComponent(formBackupMatch[1]);
         const formRow = await env.DB.prepare(
-          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.file_rules_json,t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_salt,f.password_hash,f.file_rules_json,t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
         )
           .bind(slug)
           .first<{
@@ -6674,6 +7372,11 @@ export default {
             canvas_course_id: string | null;
             canvas_allowed_section_ids_json: string | null;
             canvas_fields_position: string | null;
+            available_from: string | null;
+            available_until: string | null;
+            password_required: number | null;
+            password_salt: string | null;
+            password_hash: string | null;
             file_rules_json: string | null;
             template_key: string | null;
             template_name: string | null;
@@ -6707,7 +7410,12 @@ export default {
             canvas_enabled: toBoolean(formRow.canvas_enabled),
             canvas_course_id: formRow.canvas_course_id ?? null,
             canvas_allowed_section_ids_json: formRow.canvas_allowed_section_ids_json ?? null,
-            canvas_fields_position: formRow.canvas_fields_position ?? "bottom"
+            canvas_fields_position: formRow.canvas_fields_position ?? "bottom",
+            available_from: formRow.available_from ?? null,
+            available_until: formRow.available_until ?? null,
+            password_required: toBoolean(formRow.password_required ?? 0),
+            password_salt: formRow.password_salt ?? null,
+            password_hash: formRow.password_hash ?? null
           }
         };
         const body = JSON.stringify({ data: payload, requestId });
@@ -6725,13 +7433,14 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/admin/templates") {
         const { results } = await env.DB.prepare(
-          "SELECT id,key,name,created_at FROM templates WHERE deleted_at IS NULL ORDER BY created_at DESC"
+          "SELECT id,key,name,created_at,updated_at FROM templates WHERE deleted_at IS NULL ORDER BY created_at DESC"
         ).all();
         const data = results.map((row: any) => ({
           id: row.id,
           key: row.key,
           name: row.name,
-          created_at: row.created_at
+          created_at: row.created_at,
+          updated_at: row.updated_at ?? null
         }));
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
       }
@@ -6975,7 +7684,7 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/admin/users") {
         const { results } = await env.DB.prepare(
-          "SELECT u.id,u.is_admin,u.created_at,(SELECT provider FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as provider,(SELECT email FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as email,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as provider_login FROM users u WHERE u.deleted_at IS NULL ORDER BY u.created_at DESC"
+          "SELECT u.id,u.is_admin,u.created_at,(SELECT provider FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as provider,(SELECT email FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as email,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=u.id ORDER BY ui.created_at DESC LIMIT 1) as provider_login,(SELECT s.canvas_enroll_status FROM submissions s WHERE s.user_id=u.id AND s.canvas_course_id IS NOT NULL AND s.deleted_at IS NULL ORDER BY COALESCE(s.updated_at, s.created_at) DESC LIMIT 1) as canvas_status FROM users u WHERE u.deleted_at IS NULL ORDER BY u.created_at DESC"
         ).all();
         const data = results.map((row: any) => ({
           id: row.id,
@@ -6983,6 +7692,7 @@ export default {
           provider: row.provider ?? null,
           email: row.email ?? null,
           provider_login: row.provider_login ?? null,
+          canvas_status: row.canvas_status ?? null,
           created_at: row.created_at
         }));
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -7082,7 +7792,7 @@ export default {
             .first<{ total: number }>();
           totals.submissions = total?.total ?? 0;
           const { results } = await env.DB.prepare(
-            "SELECT s.id,s.form_id,f.slug as form_slug,s.deleted_at,s.deleted_by,s.deleted_reason,(SELECT email FROM user_identities ui WHERE ui.user_id=s.deleted_by ORDER BY ui.created_at DESC LIMIT 1) as deleted_by_email FROM submissions s LEFT JOIN forms f ON f.id=s.form_id WHERE s.deleted_at IS NOT NULL ORDER BY s.deleted_at DESC LIMIT ? OFFSET ?"
+            "SELECT s.id,s.form_id,f.slug as form_slug,f.title as form_title,s.deleted_at,s.deleted_by,s.deleted_reason,(SELECT email FROM user_identities ui WHERE ui.user_id=s.deleted_by ORDER BY ui.created_at DESC LIMIT 1) as deleted_by_email FROM submissions s LEFT JOIN forms f ON f.id=s.form_id WHERE s.deleted_at IS NOT NULL ORDER BY s.deleted_at DESC LIMIT ? OFFSET ?"
           )
             .bind(limit, offset)
             .all();
@@ -7096,7 +7806,7 @@ export default {
             .first<{ total: number }>();
           totals.files = total?.total ?? 0;
           const { results } = await env.DB.prepare(
-            "SELECT id, form_slug, submission_id, field_id, original_name, size_bytes, deleted_at, deleted_by, deleted_reason,(SELECT email FROM user_identities ui WHERE ui.user_id=deleted_by ORDER BY ui.created_at DESC LIMIT 1) as deleted_by_email FROM submission_file_items WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ? OFFSET ?"
+            "SELECT sfi.id, sfi.form_slug, f.title as form_title, sfi.submission_id, sfi.field_id, sfi.original_name, sfi.size_bytes, sfi.deleted_at, sfi.deleted_by, sfi.deleted_reason,(SELECT email FROM user_identities ui WHERE ui.user_id=sfi.deleted_by ORDER BY ui.created_at DESC LIMIT 1) as deleted_by_email FROM submission_file_items sfi LEFT JOIN forms f ON f.slug=sfi.form_slug WHERE sfi.deleted_at IS NOT NULL ORDER BY sfi.deleted_at DESC LIMIT ? OFFSET ?"
           )
             .bind(limit, offset)
             .all();
@@ -7110,7 +7820,7 @@ export default {
             .first<{ total: number }>();
           totals.emails = total?.total ?? 0;
           const { results } = await env.DB.prepare(
-            "SELECT id,to_email,subject,status,error,submission_id,form_slug,form_title,deleted_at,deleted_by,deleted_reason,(SELECT email FROM user_identities ui WHERE ui.user_id=deleted_by ORDER BY ui.created_at DESC LIMIT 1) as deleted_by_email FROM email_logs WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC LIMIT ? OFFSET ?"
+            "SELECT l.id,l.to_email,l.subject,l.status,l.error,l.submission_id,COALESCE(l.form_slug,f.slug) as form_slug,COALESCE(l.form_title,f.title) as form_title,l.deleted_at,l.deleted_by,l.deleted_reason,(SELECT email FROM user_identities ui WHERE ui.user_id=l.deleted_by ORDER BY ui.created_at DESC LIMIT 1) as deleted_by_email FROM email_logs l LEFT JOIN forms f ON f.id=l.form_id WHERE l.deleted_at IS NOT NULL ORDER BY l.deleted_at DESC LIMIT ? OFFSET ?"
           )
             .bind(limit, offset)
             .all();
@@ -7493,6 +8203,23 @@ export default {
 
         const isPublic = Boolean(form.is_public);
         const isLocked = Boolean(form.is_locked);
+        const availableFrom = normalizeDateTimeInput(form.available_from ?? null);
+        const availableUntil = normalizeDateTimeInput(form.available_until ?? null);
+        const passwordRequired = Boolean(form.password_required);
+        const passwordSalt =
+          typeof form.password_salt === "string" && form.password_salt.trim()
+            ? form.password_salt.trim()
+            : null;
+        const passwordHash =
+          typeof form.password_hash === "string" && form.password_hash.trim()
+            ? form.password_hash.trim()
+            : null;
+        if (passwordRequired && (!passwordSalt || !passwordHash)) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "password",
+            message: "missing_password_hash"
+          });
+        }
         const canvasEnabled = Boolean(form.canvas_enabled);
         const canvasAllowed =
           Array.isArray(form.canvas_allowed_section_ids_json)
@@ -7516,7 +8243,7 @@ export default {
         }
         if (existingForm?.id) {
           await env.DB.prepare(
-            "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+            "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_salt=?, password_hash=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
           )
             .bind(
               form.title,
@@ -7530,6 +8257,11 @@ export default {
               form.canvas_course_id ?? null,
               canvasAllowed ?? null,
               form.canvas_fields_position ?? "bottom",
+              availableFrom,
+              availableUntil,
+              passwordRequired ? 1 : 0,
+              passwordRequired ? passwordSalt : null,
+              passwordRequired ? passwordHash : null,
               existingForm.id
             )
             .run();
@@ -7561,7 +8293,7 @@ export default {
 
         const formId = crypto.randomUUID();
         await env.DB.prepare(
-          "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_salt, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
           .bind(
             formId,
@@ -7575,7 +8307,12 @@ export default {
             canvasEnabled ? 1 : 0,
             form.canvas_course_id ?? null,
             canvasAllowed ?? null,
-            form.canvas_fields_position ?? "bottom"
+            form.canvas_fields_position ?? "bottom",
+            availableFrom,
+            availableUntil,
+            passwordRequired ? 1 : 0,
+            passwordRequired ? passwordSalt : null,
+            passwordRequired ? passwordHash : null
           )
           .run();
         if (formVersionSchema) {
@@ -7687,6 +8424,10 @@ export default {
           canvasCourseId?: string | null;
           canvasAllowedSectionIds?: string[] | null;
           canvasFieldsPosition?: string | null;
+          availableFrom?: string | null;
+          availableUntil?: string | null;
+          passwordRequired?: boolean;
+          formPassword?: string | null;
         } | null = null;
         try {
           body = await parseJsonBody(request);
@@ -7721,6 +8462,13 @@ export default {
         if (body.is_public !== undefined && typeof body.is_public !== "boolean") {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             field: "is_public",
+            message: "expected_boolean"
+          });
+        }
+
+        if (body.passwordRequired !== undefined && typeof body.passwordRequired !== "boolean") {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "passwordRequired",
             message: "expected_boolean"
           });
         }
@@ -7828,13 +8576,40 @@ export default {
         const isPublic = body.is_public === undefined ? 1 : body.is_public ? 1 : 0;
         const description = body.description ?? null;
         const mirroredRules = buildFileRulesJsonFromSchema(template.schema_json);
+        const availableFrom = normalizeDateTimeInput(body.availableFrom ?? null);
+        const availableUntil = normalizeDateTimeInput(body.availableUntil ?? null);
+        if (availableFrom && availableUntil) {
+          const start = parseIsoTime(availableFrom);
+          const end = parseIsoTime(availableUntil);
+          if (start && end && start >= end) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "availableUntil",
+              message: "must_be_after_start"
+            });
+          }
+        }
+        let passwordRequired = body.passwordRequired ? 1 : 0;
+        let passwordSalt: string | null = null;
+        let passwordHash: string | null = null;
+        if (passwordRequired) {
+          const rawPassword =
+            typeof body.formPassword === "string" ? body.formPassword.trim() : "";
+          if (!rawPassword) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "formPassword",
+              message: "required"
+            });
+          }
+          passwordSalt = crypto.randomUUID();
+          passwordHash = await hashPasswordWithSalt(rawPassword, passwordSalt);
+        }
         const canvasAllowedJson =
           canvasAllowedSectionIds && canvasAllowedSectionIds.length > 0
             ? JSON.stringify(canvasAllowedSectionIds)
             : null;
         const statements = [
           env.DB.prepare(
-            "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_salt, password_hash, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           ).bind(
             formId,
             body.slug.trim(),
@@ -7849,6 +8624,11 @@ export default {
             canvasCourseId,
             canvasAllowedJson,
             canvasFieldsPosition,
+            availableFrom,
+            availableUntil,
+            passwordRequired,
+            passwordSalt,
+            passwordHash,
             authPayload?.userId ?? null
           ),
           env.DB.prepare(
@@ -7880,7 +8660,10 @@ export default {
               canvas_enabled: canvasEnabled,
               canvas_course_id: canvasCourseId,
               canvas_allowed_section_ids_json: canvasAllowedJson,
-              canvas_fields_position: canvasFieldsPosition
+              canvas_fields_position: canvasFieldsPosition,
+              available_from: availableFrom,
+              available_until: availableUntil,
+              password_required: passwordRequired === 1
             },
             warning: canvasWarning ? { code: canvasWarning } : null,
             requestId
@@ -7891,7 +8674,7 @@ export default {
       }
 
       if (request.method === "PATCH") {
-        const formMatch = url.pathname.match(/^\/api\/admin\/forms\/([^/]+)$/);
+          const formMatch = url.pathname.match(/^\/api\/admin\/forms\/([^/]+)$/);
         if (formMatch) {
           const slug = decodeURIComponent(formMatch[1]);
             let body: {
@@ -7907,6 +8690,10 @@ export default {
             canvasCourseId?: string | null;
             canvasAllowedSectionIds?: string[] | null;
             canvasFieldsPosition?: string | null;
+            availableFrom?: string | null;
+            availableUntil?: string | null;
+            passwordRequired?: boolean;
+            formPassword?: string | null;
           } | null = null;
           try {
             body = await parseJsonBody(request);
@@ -7918,12 +8705,22 @@ export default {
             const params: Array<string | number | null> = [];
             let canvasWarning: string | null = null;
             const formRow = await env.DB.prepare(
-              "SELECT id, slug FROM forms WHERE slug=? AND deleted_at IS NULL"
+              "SELECT id, slug, password_required, password_salt, password_hash, available_from, available_until FROM forms WHERE slug=? AND deleted_at IS NULL"
             )
               .bind(slug)
-              .first<{ id: string; slug: string }>();
+              .first<{ id: string; slug: string; password_required: number; password_salt: string | null; password_hash: string | null; available_from: string | null; available_until: string | null }>();
             if (!formRow) {
               return errorResponse(404, "not_found", requestId, corsHeaders);
+            }
+            if (
+              body?.passwordRequired === true &&
+              (!formRow.password_hash || !formRow.password_salt) &&
+              (!body.formPassword || (typeof body.formPassword === "string" && !body.formPassword.trim()))
+            ) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "formPassword",
+                message: "required"
+              });
             }
             let newSlug: string | null = null;
             if (body?.newSlug !== undefined) {
@@ -7978,6 +8775,64 @@ export default {
             }
             updates.push("is_public=?");
             params.push(body.is_public ? 1 : 0);
+          }
+          const nextAvailableFrom =
+            body?.availableFrom !== undefined
+              ? normalizeDateTimeInput(body.availableFrom ?? null)
+              : formRow.available_from ?? null;
+          const nextAvailableUntil =
+            body?.availableUntil !== undefined
+              ? normalizeDateTimeInput(body.availableUntil ?? null)
+              : formRow.available_until ?? null;
+          if (nextAvailableFrom && nextAvailableUntil) {
+            const start = parseIsoTime(nextAvailableFrom);
+            const end = parseIsoTime(nextAvailableUntil);
+            if (start && end && start >= end) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "availableUntil",
+                message: "must_be_after_start"
+              });
+            }
+          }
+          if (body?.availableFrom !== undefined) {
+            updates.push("available_from=?");
+            params.push(nextAvailableFrom);
+          }
+          if (body?.availableUntil !== undefined) {
+            updates.push("available_until=?");
+            params.push(nextAvailableUntil);
+          }
+          if (body?.passwordRequired !== undefined) {
+            if (typeof body.passwordRequired !== "boolean") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "passwordRequired",
+                message: "expected_boolean"
+              });
+            }
+            if (!body.passwordRequired) {
+              updates.push("password_required=?");
+              params.push(0);
+              updates.push("password_salt=?");
+              params.push(null);
+              updates.push("password_hash=?");
+              params.push(null);
+            } else {
+              updates.push("password_required=?");
+              params.push(1);
+            }
+          }
+          if (body?.formPassword !== undefined) {
+            const raw = typeof body.formPassword === "string" ? body.formPassword.trim() : "";
+            if (raw) {
+              const salt = crypto.randomUUID();
+              const hash = await hashPasswordWithSalt(raw, salt);
+              updates.push("password_salt=?");
+              params.push(salt);
+              updates.push("password_hash=?");
+              params.push(hash);
+              updates.push("password_required=?");
+              params.push(1);
+            }
           }
           if (body?.auth_policy) {
             if (!["optional", "google", "github", "either", "required"].includes(body.auth_policy)) {
@@ -8294,7 +9149,7 @@ export default {
         const offset = (page - 1) * pageSize;
         const params: Array<string | number> = [];
         let query =
-          "SELECT s.id,s.form_id,f.slug as form_slug,s.user_id,s.payload_json,s.created_at,s.updated_at,s.created_ip,s.created_user_agent,COALESCE(s.submitter_provider,(SELECT provider FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_provider,COALESCE(s.submitter_email,(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_email,COALESCE(s.submitter_github_username,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_github_username FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.deleted_at IS NULL AND f.deleted_at IS NULL";
+          "SELECT s.id,s.form_id,f.slug as form_slug,f.title as form_title,s.user_id,s.payload_json,s.created_at,s.updated_at,s.created_ip,s.created_user_agent,COALESCE(s.submitter_provider,(SELECT provider FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_provider,COALESCE(s.submitter_email,(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_email,COALESCE(s.submitter_github_username,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_github_username FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.deleted_at IS NULL AND f.deleted_at IS NULL";
         if (formSlug) {
           query += " AND f.slug=?";
           params.push(formSlug);
@@ -8333,6 +9188,7 @@ export default {
           return {
             id: row.id,
             form_slug: row.form_slug,
+            form_title: (row as SubmissionRow & { form_title?: string | null }).form_title ?? null,
             form_id: row.form_id,
             form_version: null,
             created_at: row.created_at,
@@ -8371,6 +9227,19 @@ export default {
           const format = (url.searchParams.get("format") || "csv").toLowerCase();
           const includeDeleted = url.searchParams.get("includeDeleted") === "1";
           const includeDeletedUsers = url.searchParams.get("includeDeletedUsers") === "1";
+          const fieldsParam = url.searchParams.get("fields");
+          const requestedFields = fieldsParam
+            ? fieldsParam
+                .split(",")
+                .map((item) => item.trim())
+                .filter((item) => item.length > 0)
+            : [];
+          if (fieldsParam && requestedFields.length === 0) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "fields",
+              message: "empty"
+            });
+          }
           if (!formSlug) {
             return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
               field: "formSlug",
@@ -8428,6 +9297,7 @@ export default {
             }
           }
 
+          const includeDataJson = requestedFields.length === 0;
           const rows = results.map((row: any) => {
             let dataObj: Record<string, unknown> = {};
             try {
@@ -8435,6 +9305,15 @@ export default {
               dataObj = payload?.data && typeof payload.data === "object" ? payload.data : {};
             } catch (error) {
               dataObj = {};
+            }
+            if (requestedFields.length > 0) {
+              const filtered: Record<string, unknown> = {};
+              requestedFields.forEach((key) => {
+                if (Object.prototype.hasOwnProperty.call(dataObj, key)) {
+                  filtered[key] = (dataObj as Record<string, unknown>)[key];
+                }
+              });
+              dataObj = filtered;
             }
             return {
               submission_id: row.id,
@@ -8455,7 +9334,7 @@ export default {
           rows.forEach((row) => {
             Object.keys(row.data || {}).forEach((key) => keySet.add(key));
           });
-          const dataKeys = Array.from(keySet).sort();
+          const dataKeys = requestedFields.length > 0 ? requestedFields : Array.from(keySet).sort();
           const headers = [
             "submission_id",
             "form_slug",
@@ -8466,11 +9345,11 @@ export default {
             "provider",
             "email",
             "github_username",
-            "data_json",
+            ...(includeDataJson ? ["data_json"] : []),
             ...dataKeys.map((key) => `data.${key}`)
           ];
 
-          const delimiter = format === "csv" ? "," : "\t";
+          const delimiter = format === "csv" ? "," : ",";
           const lines = [headers.join(delimiter)];
           rows.forEach((row) => {
             const baseValues = [
@@ -8483,7 +9362,7 @@ export default {
               row.provider ?? "",
               row.email ?? "",
               row.github_username ?? "",
-              row.data_json ?? ""
+              ...(includeDataJson ? [row.data_json ?? ""] : [])
             ];
             const dataValues = dataKeys.map((key) => stringifyCsvValue(row.data?.[key]));
             const values = [...baseValues, ...dataValues].map((value) =>
@@ -8500,7 +9379,10 @@ export default {
             headers: {
               "content-type": format === "csv" ? "text/csv; charset=utf-8" : "text/plain; charset=utf-8",
               "content-disposition": `attachment; filename="${filename}"`,
+              "cache-control": "no-store",
               "access-control-expose-headers": "Content-Disposition",
+              "x-export-fields": requestedFields.join(","),
+              "x-export-delimiter": delimiter,
               "x-request-id": requestId,
               ...corsHeaders
             }
@@ -8511,7 +9393,8 @@ export default {
       if (
         request.method === "GET" &&
         (url.pathname === "/api/admin/submissions/export" ||
-          url.pathname.match(/^\/api\/admin\/forms\/[^/]+\/export$/))
+          url.pathname.match(/^\/api\/admin\/forms\/[^/]+\/export$/) ||
+          url.pathname.match(/^\/api\/admin\/forms\/[^/]+\/submissions\/export$/))
       ) {
         const formSlug =
           url.pathname === "/api/admin/submissions/export"
@@ -8527,6 +9410,20 @@ export default {
         const mode = (url.searchParams.get("mode") || "flat").toLowerCase();
         const includeMeta = url.searchParams.get("includeMeta") !== "0";
         const maxRows = Math.min(Math.max(toNumber(url.searchParams.get("maxRows"), 5000), 1), 50000);
+        const fieldsParam = url.searchParams.get("fields");
+        const requestedFields = fieldsParam
+          ? fieldsParam
+              .split(",")
+              .map((item) => item.trim())
+              .filter((item) => item.length > 0)
+          : [];
+        if (fieldsParam && requestedFields.length === 0) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "fields",
+            message: "empty"
+          });
+        }
+        const includeMetaEffective = requestedFields.length > 0 ? false : includeMeta;
         if (format !== "csv" && format !== "txt") {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             field: "format",
@@ -8554,6 +9451,15 @@ export default {
           } catch (error) {
             dataObj = {};
           }
+          if (requestedFields.length > 0) {
+            const filtered: Record<string, unknown> = {};
+            requestedFields.forEach((key) => {
+              if (Object.prototype.hasOwnProperty.call(dataObj, key)) {
+                filtered[key] = (dataObj as Record<string, unknown>)[key];
+              }
+            });
+            dataObj = filtered;
+          }
           return {
             submission_id: row.id,
             created_at: row.created_at,
@@ -8570,7 +9476,7 @@ export default {
         rows.forEach((row) => {
           Object.keys(row.data || {}).forEach((key) => keySet.add(key));
         });
-        const dataKeys = Array.from(keySet).sort();
+        const dataKeys = requestedFields.length > 0 ? requestedFields : Array.from(keySet).sort();
 
         const escapeDelimited = (value: string, delimiter: string) => {
           if (value.includes('"') || value.includes("\n") || value.includes("\r") || value.includes(delimiter)) {
@@ -8579,7 +9485,7 @@ export default {
           return value;
         };
 
-        const metaHeaders = includeMeta
+        const metaHeaders = includeMetaEffective
           ? ["submission_id", "created_at", "updated_at", "user_id", "provider", "email", "github_username"]
           : [];
 
@@ -8595,7 +9501,7 @@ export default {
               : [...metaHeaders, ...dataKeys];
           const lines = [headers.join(",")];
           rows.forEach((row) => {
-            const metaValues = includeMeta
+            const metaValues = includeMetaEffective
               ? [
                   row.submission_id,
                   row.created_at,
@@ -8619,7 +9525,9 @@ export default {
             headers: {
               "content-type": "text/csv; charset=utf-8",
               "content-disposition": `attachment; filename="${filenamePrefix}.csv"`,
+              "cache-control": "no-store",
               "access-control-expose-headers": "Content-Disposition",
+              "x-export-fields": requestedFields.join(","),
               "x-request-id": requestId,
               ...corsHeaders
             }
@@ -8629,7 +9537,7 @@ export default {
         if (mode === "json") {
           const lines = rows.map((row) => {
             const record: Record<string, unknown> = {};
-            if (includeMeta) {
+            if (includeMetaEffective) {
               record.submission_id = row.submission_id;
               record.created_at = row.created_at;
               record.updated_at = row.updated_at ?? null;
@@ -8647,17 +9555,20 @@ export default {
             headers: {
               "content-type": "text/plain; charset=utf-8",
               "content-disposition": `attachment; filename="${filenamePrefix}.txt"`,
+              "cache-control": "no-store",
               "access-control-expose-headers": "Content-Disposition",
+              "x-export-fields": requestedFields.join(","),
               "x-request-id": requestId,
               ...corsHeaders
             }
           });
         }
 
+        const delimiter = ",";
         const headers = [...metaHeaders, ...dataKeys];
-        const lines = [headers.join("\t")];
+        const lines = [headers.join(delimiter)];
         rows.forEach((row) => {
-          const metaValues = includeMeta
+          const metaValues = includeMetaEffective
             ? [
                 row.submission_id,
                 row.created_at,
@@ -8669,8 +9580,10 @@ export default {
               ]
             : [];
           const dataValues = dataKeys.map((key) => stringifyCsvValue(row.data?.[key]));
-          const values = [...metaValues, ...dataValues].map((value) => escapeDelimited(String(value ?? ""), "\t"));
-          lines.push(values.join("\t"));
+          const values = [...metaValues, ...dataValues].map((value) =>
+            escapeDelimited(String(value ?? ""), delimiter)
+          );
+          lines.push(values.join(delimiter));
         });
         const output = lines.join("\n");
         return new Response(output, {
@@ -8678,7 +9591,10 @@ export default {
           headers: {
             "content-type": "text/plain; charset=utf-8",
             "content-disposition": `attachment; filename="${filenamePrefix}.txt"`,
+            "cache-control": "no-store",
             "access-control-expose-headers": "Content-Disposition",
+            "x-export-fields": requestedFields.join(","),
+            "x-export-delimiter": delimiter,
             "x-request-id": requestId,
             ...corsHeaders
           }
@@ -8944,17 +9860,22 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/api/forms") {
       const { results } = await env.DB.prepare(
-        "SELECT slug,title,is_locked,is_public,auth_policy,canvas_enabled,canvas_course_id FROM forms WHERE deleted_at IS NULL AND is_public=1 ORDER BY created_at DESC"
-      ).all<FormListRow & { auth_policy: string }>();
+        "SELECT slug,title,description,is_locked,is_public,auth_policy,canvas_enabled,canvas_course_id,available_from,available_until,password_required FROM forms WHERE deleted_at IS NULL AND is_public=1 ORDER BY created_at DESC"
+      ).all<FormListRow & { auth_policy: string; description: string | null }>();
 
       const data = results.map((row) => ({
         slug: row.slug,
         title: row.title,
+        description: row.description ?? null,
         is_locked: toBoolean(row.is_locked),
         is_public: toBoolean(row.is_public),
         auth_policy: row.auth_policy,
         canvas_enabled: toBoolean(row.canvas_enabled),
-        canvas_course_id: row.canvas_course_id ?? null
+        canvas_course_id: row.canvas_course_id ?? null,
+        available_from: row.available_from ?? null,
+        available_until: row.available_until ?? null,
+        password_required: toBoolean(row.password_required ?? 0),
+        is_open: getFormAvailability(row).open
       }));
 
       return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -9017,6 +9938,10 @@ export default {
           templateKey: row.templateKey,
           templateVersion: row.templateVersion,
           formVersion: row.templateVersion,
+          available_from: row.available_from ?? null,
+          available_until: row.available_until ?? null,
+          password_required: toBoolean(row.password_required ?? 0),
+          is_open: getFormAvailability(row).open,
           template_schema_json: row.schema_json,
           file_rules_json: row.form_file_rules_json ?? row.template_file_rules_json ?? null,
           fields,
@@ -9338,8 +10263,11 @@ export default {
         if (!formRow) {
           return errorResponse(404, "not_found", requestId, corsHeaders);
         }
-        if (toBoolean(formRow.is_locked)) {
-          return errorResponse(409, "locked", requestId, corsHeaders);
+        const availability = getFormAvailability(formRow);
+        if (!availability.open) {
+          return errorResponse(403, "form_closed", requestId, corsHeaders, {
+            reason: availability.reason
+          });
         }
 
         const authPayload = await getAuthPayload(request, env);
@@ -9351,6 +10279,8 @@ export default {
         const formData = await request.formData();
         const fieldIdValue = formData.get("fieldId");
         const submissionIdValue = formData.get("submissionId");
+        const passwordValue = formData.get("formPassword");
+        const formPassword = typeof passwordValue === "string" ? passwordValue : null;
         const fieldId = typeof fieldIdValue === "string" ? fieldIdValue.trim() : "";
         const submissionId =
           typeof submissionIdValue === "string" && submissionIdValue.trim()
@@ -9367,6 +10297,13 @@ export default {
         if (!fieldId || files.length === 0) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             message: "fieldId and files are required"
+          });
+        }
+        const passwordCheck = await verifyFormPassword(formRow, formPassword);
+        if (!passwordCheck.ok) {
+          return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
+            field: "formPassword",
+            message: passwordCheck.message
           });
         }
 
@@ -10255,6 +11192,28 @@ export default {
         .bind(submission.id)
         .all();
 
+      let canvasFullName: string | null = null;
+      let canvasDisplayName: string | null = submission.canvas_user_name || null;
+      if (submission.canvas_course_id) {
+        let email =
+          (payload?.data && typeof (payload as any).data?.email === "string"
+            ? String((payload as any).data.email).trim()
+            : "") || "";
+        if (!email) {
+          const emailRow = await env.DB.prepare(
+            "SELECT email FROM user_identities WHERE user_id=? AND email IS NOT NULL ORDER BY created_at DESC LIMIT 1"
+          )
+            .bind(submission.user_id ?? "")
+            .first<{ email: string | null }>();
+          email = emailRow?.email ?? "";
+        }
+        if (email) {
+          const canvasUser = await canvasFindUserByEmailInCourse(env, submission.canvas_course_id, email);
+          canvasFullName = canvasUser?.name?.trim() || null;
+          canvasDisplayName = canvasUser?.shortName?.trim() || canvasDisplayName;
+        }
+      }
+
       return jsonResponse(
         200,
         {
@@ -10271,7 +11230,9 @@ export default {
               section_id: submission.canvas_section_id,
               enrolled_at: submission.canvas_enrolled_at,
               user_id: submission.canvas_user_id,
-              user_name: submission.canvas_user_name
+              user_name: submission.canvas_user_name,
+              full_name: canvasFullName,
+              display_name: canvasDisplayName
             },
             form: {
               slug: submission.form_slug,
@@ -10309,7 +11270,7 @@ export default {
           .first<{ total: number }>();
         totals.submissions = total?.total ?? 0;
         const { results } = await env.DB.prepare(
-          "SELECT s.id,s.form_id,f.slug as form_slug,s.deleted_at,s.deleted_by,s.deleted_reason FROM submissions s LEFT JOIN forms f ON f.id=s.form_id WHERE s.deleted_at IS NOT NULL AND s.user_id=? ORDER BY s.deleted_at DESC LIMIT ? OFFSET ?"
+          "SELECT s.id,s.form_id,f.slug as form_slug,f.title as form_title,s.deleted_at,s.deleted_by,s.deleted_reason FROM submissions s LEFT JOIN forms f ON f.id=s.form_id WHERE s.deleted_at IS NOT NULL AND s.user_id=? ORDER BY s.deleted_at DESC LIMIT ? OFFSET ?"
         )
           .bind(authPayload.userId, limit, offset)
           .all();
@@ -10324,7 +11285,7 @@ export default {
           .first<{ total: number }>();
         totals.files = total?.total ?? 0;
         const { results } = await env.DB.prepare(
-          "SELECT sfi.id, sfi.form_slug, sfi.submission_id, sfi.field_id, sfi.original_name, sfi.size_bytes, sfi.deleted_at, sfi.deleted_by, sfi.deleted_reason FROM submission_file_items sfi WHERE sfi.deleted_at IS NOT NULL AND sfi.submission_id IN (SELECT id FROM submissions WHERE user_id=?) ORDER BY sfi.deleted_at DESC LIMIT ? OFFSET ?"
+          "SELECT sfi.id, sfi.form_slug, f.title as form_title, sfi.submission_id, sfi.field_id, sfi.original_name, sfi.size_bytes, sfi.deleted_at, sfi.deleted_by, sfi.deleted_reason FROM submission_file_items sfi LEFT JOIN forms f ON f.slug=sfi.form_slug WHERE sfi.deleted_at IS NOT NULL AND sfi.submission_id IN (SELECT id FROM submissions WHERE user_id=?) ORDER BY sfi.deleted_at DESC LIMIT ? OFFSET ?"
         )
           .bind(authPayload.userId, limit, offset)
           .all();
@@ -10459,6 +11420,20 @@ export default {
         .bind(submission.id)
         .all();
 
+      let canvasFullName: string | null = null;
+      let canvasDisplayName: string | null = submission.canvas_user_name || null;
+      if (submission.canvas_course_id) {
+        let email =
+          (payload?.data && typeof (payload as any).data?.email === "string"
+            ? String((payload as any).data.email).trim()
+            : "") || "";
+        if (email) {
+          const canvasUser = await canvasFindUserByEmailInCourse(env, submission.canvas_course_id, email);
+          canvasFullName = canvasUser?.name?.trim() || null;
+          canvasDisplayName = canvasUser?.shortName?.trim() || canvasDisplayName;
+        }
+      }
+
       return jsonResponse(
         200,
         {
@@ -10475,7 +11450,9 @@ export default {
               section_id: submission.canvas_section_id,
               enrolled_at: submission.canvas_enrolled_at,
               user_id: submission.canvas_user_id,
-              user_name: submission.canvas_user_name
+              user_name: submission.canvas_user_name,
+              full_name: canvasFullName,
+              display_name: canvasDisplayName
             },
             form: {
               slug: submission.form_slug,
@@ -10752,7 +11729,7 @@ export default {
     if (request.method === "POST") {
       const submitMatch = url.pathname.match(/^\/api\/forms\/([^/]+)\/submit$/);
       if (submitMatch) {
-        let body: { data?: Record<string, unknown> } | null = null;
+        let body: { data?: Record<string, unknown>; formPassword?: string } | null = null;
         try {
           body = await parseJsonBody(request);
         } catch (error) {
@@ -10764,8 +11741,11 @@ export default {
         if (!form) {
           return errorResponse(404, "not_found", requestId, corsHeaders);
         }
-        if (toBoolean(form.is_locked)) {
-          return errorResponse(409, "locked", requestId, corsHeaders);
+        const availability = getFormAvailability(form);
+        if (!availability.open) {
+          return errorResponse(403, "form_closed", requestId, corsHeaders, {
+            reason: availability.reason
+          });
         }
         if (!body?.data || typeof body.data !== "object") {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
@@ -10777,6 +11757,13 @@ export default {
         const authCheck = checkAuthPolicy(form.auth_policy, authPayload);
         if (!authCheck.ok) {
           return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
+        }
+        const passwordCheck = await verifyFormPassword(form, body?.formPassword);
+        if (!passwordCheck.ok) {
+          return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
+            field: "formPassword",
+            message: passwordCheck.message
+          });
         }
         const userId = await resolveUserId(env, authPayload);
         const submitter = getSubmitterSnapshot(authPayload);
@@ -10951,6 +11938,7 @@ export default {
             contentType?: string;
             sizeBytes?: number;
             sha256?: string;
+            formPassword?: string;
           }
         | null = null;
       try {
@@ -10966,7 +11954,8 @@ export default {
           filename: body?.filename,
           contentType: body?.contentType,
           sizeBytes: body?.sizeBytes,
-          sha256: body?.sha256
+          sha256: body?.sha256,
+          formPassword: body?.formPassword
         });
       }
 
@@ -10980,14 +11969,24 @@ export default {
       if (!formRow) {
         return errorResponse(404, "not_found", requestId, corsHeaders);
       }
-      if (toBoolean(formRow.is_locked)) {
-        return errorResponse(409, "locked", requestId, corsHeaders);
+      const availability = getFormAvailability(formRow);
+      if (!availability.open) {
+        return errorResponse(403, "form_closed", requestId, corsHeaders, {
+          reason: availability.reason
+        });
       }
 
       const authPayload = await getAuthPayload(request, env);
       const authCheck = checkAuthPolicy(formRow.auth_policy, authPayload);
       if (!authCheck.ok) {
         return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
+      }
+      const passwordCheck = await verifyFormPassword(formRow, body.formPassword);
+      if (!passwordCheck.ok) {
+        return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
+          field: "formPassword",
+          message: passwordCheck.message
+        });
       }
       const safeUserId = await resolveUserId(env, authPayload);
 
@@ -11467,8 +12466,11 @@ export default {
       if (!form) {
         return errorResponse(404, "not_found", requestId, corsHeaders);
       }
-      if (toBoolean(form.is_locked)) {
-        return errorResponse(403, "form_locked", requestId, corsHeaders);
+      const availability = getFormAvailability(form);
+      if (!availability.open) {
+        return errorResponse(403, "form_closed", requestId, corsHeaders, {
+          reason: availability.reason
+        });
       }
 
       let schema: unknown = null;
@@ -11489,6 +12491,13 @@ export default {
       if (!authCheck.ok) {
         return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
       }
+      const passwordCheck = await verifyFormPassword(form, parsed?.formPassword);
+      if (!passwordCheck.ok) {
+        return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
+          field: "formPassword",
+          message: passwordCheck.message
+        });
+      }
 
       const dataObj: Record<string, unknown> = { ...(parsed.data as Record<string, unknown>) };
       const rawCanvasSectionId =
@@ -11498,7 +12507,9 @@ export default {
       const githubLogin =
         authPayload?.userId ? await getGithubLoginForUser(env, authPayload.userId) : null;
       for (const field of fields) {
-        if (field.type !== "email" && field.type !== "github_username") continue;
+        if (field.type !== "email" && field.type !== "github_username" && field.type !== "url") {
+          continue;
+        }
         const raw = dataObj[field.id];
         if (raw !== undefined && raw !== null && typeof raw !== "string") {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
@@ -11565,6 +12576,42 @@ export default {
             return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
               field: field.id,
               message: "invalid_github_username"
+            });
+          }
+          if (!allowAutofill) {
+            try {
+              const exists = await githubUserExists(value);
+              if (!exists) {
+                return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                  field: field.id,
+                  message: "github_user_not_found"
+                });
+              }
+            } catch (error) {
+              return errorResponse(502, "github_lookup_failed", requestId, corsHeaders, {
+                field: field.id
+              });
+            }
+          }
+        }
+        if (field.type === "url") {
+          if (!value) {
+            if (field.required) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: field.id,
+                message: "required"
+              });
+            }
+            continue;
+          }
+          const normalizedUrl = ensureUrlWithScheme(value);
+          if (normalizedUrl !== value) {
+            dataObj[field.id] = normalizedUrl;
+          }
+          if (!isValidHttpUrl(normalizedUrl)) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: field.id,
+              message: "invalid_url"
             });
           }
         }
@@ -11766,11 +12813,22 @@ export default {
           }
         }
       }
+      if (userId && !existingSubmissionId) {
+        const anyExisting = await env.DB.prepare(
+          "SELECT id, deleted_at FROM submissions WHERE form_id=? AND user_id=? ORDER BY created_at DESC LIMIT 1"
+        )
+          .bind(form.id, userId)
+          .first<{ id: string; deleted_at: string | null }>();
+        if (anyExisting) {
+          existingSubmissionId = anyExisting.id;
+          submissionId = anyExisting.id;
+        }
+      }
       const isResubmission = Boolean(existingSubmissionId);
 
       if (existingSubmissionId) {
         await env.DB.prepare(
-          "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), submitter_provider=?, submitter_email=?, submitter_github_username=?, canvas_course_id=? WHERE id=?"
+          "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), submitter_provider=?, submitter_email=?, submitter_github_username=?, canvas_course_id=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
         )
           .bind(
             payloadJson,
@@ -12114,7 +13172,31 @@ export default {
               "className",
               "lop"
             ]);
-            const dob = pickFirstStringValue(dataObj, ["dob", "date_of_birth", "birthday"]);
+            const dobEntry = pickFirstStringEntry(dataObj, [
+              "dob",
+              "date_of_birth",
+              "birthday"
+            ]);
+            let dobDisplay = dobEntry?.value ?? null;
+            if (dobEntry) {
+              const dobField = fields.find(
+                (field) => field.id === dobEntry.key && field.type === "date"
+              );
+              if (dobField) {
+                const rawMode = String(dobField.rules?.mode || "date");
+                const mode =
+                  rawMode === "time" ? "time" : rawMode === "datetime" ? "datetime" : "date";
+                const tzRaw = dataObj[`${dobEntry.key}__tz`];
+                const tzValue = typeof tzRaw === "string" && tzRaw.trim() ? tzRaw.trim() : null;
+                const showTimezone = dobField.rules?.timezoneOptional !== true;
+                dobDisplay = formatDateValueForMessage(
+                  dobEntry.value,
+                  mode,
+                  tzValue,
+                  showTimezone
+                );
+              }
+            }
 
             if (isResubmission) {
               const message = buildCanvasInformMessage({
@@ -12122,7 +13204,7 @@ export default {
                 submittedEmail: canvasEmail,
                 studentId,
                 className,
-                dob,
+                dob: dobDisplay,
                 courseLabel,
                 sectionLabel,
                 formTitle: form.title,
@@ -12151,7 +13233,13 @@ export default {
               const welcomeMessage = buildCanvasWelcomeMessage({
                 courseLabel,
                 sectionLabel,
-                formTitle: form.title
+                formTitle: form.title,
+                submittedName,
+                submittedEmail: canvasEmail,
+                studentId,
+                className,
+                dob: dobDisplay,
+                formLink
               });
               const welcomeResult = await sendGmailMessage(env, {
                 to: canvasEmail,

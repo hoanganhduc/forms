@@ -20,6 +20,7 @@ with VirusTotal scanning, and optional Google Drive finalization.
 - Login buttons redirect to OAuth and return to the app after authentication.
 - Admin UI (after login): `http://localhost:5173/forms/#/admin`
 - Builder UI (admin): `http://localhost:5173/forms/#/admin/builder` (create/edit forms & templates)
+- Admin nav entries (under Admin tab): Admin Dashboard, Builder, Canvas, Emails, Trash.
 - Public fill route: `http://localhost:5173/forms/#/f/hus-demo-1`
 - Docs: `http://localhost:5173/forms/#/docs`
 - File upload test: choose a file on the form page and submit; API stores in R2.
@@ -35,6 +36,24 @@ with VirusTotal scanning, and optional Google Drive finalization.
   - Verify the form appears after at least one submission.
 - Clean local caches (keeps env files): `clean.bat`
 - Theme: dark is default; the toggle persists in localStorage.
+- Theme toggle: floating button at bottom-right.
+- Form drafts: unsent inputs auto-save to localStorage and can be restored on return.
+- Builder: duplicate forms/templates to speed up reuse.
+
+## Mobile QA
+- Run `npm run dev:web` and open `http://localhost:5173/forms/`.
+- Use device emulation:
+  - iPhone SE (375x667)
+  - iPhone 14 Pro (393x852)
+  - Pixel 7 (412x915)
+  - iPad Mini (768x1024)
+- Verify:
+  - No horizontal scrolling.
+  - Mobile menu drawer opens/closes and links work.
+  - Login buttons are full-width and tappable.
+  - Form fill fields stack vertically and errors are readable.
+  - Sticky submit bar appears and does not cover content.
+  - Admin lists remain readable on mobile.
 
 ## Migrations
 - `npm run migrate:local -w apps/api`
@@ -47,9 +66,12 @@ with VirusTotal scanning, and optional Google Drive finalization.
 ## Admin exports
 - CSV: `GET /api/admin/forms/:slug/export.csv`
 - TXT (JSONL): `GET /api/admin/forms/:slug/export.txt`
+- Optional field filter: add `fields=full_name,email` to export only specific data keys (CSV/TXT).
 
 ## Routine tasks + health
 - Admin dashboard shows routine tasks (cron-based) and health status history.
+- Routine tasks support bulk run/save and enable/disable actions; latest run time appears in status.
+- Admin listings support bulk select + move-to-trash for forms/templates/users/submissions.
 - Built-in tasks:
   - Canvas sync (courses + sections)
   - Canvas name mismatch checker
@@ -163,7 +185,13 @@ The API uses a staged upload flow:
   email domain does not match the required domain, the user can still manually enter a valid
   email address for that domain.
 - GitHub Username fields can auto-fill from the logged-in GitHub identity and are validated server-side.
-- Full Name fields normalize to title-case on submit (e.g., `john wick` → `John Wick`).
+- When GitHub auto-fill is disabled, the UI checks the username exists on GitHub (blur) and the API enforces it.
+- Full Name fields normalize to title-case on submit (e.g., `john wick` -> `John Wick`).
+- URL fields accept only valid `http`/`https` links and auto-prefix missing schemes on blur/submit.
+- Date/Time fields let you choose date only, time only, or both; submissions store UTC plus the chosen timezone key.
+- Form availability uses a timezone selector; open/close times are stored in UTC.
+- The timezone picker is searchable and uses the full IANA list with a curated fallback (Asia/Ho_Chi_Minh always available).
+- Admin can set a global default timezone (Admin App settings); times are displayed in the viewer's local timezone.
 
 ## Deletion policy
 - User deletes account via `DELETE /api/me`:
@@ -178,7 +206,7 @@ The API uses a staged upload flow:
 - Toggle **New** vs **Edit**:
   - **New**: enter slug/title/template and status fields, then create.
   - **Edit**: select an existing item and update schema/settings.
-- Field builder supports: text, textarea, number, date, email, GitHub username, full name,
+- Field builder supports: text, textarea, number, date/time, email, URL, GitHub username, full name,
   select, checkbox, and file fields.
 - File fields: configure extensions, max size, and max files; rules are stored per field.
 - Use drag handles to reorder fields; ordering is saved in schema JSON.
