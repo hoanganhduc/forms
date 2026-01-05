@@ -839,8 +839,10 @@ h1 {
   }
 
   .field input,
-  .field textarea {
+  .field textarea,
+  .field select {
     font-size: 16px;
+    width: 100%;
   }
 }
 
