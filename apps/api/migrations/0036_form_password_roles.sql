@@ -1,0 +1,4 @@
+ALTER TABLE forms ADD COLUMN password_require_access INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE forms ADD COLUMN password_require_submit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE forms ADD COLUMN password_require_edit INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE forms ADD COLUMN password_require_delete INTEGER NOT NULL DEFAULT 0;

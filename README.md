@@ -4,6 +4,8 @@ Monorepo for a Cloudflare Worker API (apps/api) and a Vite + React web app (apps
 The app supports public forms, OAuth (Google/GitHub), user submissions, file uploads
 with VirusTotal scanning, and optional Google Drive finalization.
 
+This codebase was developed with the assistance of GitHub Copilot and ChatGPT Codex.
+
 ## Prereqs
 - Node.js (npm)
 
@@ -39,6 +41,7 @@ with VirusTotal scanning, and optional Google Drive finalization.
 - Theme toggle: floating button at bottom-right.
 - Form drafts: unsent inputs auto-save to localStorage and can be restored on return.
 - Builder: duplicate forms/templates to speed up reuse.
+- Rich text: Markdown + MathJax + HTML rendering can be toggled in Admin App settings.
 
 ## Mobile QA
 - Run `npm run dev:web` and open `http://localhost:5173/forms/`.
@@ -193,13 +196,14 @@ The API uses a staged upload flow:
 - Form availability uses a timezone selector; open/close times are stored in UTC.
 - The timezone picker is searchable and uses the full IANA list with a curated fallback (Asia/Ho_Chi_Minh always available).
 - Admin can set a global default timezone (Admin App settings); times are displayed in the viewer's local timezone.
+- Markdown/MathJax/HTML rendering is global (Admin App settings) and applies to form titles, descriptions, labels, and text values.
 
 ## Deletion policy
 - User deletes account via `DELETE /api/me`:
   - Soft-deletes the user and all related submissions/files.
   - Clears auth cookie immediately.
   - Login is blocked for deleted users until an admin restores the account.
-- Admin App settings: “Canvas sync on delete/restore” toggles whether delete/restore
+- Admin App settings: ï¿½Canvas sync on delete/restoreï¿½ toggles whether delete/restore
   actions deactivate/reactivate Canvas enrollments, and whether hard delete actions
   unenroll Canvas users.
 - Admin can restore or permanently delete users via the trash tools.

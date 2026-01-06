@@ -46,6 +46,8 @@ type FormListRow = {
   available_from?: string | null;
   available_until?: string | null;
   password_required?: number | null;
+  password_require_access?: number | null;
+  password_require_submit?: number | null;
 };
 
 type FormDetailRow = {
@@ -66,6 +68,8 @@ type FormDetailRow = {
   available_from?: string | null;
   available_until?: string | null;
   password_required?: number | null;
+  password_require_access?: string | number | null;
+  password_require_submit?: string | number | null;
   password_salt?: string | null;
   password_hash?: string | null;
 };
@@ -92,6 +96,8 @@ type AdminFormRow = {
   available_from?: string | null;
   available_until?: string | null;
   password_required?: number | null;
+  password_require_access?: number | null;
+  password_require_submit?: number | null;
 };
 
 type TemplateRow = {
@@ -202,6 +208,8 @@ function parseAllowedOrigins(value: string | undefined): string[] {
 const APP_SETTING_DEFAULT_TIMEZONE = "timezone_default";
 const APP_SETTING_CANVAS_COURSE_SYNC_MODE = "canvas_course_sync_mode";
 const APP_SETTING_CANVAS_DELETE_SYNC = "canvas_delete_sync";
+const APP_SETTING_MARKDOWN_ENABLED = "markdown_enabled";
+const APP_SETTING_MATHJAX_ENABLED = "mathjax_enabled";
 
 async function getAppSetting(env: Env, key: string): Promise<string | null> {
   try {
@@ -368,10 +376,24 @@ async function hashPasswordWithSalt(password: string, salt: string) {
 }
 
 async function verifyFormPassword(
-  form: { password_required?: number | null; password_salt?: string | null; password_hash?: string | null },
-  rawPassword: string | null | undefined
+  form: {
+    password_required?: number | null;
+    password_require_access?: number | null;
+    password_require_submit?: number | null;
+    password_salt?: string | null;
+    password_hash?: string | null;
+  },
+  rawPassword: string | null | undefined,
+  action: "access" | "submit" = "submit"
 ) {
-  if (!toBoolean(form.password_required ?? 0)) {
+  const requireAccess = toBoolean(form.password_require_access ?? 0);
+  let requireSubmit = toBoolean(form.password_require_submit ?? 0);
+  const legacyRequired = toBoolean(form.password_required ?? 0);
+  if (!requireAccess && !requireSubmit && legacyRequired) {
+    requireSubmit = true;
+  }
+  const required = action === "access" ? requireAccess : requireSubmit;
+  if (!required) {
     return { ok: true };
   }
   if (!rawPassword) {
@@ -790,7 +812,7 @@ async function handleSubmissionUploadInit(
     return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
   }
 
-  const passwordCheck = await verifyFormPassword(formRow, body.formPassword);
+  const passwordCheck = await verifyFormPassword(formRow, body.formPassword, "submit");
   if (!passwordCheck.ok) {
     return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
       field: "formPassword",
@@ -1020,7 +1042,7 @@ async function getGithubLoginForUser(env: Env, userId: string): Promise<string |
 
 async function getFormWithRules(env: Env, slug: string) {
   return env.DB.prepare(
-    "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_salt,f.password_hash,t.key as templateKey,fv.schema_json,t.file_rules_json as template_file_rules_json,f.file_rules_json as form_file_rules_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+    "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,t.key as templateKey,fv.schema_json,t.file_rules_json as template_file_rules_json,f.file_rules_json as form_file_rules_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
   )
     .bind(slug)
     .first<
@@ -1051,6 +1073,73 @@ function buildEffectiveRules(row: {
     }
   }
   return mergeRules(templateRules, formRules);
+}
+
+async function buildFormDetailPayload(env: Env, row: FormDetailRow) {
+  let schema: unknown = null;
+  if (row.schema_json) {
+    try {
+      schema = JSON.parse(row.schema_json);
+    } catch (error) {
+      return { error: "invalid_schema" as const };
+    }
+  }
+
+  const fields = extractFields(schema);
+  const fileRules = buildEffectiveRules(row);
+  let allowedSectionIds: string[] | null = null;
+  if (row.canvas_allowed_section_ids_json) {
+    try {
+      const parsed = JSON.parse(row.canvas_allowed_section_ids_json);
+      if (Array.isArray(parsed)) {
+        allowedSectionIds = parsed.filter((id) => typeof id === "string");
+      }
+    } catch (error) {
+      allowedSectionIds = null;
+    }
+  }
+  const canvasSections =
+    toBoolean(row.canvas_enabled) && row.canvas_course_id
+      ? await getCanvasAllowedSections(env, row.canvas_course_id, allowedSectionIds)
+      : [];
+  let canvasCourseName: string | null = null;
+  if (row.canvas_course_id) {
+    const courseRow = await env.DB.prepare("SELECT name FROM canvas_courses_cache WHERE id=?")
+      .bind(row.canvas_course_id)
+      .first<{ name?: string }>();
+    if (courseRow?.name) {
+      canvasCourseName = courseRow.name;
+    }
+  }
+
+  return {
+    data: {
+      slug: row.slug,
+      title: row.title,
+      description: row.description,
+      is_locked: toBoolean(row.is_locked),
+      is_public: toBoolean(row.is_public),
+      auth_policy: row.auth_policy,
+      templateKey: row.templateKey,
+      templateVersion: row.templateVersion,
+      formVersion: row.templateVersion,
+      available_from: row.available_from ?? null,
+      available_until: row.available_until ?? null,
+      password_required: toBoolean(row.password_required ?? 0),
+      password_require_access: toBoolean(row.password_require_access ?? 0),
+      password_require_submit: toBoolean(row.password_require_submit ?? 0),
+      is_open: getFormAvailability(row).open,
+      template_schema_json: row.schema_json,
+      file_rules_json: row.form_file_rules_json ?? row.template_file_rules_json ?? null,
+      fields,
+      file_rules: fileRules,
+      canvas_enabled: toBoolean(row.canvas_enabled),
+      canvas_course_id: row.canvas_course_id ?? null,
+      canvas_course_name: canvasCourseName,
+      canvas_allowed_sections: canvasSections,
+      canvas_fields_position: row.canvas_fields_position ?? "bottom"
+    }
+  };
 }
 
 type CanvasCourse = {
@@ -1143,6 +1232,18 @@ function normalizeCanvasDeleteSyncEnabled(value: string | null): boolean {
     return false;
   }
   return true;
+}
+
+function normalizeAppToggle(value: string | null, defaultValue: boolean): boolean {
+  if (!value) return defaultValue;
+  const normalized = String(value).trim().toLowerCase();
+  if (["0", "false", "disabled", "off", "no"].includes(normalized)) {
+    return false;
+  }
+  if (["1", "true", "enabled", "on", "yes"].includes(normalized)) {
+    return true;
+  }
+  return defaultValue;
 }
 
 async function isCanvasDeleteSyncEnabled(env: Env): Promise<boolean> {
@@ -1526,7 +1627,7 @@ async function backupFormsAndTemplates(env: Env) {
     throw new Error("drive_access_failed");
   }
   const { results: formRows } = await env.DB.prepare(
-    "SELECT f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.template_id,t.key as templateKey,f.file_rules_json,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_salt,f.password_hash,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.deleted_at IS NULL"
+    "SELECT f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.template_id,t.key as templateKey,f.file_rules_json,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.deleted_at IS NULL"
   ).all<Record<string, unknown>>();
   const { results: templateRows } = await env.DB.prepare(
     "SELECT key,name,schema_json,file_rules_json FROM templates WHERE deleted_at IS NULL"
@@ -6206,12 +6307,16 @@ export default {
       const timezoneDefault = await getAppSetting(env, APP_SETTING_DEFAULT_TIMEZONE);
       const canvasCourseSyncMode = await getAppSetting(env, APP_SETTING_CANVAS_COURSE_SYNC_MODE);
       const canvasDeleteSync = await getAppSetting(env, APP_SETTING_CANVAS_DELETE_SYNC);
+      const markdownEnabled = await getAppSetting(env, APP_SETTING_MARKDOWN_ENABLED);
+      const mathjaxEnabled = await getAppSetting(env, APP_SETTING_MATHJAX_ENABLED);
       return jsonResponse(
         200,
         {
           timezoneDefault,
           canvasCourseSyncMode: normalizeCanvasCourseSyncMode(canvasCourseSyncMode),
           canvasDeleteSyncEnabled: normalizeCanvasDeleteSyncEnabled(canvasDeleteSync),
+          markdownEnabled: normalizeAppToggle(markdownEnabled, true),
+          mathjaxEnabled: normalizeAppToggle(mathjaxEnabled, true),
           requestId
         },
         requestId,
@@ -6699,12 +6804,16 @@ export default {
           timezoneDefault?: string | null;
           canvasCourseSyncMode?: string | null;
           canvasDeleteSyncEnabled?: boolean | null;
+          markdownEnabled?: boolean | null;
+          mathjaxEnabled?: boolean | null;
         } | null;
         if (
           !body ||
           (!("timezoneDefault" in body) &&
             !("canvasCourseSyncMode" in body) &&
-            !("canvasDeleteSyncEnabled" in body))
+            !("canvasDeleteSyncEnabled" in body) &&
+            !("markdownEnabled" in body) &&
+            !("mathjaxEnabled" in body))
         ) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             message: "settings_required"
@@ -6757,6 +6866,38 @@ export default {
             const value = body.canvasDeleteSyncEnabled ? "enabled" : "disabled";
             await setAppSetting(env, APP_SETTING_CANVAS_DELETE_SYNC, value);
             responsePayload.canvasDeleteSyncEnabled = body.canvasDeleteSyncEnabled;
+          }
+        }
+
+        if ("markdownEnabled" in body) {
+          if (body.markdownEnabled === null) {
+            await deleteAppSetting(env, APP_SETTING_MARKDOWN_ENABLED);
+            responsePayload.markdownEnabled = true;
+          } else if (typeof body.markdownEnabled !== "boolean") {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "markdownEnabled",
+              message: "invalid_value"
+            });
+          } else {
+            const value = body.markdownEnabled ? "enabled" : "disabled";
+            await setAppSetting(env, APP_SETTING_MARKDOWN_ENABLED, value);
+            responsePayload.markdownEnabled = body.markdownEnabled;
+          }
+        }
+
+        if ("mathjaxEnabled" in body) {
+          if (body.mathjaxEnabled === null) {
+            await deleteAppSetting(env, APP_SETTING_MATHJAX_ENABLED);
+            responsePayload.mathjaxEnabled = true;
+          } else if (typeof body.mathjaxEnabled !== "boolean") {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "mathjaxEnabled",
+              message: "invalid_value"
+            });
+          } else {
+            const value = body.mathjaxEnabled ? "enabled" : "disabled";
+            await setAppSetting(env, APP_SETTING_MATHJAX_ENABLED, value);
+            responsePayload.mathjaxEnabled = body.mathjaxEnabled;
           }
         }
 
@@ -7526,7 +7667,7 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/admin/forms") {
         const { results } = await env.DB.prepare(
-          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC"
+          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC"
         ).all<AdminFormRow & { submission_count?: number; updated_at?: string | null; created_at?: string | null }>();
 
         const data = results.map((row) => ({
@@ -7547,7 +7688,9 @@ export default {
           canvas_fields_position: row.canvas_fields_position ?? "bottom",
           available_from: row.available_from ?? null,
           available_until: row.available_until ?? null,
-          password_required: toBoolean(row.password_required ?? 0)
+          password_required: toBoolean(row.password_required ?? 0),
+          password_require_access: toBoolean(row.password_require_access ?? 0),
+          password_require_submit: toBoolean(row.password_require_submit ?? 0)
         }));
 
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -7557,7 +7700,7 @@ export default {
       if (request.method === "GET" && formBackupMatch) {
         const slug = decodeURIComponent(formBackupMatch[1]);
         const formRow = await env.DB.prepare(
-          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_salt,f.password_hash,f.file_rules_json,t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
         )
           .bind(slug)
           .first<{
@@ -7575,6 +7718,8 @@ export default {
             available_from: string | null;
             available_until: string | null;
             password_required: number | null;
+            password_require_access: number | null;
+            password_require_submit: number | null;
             password_salt: string | null;
             password_hash: string | null;
             file_rules_json: string | null;
@@ -7614,6 +7759,8 @@ export default {
             available_from: formRow.available_from ?? null,
             available_until: formRow.available_until ?? null,
             password_required: toBoolean(formRow.password_required ?? 0),
+            password_require_access: toBoolean(formRow.password_require_access ?? 0),
+            password_require_submit: toBoolean(formRow.password_require_submit ?? 0),
             password_salt: formRow.password_salt ?? null,
             password_hash: formRow.password_hash ?? null
           }
@@ -8456,6 +8603,11 @@ export default {
         const availableFrom = normalizeDateTimeInput(form.available_from ?? null);
         const availableUntil = normalizeDateTimeInput(form.available_until ?? null);
         const passwordRequired = Boolean(form.password_required);
+        let passwordRequireAccess = Boolean(form.password_require_access);
+        let passwordRequireSubmit = Boolean(form.password_require_submit);
+        if (!passwordRequireAccess && !passwordRequireSubmit && passwordRequired) {
+          passwordRequireSubmit = true;
+        }
         const passwordSalt =
           typeof form.password_salt === "string" && form.password_salt.trim()
             ? form.password_salt.trim()
@@ -8493,7 +8645,7 @@ export default {
         }
         if (existingForm?.id) {
           await env.DB.prepare(
-            "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_salt=?, password_hash=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+            "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_require_access=?, password_require_submit=?, password_salt=?, password_hash=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
           )
             .bind(
               form.title,
@@ -8510,6 +8662,8 @@ export default {
               availableFrom,
               availableUntil,
               passwordRequired ? 1 : 0,
+              passwordRequireAccess ? 1 : 0,
+              passwordRequireSubmit ? 1 : 0,
               passwordRequired ? passwordSalt : null,
               passwordRequired ? passwordHash : null,
               existingForm.id
@@ -8543,7 +8697,7 @@ export default {
 
         const formId = crypto.randomUUID();
         await env.DB.prepare(
-          "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_salt, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
           .bind(
             formId,
@@ -8561,6 +8715,8 @@ export default {
             availableFrom,
             availableUntil,
             passwordRequired ? 1 : 0,
+            passwordRequireAccess ? 1 : 0,
+            passwordRequireSubmit ? 1 : 0,
             passwordRequired ? passwordSalt : null,
             passwordRequired ? passwordHash : null
           )
@@ -8677,6 +8833,8 @@ export default {
           availableFrom?: string | null;
           availableUntil?: string | null;
           passwordRequired?: boolean;
+          passwordRequireAccess?: boolean;
+          passwordRequireSubmit?: boolean;
           formPassword?: string | null;
         } | null = null;
         try {
@@ -8838,7 +8996,41 @@ export default {
             });
           }
         }
-        let passwordRequired = body.passwordRequired ? 1 : 0;
+        if (body.passwordRequired !== undefined && typeof body.passwordRequired !== "boolean") {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "passwordRequired",
+            message: "expected_boolean"
+          });
+        }
+        if (
+          body.passwordRequireAccess !== undefined &&
+          typeof body.passwordRequireAccess !== "boolean"
+        ) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "passwordRequireAccess",
+            message: "expected_boolean"
+          });
+        }
+        if (
+          body.passwordRequireSubmit !== undefined &&
+          typeof body.passwordRequireSubmit !== "boolean"
+        ) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "passwordRequireSubmit",
+            message: "expected_boolean"
+          });
+        }
+        const roleFlagsProvided =
+          body.passwordRequireAccess !== undefined || body.passwordRequireSubmit !== undefined;
+        let passwordRequireAccess = Boolean(body.passwordRequireAccess);
+        let passwordRequireSubmit = Boolean(body.passwordRequireSubmit);
+        let passwordRequired = Boolean(body.passwordRequired);
+        if (!roleFlagsProvided && passwordRequired) {
+          passwordRequireSubmit = true;
+        }
+        if (roleFlagsProvided) {
+          passwordRequired = passwordRequireAccess || passwordRequireSubmit;
+        }
         let passwordSalt: string | null = null;
         let passwordHash: string | null = null;
         if (passwordRequired) {
@@ -8859,7 +9051,7 @@ export default {
             : null;
         const statements = [
           env.DB.prepare(
-            "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_salt, password_hash, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           ).bind(
             formId,
             body.slug.trim(),
@@ -8876,7 +9068,9 @@ export default {
             canvasFieldsPosition,
             availableFrom,
             availableUntil,
-            passwordRequired,
+            passwordRequired ? 1 : 0,
+            passwordRequireAccess ? 1 : 0,
+            passwordRequireSubmit ? 1 : 0,
             passwordSalt,
             passwordHash,
             authPayload?.userId ?? null
@@ -8913,7 +9107,9 @@ export default {
               canvas_fields_position: canvasFieldsPosition,
               available_from: availableFrom,
               available_until: availableUntil,
-              password_required: passwordRequired === 1
+              password_required: passwordRequired === true,
+              password_require_access: passwordRequireAccess,
+              password_require_submit: passwordRequireSubmit
             },
             warning: canvasWarning ? { code: canvasWarning } : null,
             requestId
@@ -8955,10 +9151,20 @@ export default {
             const params: Array<string | number | null> = [];
             let canvasWarning: string | null = null;
             const formRow = await env.DB.prepare(
-              "SELECT id, slug, password_required, password_salt, password_hash, available_from, available_until FROM forms WHERE slug=? AND deleted_at IS NULL"
+              "SELECT id, slug, password_required, password_require_access, password_require_submit, password_salt, password_hash, available_from, available_until FROM forms WHERE slug=? AND deleted_at IS NULL"
             )
               .bind(slug)
-              .first<{ id: string; slug: string; password_required: number; password_salt: string | null; password_hash: string | null; available_from: string | null; available_until: string | null }>();
+              .first<{
+                id: string;
+                slug: string;
+                password_required: number;
+                password_require_access: number | null;
+                password_require_submit: number | null;
+                password_salt: string | null;
+                password_hash: string | null;
+                available_from: string | null;
+                available_until: string | null;
+              }>();
             if (!formRow) {
               return errorResponse(404, "not_found", requestId, corsHeaders);
             }
@@ -9052,23 +9258,46 @@ export default {
             updates.push("available_until=?");
             params.push(nextAvailableUntil);
           }
-          if (body?.passwordRequired !== undefined) {
-            if (typeof body.passwordRequired !== "boolean") {
-              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-                field: "passwordRequired",
-                message: "expected_boolean"
-              });
-            }
-            if (!body.passwordRequired) {
-              updates.push("password_required=?");
-              params.push(0);
-              updates.push("password_salt=?");
-              params.push(null);
-              updates.push("password_hash=?");
-              params.push(null);
-            } else {
-              updates.push("password_required=?");
-              params.push(1);
+          if (body?.passwordRequired !== undefined && typeof body.passwordRequired !== "boolean") {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "passwordRequired",
+              message: "expected_boolean"
+            });
+          }
+          if (
+            body?.passwordRequireAccess !== undefined &&
+            typeof body.passwordRequireAccess !== "boolean"
+          ) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "passwordRequireAccess",
+              message: "expected_boolean"
+            });
+          }
+          if (
+            body?.passwordRequireSubmit !== undefined &&
+            typeof body.passwordRequireSubmit !== "boolean"
+          ) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "passwordRequireSubmit",
+              message: "expected_boolean"
+            });
+          }
+          const accessProvided = body?.passwordRequireAccess !== undefined;
+          const submitProvided = body?.passwordRequireSubmit !== undefined;
+          let nextRequireAccess = accessProvided
+            ? Boolean(body?.passwordRequireAccess)
+            : toBoolean(formRow.password_require_access ?? 0);
+          let nextRequireSubmit = submitProvided
+            ? Boolean(body?.passwordRequireSubmit)
+            : toBoolean(formRow.password_require_submit ?? 0);
+          const roleFlagsProvided = accessProvided || submitProvided;
+          let nextPasswordRequired = toBoolean(formRow.password_required ?? 0);
+          if (roleFlagsProvided) {
+            nextPasswordRequired = nextRequireAccess || nextRequireSubmit;
+          } else if (body?.passwordRequired !== undefined) {
+            nextPasswordRequired = Boolean(body.passwordRequired);
+            if (nextPasswordRequired && !nextRequireAccess && !nextRequireSubmit) {
+              nextRequireSubmit = true;
             }
           }
           if (body?.formPassword !== undefined) {
@@ -9080,8 +9309,24 @@ export default {
               params.push(salt);
               updates.push("password_hash=?");
               params.push(hash);
-              updates.push("password_required=?");
-              params.push(1);
+              nextPasswordRequired = true;
+              if (!nextRequireAccess && !nextRequireSubmit) {
+                nextRequireSubmit = true;
+              }
+            }
+          }
+          if (roleFlagsProvided || body?.passwordRequired !== undefined || body?.formPassword !== undefined) {
+            updates.push("password_required=?");
+            params.push(nextPasswordRequired ? 1 : 0);
+            updates.push("password_require_access=?");
+            params.push(nextRequireAccess ? 1 : 0);
+            updates.push("password_require_submit=?");
+            params.push(nextRequireSubmit ? 1 : 0);
+            if (!nextPasswordRequired) {
+              updates.push("password_salt=?");
+              params.push(null);
+              updates.push("password_hash=?");
+              params.push(null);
             }
           }
           if (body?.auth_policy) {
@@ -10118,7 +10363,7 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/api/forms") {
       const { results } = await env.DB.prepare(
-        "SELECT slug,title,description,is_locked,is_public,auth_policy,canvas_enabled,canvas_course_id,available_from,available_until,password_required FROM forms WHERE deleted_at IS NULL AND is_public=1 ORDER BY created_at DESC"
+        "SELECT slug,title,description,is_locked,is_public,auth_policy,canvas_enabled,canvas_course_id,available_from,available_until,password_required,password_require_access,password_require_submit FROM forms WHERE deleted_at IS NULL AND is_public=1 ORDER BY created_at DESC"
       ).all<FormListRow & { auth_policy: string; description: string | null }>();
 
       const data = results.map((row) => ({
@@ -10133,6 +10378,8 @@ export default {
         available_from: row.available_from ?? null,
         available_until: row.available_until ?? null,
         password_required: toBoolean(row.password_required ?? 0),
+        password_require_access: toBoolean(row.password_require_access ?? 0),
+        password_require_submit: toBoolean(row.password_require_submit ?? 0),
         is_open: getFormAvailability(row).open
       }));
 
@@ -10148,75 +10395,51 @@ export default {
         if (!row) {
           return errorResponse(404, "not_found", requestId, corsHeaders);
         }
-
-        let schema: unknown = null;
-        if (row.schema_json) {
-          try {
-            schema = JSON.parse(row.schema_json);
-          } catch (error) {
-            return errorResponse(500, "invalid_schema", requestId, corsHeaders);
-          }
+        const accessPassword =
+          url.searchParams.get("formPassword") || request.headers.get("x-form-password");
+        const accessCheck = await verifyFormPassword(row, accessPassword, "access");
+        if (!accessCheck.ok) {
+          return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
+            field: "formPassword",
+            message: accessCheck.message
+          });
         }
 
-        const fields = extractFields(schema);
-        const fileRules = buildEffectiveRules(row);
-        let allowedSectionIds: string[] | null = null;
-        if (row.canvas_allowed_section_ids_json) {
-          try {
-            const parsed = JSON.parse(row.canvas_allowed_section_ids_json);
-            if (Array.isArray(parsed)) {
-              allowedSectionIds = parsed.filter((id) => typeof id === "string");
-            }
-          } catch (error) {
-            allowedSectionIds = null;
-          }
+        const detail = await buildFormDetailPayload(env, row);
+        if ("error" in detail) {
+          return errorResponse(500, detail.error, requestId, corsHeaders);
         }
-        const canvasSections =
-          toBoolean(row.canvas_enabled) && row.canvas_course_id
-            ? await getCanvasAllowedSections(env, row.canvas_course_id, allowedSectionIds)
-            : [];
-        let canvasCourseName: string | null = null;
-        if (row.canvas_course_id) {
-          const courseRow = await env.DB.prepare(
-            "SELECT name FROM canvas_courses_cache WHERE id=?"
-          )
-            .bind(row.canvas_course_id)
-            .first<{ name?: string }>();
-          if (courseRow?.name) {
-            canvasCourseName = courseRow.name;
-          }
-        }
-        const data = {
-          slug: row.slug,
-          title: row.title,
-          description: row.description,
-          is_locked: toBoolean(row.is_locked),
-          is_public: toBoolean(row.is_public),
-          auth_policy: row.auth_policy,
-          templateKey: row.templateKey,
-          templateVersion: row.templateVersion,
-          formVersion: row.templateVersion,
-          available_from: row.available_from ?? null,
-          available_until: row.available_until ?? null,
-          password_required: toBoolean(row.password_required ?? 0),
-          is_open: getFormAvailability(row).open,
-          template_schema_json: row.schema_json,
-          file_rules_json: row.form_file_rules_json ?? row.template_file_rules_json ?? null,
-          fields,
-          file_rules: fileRules,
-          canvas_enabled: toBoolean(row.canvas_enabled),
-          canvas_course_id: row.canvas_course_id ?? null,
-          canvas_course_name: canvasCourseName,
-          canvas_allowed_sections: canvasSections,
-          canvas_fields_position: row.canvas_fields_position ?? "bottom"
-        };
-
-        return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
+        return jsonResponse(200, { data: detail.data, requestId }, requestId, corsHeaders);
       }
     }
 
     if (request.method === "POST") {
-      
+      const accessMatch = url.pathname.match(/^\/api\/forms\/([^/]+)\/access$/);
+      if (accessMatch) {
+        const slug = decodeURIComponent(accessMatch[1] || "");
+        let body: { formPassword?: string } | null = null;
+        try {
+          body = await parseJsonBody(request);
+        } catch (error) {
+          return errorResponse(400, "invalid_json", requestId, corsHeaders);
+        }
+        const row = await getFormWithRules(env, slug);
+        if (!row) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        const accessCheck = await verifyFormPassword(row, body?.formPassword, "access");
+        if (!accessCheck.ok) {
+          return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
+            field: "formPassword",
+            message: accessCheck.message
+          });
+        }
+        const detail = await buildFormDetailPayload(env, row);
+        if ("error" in detail) {
+          return errorResponse(500, detail.error, requestId, corsHeaders);
+        }
+        return jsonResponse(200, { data: detail.data, requestId }, requestId, corsHeaders);
+      }
 
       if (url.pathname === "/api/submissions/upload/init") {
         let body: {
@@ -10557,7 +10780,7 @@ export default {
             message: "fieldId and files are required"
           });
         }
-        const passwordCheck = await verifyFormPassword(formRow, formPassword);
+        const passwordCheck = await verifyFormPassword(formRow, formPassword, "submit");
         if (!passwordCheck.ok) {
           return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
             field: "formPassword",
@@ -12016,7 +12239,7 @@ export default {
         if (!authCheck.ok) {
           return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
         }
-        const passwordCheck = await verifyFormPassword(form, body?.formPassword);
+        const passwordCheck = await verifyFormPassword(form, body?.formPassword, "submit");
         if (!passwordCheck.ok) {
           return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
             field: "formPassword",
@@ -12239,7 +12462,7 @@ export default {
       if (!authCheck.ok) {
         return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
       }
-      const passwordCheck = await verifyFormPassword(formRow, body.formPassword);
+      const passwordCheck = await verifyFormPassword(formRow, body.formPassword, "submit");
       if (!passwordCheck.ok) {
         return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
           field: "formPassword",
@@ -12749,7 +12972,7 @@ export default {
       if (!authCheck.ok) {
         return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
       }
-      const passwordCheck = await verifyFormPassword(form, parsed?.formPassword);
+      const passwordCheck = await verifyFormPassword(form, parsed?.formPassword, "submit");
       if (!passwordCheck.ok) {
         return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
           field: "formPassword",

@@ -1,7 +1,9 @@
 import React, { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { HashRouter, Link, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
 import { APP_INFO } from "./config";
-import { apiFetch, clearToken, setToken } from "./auth";
+import { apiFetch, clearToken } from "./auth";
 import { IANA_TIMEZONES } from "./timezones";
 
 const LICENSE_URL = `${APP_INFO.repoUrl}/blob/master/LICENSE`;
@@ -28,6 +30,142 @@ const TIMEZONE_OPTIONS = [
   "Australia/Sydney"
 ];
 const ALL_TIMEZONES = Array.from(new Set([...IANA_TIMEZONES, ...TIMEZONE_OPTIONS]));
+
+function escapeHtml(input: string) {
+  return input
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+const RICH_ALLOWED_TAGS = [
+  "a",
+  "b",
+  "blockquote",
+  "br",
+  "code",
+  "del",
+  "div",
+  "em",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "hr",
+  "i",
+  "li",
+  "ol",
+  "p",
+  "pre",
+  "span",
+  "strong",
+  "sub",
+  "sup",
+  "table",
+  "tbody",
+  "td",
+  "th",
+  "thead",
+  "tr",
+  "u",
+  "ul"
+];
+const RICH_ALLOWED_ATTR = [
+  "href",
+  "title",
+  "target",
+  "rel",
+  "class",
+  "id",
+  "aria-label",
+  "aria-hidden",
+  "colspan",
+  "rowspan",
+  "align"
+];
+const RICH_FORBID_TAGS = ["style", "script", "iframe", "object", "embed", "svg", "math"];
+const RICH_URI_ALLOWLIST = /^(?:(?:https?|mailto):|\/|#)/i;
+
+function sanitizeRichHtml(input: string) {
+  return DOMPurify.sanitize(input, {
+    ALLOWED_TAGS: RICH_ALLOWED_TAGS,
+    ALLOWED_ATTR: RICH_ALLOWED_ATTR,
+    FORBID_TAGS: RICH_FORBID_TAGS,
+    ALLOW_DATA_ATTR: false,
+    ALLOWED_URI_REGEXP: RICH_URI_ALLOWLIST
+  });
+}
+
+function renderRichTextHtml(text: string, markdownEnabled: boolean, inline: boolean) {
+  if (!text) return "";
+  if (!markdownEnabled) {
+    const escaped = escapeHtml(text);
+    return inline ? escaped.replace(/\n/g, "<br />") : escaped.replace(/\n/g, "<br />");
+  }
+  marked.setOptions({ gfm: true, breaks: true, mangle: false, headerIds: false });
+  const html = inline ? marked.parseInline(text) : marked.parse(text);
+  return sanitizeRichHtml(String(html));
+}
+
+function useMathJax(enabled: boolean) {
+  useEffect(() => {
+    if (!enabled) return;
+    if ((window as any).MathJax) return;
+    const script = document.createElement("script");
+    script.src = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js";
+    script.async = true;
+    document.head.appendChild(script);
+  }, [enabled]);
+}
+
+function RichText({
+  text,
+  markdownEnabled,
+  mathjaxEnabled,
+  className,
+  inline = false
+}: {
+  text?: string | null;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
+  className?: string;
+  inline?: boolean;
+}) {
+  const ref = useRef<HTMLDivElement | HTMLSpanElement | null>(null);
+  const html = useMemo(
+    () => renderRichTextHtml(text ? String(text) : "", markdownEnabled, inline),
+    [text, markdownEnabled, inline]
+  );
+
+  useEffect(() => {
+    if (!mathjaxEnabled || !ref.current) return;
+    const mathjax = (window as any).MathJax;
+    if (mathjax?.typesetPromise) {
+      mathjax.typesetPromise([ref.current]).catch(() => null);
+    }
+  }, [html, mathjaxEnabled]);
+
+  if (inline) {
+    return (
+      <span
+        ref={ref as React.RefObject<HTMLSpanElement>}
+        className={className}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    );
+  }
+  return (
+    <div
+      ref={ref as React.RefObject<HTMLDivElement>}
+      className={className}
+      dangerouslySetInnerHTML={{ __html: html }}
+    />
+  );
+}
 
 function TimezoneSelect({
   value,
@@ -208,6 +346,8 @@ type FormSummary = {
   available_from?: string | null;
   available_until?: string | null;
   password_required?: boolean;
+  password_require_access?: boolean;
+  password_require_submit?: boolean;
   is_open?: boolean;
 };
 
@@ -232,6 +372,8 @@ type FormDetail = {
   available_from?: string | null;
   available_until?: string | null;
   password_required?: boolean;
+  password_require_access?: boolean;
+  password_require_submit?: boolean;
   is_open?: boolean;
   canvas_enabled?: boolean;
   canvas_course_id?: string | null;
@@ -988,6 +1130,8 @@ function FieldBuilderPanel({
   builderDateTimezone,
   builderDateMode,
   builderDateShowTimezone,
+  markdownEnabled,
+  mathjaxEnabled,
   onTypeChange,
   onCustomTypeChange,
   onIdChange,
@@ -1023,6 +1167,8 @@ function FieldBuilderPanel({
   builderDateTimezone: string;
   builderDateMode: string;
   builderDateShowTimezone: boolean;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
   onTypeChange: (value: string) => void;
   onCustomTypeChange: (value: string) => void;
   onIdChange: (value: string) => void;
@@ -1075,6 +1221,17 @@ function FieldBuilderPanel({
         <div className="col-md-3">
           <label className="form-label">Label</label>
           <input className="form-control" value={builderLabel} onChange={(event) => onLabelChange(event.target.value)} />
+          {builderLabel ? (
+            <div className="mt-2">
+              <div className="muted">Preview</div>
+              <RichText
+                text={builderLabel}
+                markdownEnabled={markdownEnabled}
+                mathjaxEnabled={mathjaxEnabled}
+                inline
+              />
+            </div>
+          ) : null}
         </div>
         <div className="col-md-3">
           <label className="form-label">Required</label>
@@ -1109,6 +1266,16 @@ function FieldBuilderPanel({
               value={builderPlaceholder}
               onChange={(event) => onPlaceholderChange(event.target.value)}
             />
+            {builderPlaceholder ? (
+              <div className="mt-2">
+                <div className="muted">Preview</div>
+                <RichText
+                  text={builderPlaceholder}
+                  markdownEnabled={markdownEnabled}
+                  mathjaxEnabled={mathjaxEnabled}
+                />
+              </div>
+            ) : null}
           </div>
         ) : null}
         {builderType === "email" ? (
@@ -1694,12 +1861,16 @@ function HomePage({
   forms,
   loading,
   error,
-  user
+  user,
+  markdownEnabled,
+  mathjaxEnabled
 }: {
   forms: FormSummary[];
   loading: boolean;
   error: ApiError | null;
   user: UserInfo | null;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
 }) {
   const formsBase = useMemo(() => {
     const base = PUBLIC_BASE.endsWith("/") ? PUBLIC_BASE : `${PUBLIC_BASE}/`;
@@ -1740,9 +1911,23 @@ function HomePage({
             {forms.map((form) => (
               <li key={form.slug} className="form-card">
                 <div>
-                  <h3>{form.title}</h3>
+                  <h3 className="mb-1">
+                    <RichText
+                      text={form.title}
+                      markdownEnabled={markdownEnabled}
+                      mathjaxEnabled={mathjaxEnabled}
+                      inline
+                    />
+                  </h3>
                   {form.description ? (
-                    <p className="muted mb-2">{form.description}</p>
+                    <p className="muted mb-2">
+                      <RichText
+                        text={form.description}
+                        markdownEnabled={markdownEnabled}
+                        mathjaxEnabled={mathjaxEnabled}
+                        inline
+                      />
+                    </p>
                   ) : null}
                   <p className="muted mb-2">Slug: {form.slug}</p>
                   <div className="d-flex gap-2 flex-wrap">
@@ -1810,6 +1995,10 @@ function HomePage({
               <i className="bi bi-book me-2" aria-hidden="true" />
               <strong>Docs:</strong> <a href={docsUrl}>/forms/docs</a>
             </li>
+            <li>
+              <i className="bi bi-stars me-2" aria-hidden="true" />
+              <strong>Assistants:</strong> GitHub Copilot, ChatGPT Codex
+            </li>
           </ul>
         </div>
         <AuthStatus user={user} />
@@ -1832,7 +2021,6 @@ function AuthCallback({
     const queryParams = url.searchParams;
     const token = hashParams.get("token") || queryParams.get("token");
     if (token) {
-      setToken(token);
       onNotice("Logged in successfully.", "success");
     }
     const returnTo = queryParams.get("return_to") || localStorage.getItem(RETURN_TO_KEY);
@@ -1855,12 +2043,16 @@ function FormPage({
   slug,
   user,
   onLogin,
-  onNotice
+  onNotice,
+  markdownEnabled,
+  mathjaxEnabled
 }: {
   slug: string;
   user: UserInfo | null;
   onLogin: (provider: "google" | "github") => void;
   onNotice: (message: string, type?: NoticeType) => void;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
 }) {
   const [form, setForm] = useState<FormDetail | null>(null);
   const [values, setValues] = useState<Record<string, string>>({});
@@ -1883,8 +2075,13 @@ function FormPage({
   const [submissionId, setSubmissionId] = useState<string | null>(null);
   const [hasExistingSubmission, setHasExistingSubmission] = useState(false);
   const [fileItems, setFileItems] = useState<FileItem[]>([]);
+  const [accessRequired, setAccessRequired] = useState(false);
+  const [accessError, setAccessError] = useState<string | null>(null);
+  const [accessing, setAccessing] = useState(false);
   const navigate = useNavigate();
   const draftKey = useMemo(() => `form-draft:${slug}`, [slug]);
+  const accessCacheKey = useMemo(() => `form-access:${slug}`, [slug]);
+  const ACCESS_CACHE_TTL_MS = 30 * 60 * 1000;
   const [draftPreview, setDraftPreview] = useState<{ values: Record<string, string>; updatedAt: string } | null>(
     null
   );
@@ -2073,6 +2270,59 @@ function FormPage({
       }
 
       if (!response.ok) {
+        if (
+          response.status === 403 &&
+          payload?.error === "invalid_payload" &&
+          payload?.detail?.field === "formPassword"
+        ) {
+          let cachedPassword = "";
+          try {
+            const cachedRaw = localStorage.getItem(accessCacheKey);
+            if (cachedRaw) {
+              const cached = JSON.parse(cachedRaw) as { password?: string; expiresAt?: number };
+              if (cached?.password && cached?.expiresAt && cached.expiresAt > Date.now()) {
+                cachedPassword = String(cached.password);
+              } else {
+                localStorage.removeItem(accessCacheKey);
+              }
+            }
+          } catch {
+            // ignore cache read failures
+          }
+          if (cachedPassword) {
+            const accessResponse = await apiFetch(
+              `${API_BASE}/api/forms/${encodeURIComponent(slug)}/access`,
+              {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ formPassword: cachedPassword })
+              }
+            );
+            const accessPayload = await accessResponse.json().catch(() => null);
+            if (!active) return;
+            if (accessResponse.ok) {
+              setForm(accessPayload?.data || null);
+              setAccessRequired(false);
+              setAccessError(null);
+              setFormPassword(cachedPassword);
+              setLocked(
+                Boolean(accessPayload?.data?.is_locked) || accessPayload?.data?.is_open === false
+              );
+              setLoading(false);
+              return;
+            }
+            try {
+              localStorage.removeItem(accessCacheKey);
+            } catch {
+              // ignore cache removal failures
+            }
+          }
+          if (!active) return;
+          setAccessRequired(true);
+          setAccessError("Form password is required to access this form.");
+          setLoading(false);
+          return;
+        }
         if (!active) return;
         setLoadError({
           status: response.status,
@@ -2086,6 +2336,8 @@ function FormPage({
       const data = payload?.data;
       if (!active) return;
       setForm(data);
+      setAccessRequired(false);
+      setAccessError(null);
       setLocked(Boolean(data?.is_locked) || data?.is_open === false);
       setLoading(false);
     }
@@ -2288,8 +2540,13 @@ function FormPage({
     () => parseFileRules(form?.file_rules_json ?? null),
     [form?.file_rules_json]
   );
-  const requiresPassword = Boolean(form?.password_required);
-  const hasPassword = !requiresPassword || formPassword.trim().length > 0;
+  const requiresAccessPassword = Boolean(form?.password_require_access);
+  const requiresSubmitPassword =
+    Boolean(form?.password_require_submit) ||
+    (!form?.password_require_access &&
+      !form?.password_require_submit &&
+      Boolean(form?.password_required));
+  const hasPassword = !requiresSubmitPassword || formPassword.trim().length > 0;
   const isOpen = form?.is_open !== false;
   const existingFilesByField = useMemo(() => {
     const map: Record<string, FileItem[]> = {};
@@ -2343,7 +2600,7 @@ function FormPage({
       <div className="field-value">{canvasCourseTitle}</div>
     </div>
   ) : null;
-  const passwordField = requiresPassword ? (
+  const passwordField = requiresSubmitPassword ? (
     <label key="form-password" className="field">
       <span>Form password *</span>
       <input
@@ -2391,6 +2648,20 @@ function FormPage({
   const canvasNodes = [canvasCourseField, canvasSectionField, passwordField].filter(
     Boolean
   ) as React.ReactNode[];
+  const renderFieldLabel = (field: FormField) => {
+    const labelText = String(field.label || field.id || "");
+    return (
+      <span className="field-label">
+        <RichText
+          text={labelText}
+          markdownEnabled={markdownEnabled}
+          mathjaxEnabled={mathjaxEnabled}
+          inline
+        />
+        {field.required ? " *" : ""}
+      </span>
+    );
+  };
   const fieldNodes = (form?.fields || []).map((field) => {
     if (field.type === "file") {
       const rules = getFieldRule(fileRules, field.id);
@@ -2404,10 +2675,7 @@ function FormPage({
       });
       return (
         <label key={field.id} className="field">
-          <span>
-            {field.label}
-            {field.required ? " *" : ""}
-          </span>
+          {renderFieldLabel(field)}
           <input
             type="file"
             multiple={Boolean(rules.maxFiles ? rules.maxFiles > 1 : true)}
@@ -2433,7 +2701,7 @@ function FormPage({
                 !canSubmit ||
                 isFieldUploading ||
                 files.length === 0 ||
-                (requiresPassword && !formPassword.trim())
+                (requiresSubmitPassword && !formPassword.trim())
               }
               onClick={() => handleUploadField(field.id)}
             >
@@ -2583,10 +2851,7 @@ function FormPage({
       const domain = field.type === "email" ? getEmailDomain(field) : "";
       return (
         <label key={field.id} className="field">
-          <span>
-            {field.label}
-            {field.required ? " *" : ""}
-          </span>
+          {renderFieldLabel(field)}
           <input
             type="text"
             className="form-control"
@@ -2621,10 +2886,7 @@ function FormPage({
           : field.label;
       return (
         <label key={field.id} className="field">
-          <span>
-            {field.label}
-            {field.required ? " *" : ""}
-          </span>
+          {renderFieldLabel(field)}
           <input
             type="text"
             className="form-control"
@@ -2644,10 +2906,7 @@ function FormPage({
           : field.label;
       return (
         <label key={field.id} className="field">
-          <span>
-            {field.label}
-            {field.required ? " *" : ""}
-          </span>
+          {renderFieldLabel(field)}
           <textarea
             className="form-control"
             value={values[field.id] || ""}
@@ -2666,10 +2925,7 @@ function FormPage({
           : field.label;
       return (
         <label key={field.id} className="field">
-          <span>
-            {field.label}
-            {field.required ? " *" : ""}
-          </span>
+          {renderFieldLabel(field)}
           <input
             type="url"
             className="form-control"
@@ -2708,10 +2964,7 @@ function FormPage({
           : field.label;
       return (
         <label key={field.id} className="field">
-          <span>
-            {field.label}
-            {field.required ? " *" : ""}
-          </span>
+          {renderFieldLabel(field)}
           <input
             type={inputType}
             className="form-control"
@@ -2743,10 +2996,7 @@ function FormPage({
           : field.label;
       return (
         <label key={field.id} className="field">
-          <span>
-            {field.label}
-            {field.required ? " *" : ""}
-          </span>
+          {renderFieldLabel(field)}
           <input
             type="number"
             className="form-control"
@@ -2763,10 +3013,7 @@ function FormPage({
       const options = Array.isArray((field as any).options) ? (field as any).options : [];
       return (
         <label key={field.id} className="field">
-          <span>
-            {field.label}
-            {field.required ? " *" : ""}
-          </span>
+          {renderFieldLabel(field)}
           <select
             className="form-select"
             value={values[field.id] || ""}
@@ -2789,10 +3036,7 @@ function FormPage({
       const isMultiple = Boolean((field as any).multiple);
       return (
         <label key={field.id} className="field">
-          <span>
-            {field.label}
-            {field.required ? " *" : ""}
-          </span>
+          {renderFieldLabel(field)}
           <div className="checkbox-group">
             {options.map((option: string) => {
               const value = values[field.id] || "";
@@ -2835,10 +3079,7 @@ function FormPage({
         : field.label;
     return (
       <label key={field.id} className="field">
-        <span>
-          {field.label}
-          {field.required ? " *" : ""}
-        </span>
+        {renderFieldLabel(field)}
         <input
           type="text"
           className="form-control"
@@ -2971,7 +3212,7 @@ function FormPage({
     existingCountOverride?: number
   ) {
     if (!form) return;
-    if (requiresPassword && !formPassword.trim()) {
+    if (requiresSubmitPassword && !formPassword.trim()) {
       setUploadError("Enter the form password before uploading files.");
       return false;
     }
@@ -3182,6 +3423,42 @@ function FormPage({
     }
   }
 
+  async function handleAccess(event: React.FormEvent) {
+    event.preventDefault();
+    if (!formPassword.trim()) {
+      setAccessError("Enter the form password to continue.");
+      return;
+    }
+    setAccessing(true);
+    setAccessError(null);
+    const response = await apiFetch(`${API_BASE}/api/forms/${encodeURIComponent(slug)}/access`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ formPassword: formPassword.trim() })
+    });
+    const payload = await response.json().catch(() => null);
+    setAccessing(false);
+    if (!response.ok) {
+      setAccessError(payload?.error || "Invalid form password.");
+      return;
+    }
+    try {
+      localStorage.setItem(
+        accessCacheKey,
+        JSON.stringify({
+          password: formPassword.trim(),
+          expiresAt: Date.now() + ACCESS_CACHE_TTL_MS
+        })
+      );
+    } catch {
+      // ignore cache write failures
+    }
+    setForm(payload?.data || null);
+    setAccessRequired(false);
+    setAccessError(null);
+    setLocked(Boolean(payload?.data?.is_locked) || payload?.data?.is_open === false);
+  }
+
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
@@ -3296,7 +3573,7 @@ function FormPage({
         errors._canvas_section_id = "Please select a section";
       }
     }
-    if (requiresPassword && !formPassword.trim()) {
+    if (requiresSubmitPassword && !formPassword.trim()) {
       errors.formPassword = "Required";
     }
 
@@ -3410,6 +3687,30 @@ function FormPage({
     );
   }
 
+  if (accessRequired && !form) {
+    return (
+      <section className="panel">
+        <h2>Form password required</h2>
+        <form className="form-grid" onSubmit={handleAccess}>
+          <label className="field">
+            <span>Form password *</span>
+            <input
+              type="password"
+              value={formPassword}
+              disabled={accessing}
+              onChange={(event) => setFormPassword(event.target.value)}
+              placeholder="Enter form password to continue"
+            />
+            {accessError ? <span className="field-error">{accessError}</span> : null}
+          </label>
+          <button type="submit" className="btn btn-primary" disabled={accessing}>
+            <i className="bi bi-unlock" aria-hidden="true" /> {accessing ? "Checking..." : "Unlock form"}
+          </button>
+        </form>
+      </section>
+    );
+  }
+
   if (!form) {
     return (
       <section className="panel">
@@ -3422,8 +3723,30 @@ function FormPage({
     <section className="panel">
       <div className="panel-header">
         <div>
-          <h2>{form.title}</h2>
-          {form.description ? <p className="muted">{form.description}</p> : null}
+          <h2 className="mb-1">
+            <RichText
+              text={form.title}
+              markdownEnabled={markdownEnabled}
+              mathjaxEnabled={mathjaxEnabled}
+              inline
+            />
+          </h2>
+          {form.description ? (
+            <p className="muted mb-1">
+              <RichText
+                text={form.description}
+                markdownEnabled={markdownEnabled}
+                mathjaxEnabled={mathjaxEnabled}
+                inline
+              />
+            </p>
+          ) : null}
+          {(markdownEnabled || mathjaxEnabled) ? (
+            <div className="field-help mt-2">
+              <i className="bi bi-markdown" aria-hidden="true" /> Markdown
+              {mathjaxEnabled ? " + MathJax" : ""} and HTML input are supported.
+            </div>
+          ) : null}
         </div>
         <div className="status-tags">
           <span className={`badge ${form.is_locked ? "text-bg-danger" : "text-bg-success"}`}>
@@ -3471,6 +3794,28 @@ function FormPage({
         <div className="panel panel--inline">
           <div className="muted">Debug response</div>
           <pre className="mb-0">{submitDebug}</pre>
+        </div>
+      ) : null}
+
+      {accessRequired ? (
+        <div className="panel panel--inline panel--warning">
+          <form className="form-grid" onSubmit={handleAccess}>
+            <label className="field">
+              <span>Form password *</span>
+              <input
+                type="password"
+                value={formPassword}
+                disabled={accessing}
+                onChange={(event) => setFormPassword(event.target.value)}
+                placeholder="Enter form password to continue"
+              />
+              {accessError ? <span className="field-error">{accessError}</span> : null}
+            </label>
+            <button type="submit" className="btn btn-primary" disabled={accessing}>
+              <i className="bi bi-unlock" aria-hidden="true" />{" "}
+              {accessing ? "Checking..." : "Unlock form"}
+            </button>
+          </form>
         </div>
       ) : null}
 
@@ -3552,15 +3897,28 @@ function FormPage({
 function FormRoute({
   user,
   onLogin,
-  onNotice
+  onNotice,
+  markdownEnabled,
+  mathjaxEnabled
 }: {
   user: UserInfo | null;
   onLogin: (provider: "google" | "github") => void;
   onNotice: (message: string, type?: NoticeType) => void;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
 }) {
   const params = useParams();
   const slug = params.slug || "";
-  return <FormPage slug={slug} user={user} onLogin={onLogin} onNotice={onNotice} />;
+  return (
+    <FormPage
+      slug={slug}
+      user={user}
+      onLogin={onLogin}
+      onNotice={onNotice}
+      markdownEnabled={markdownEnabled}
+      mathjaxEnabled={mathjaxEnabled}
+    />
+  );
 }
 
 function DocsPage() {
@@ -3569,6 +3927,9 @@ function DocsPage() {
       <h2>Docs</h2>
       <p className="muted">
         This guide explains how Form App is structured and how to use the main features.
+      </p>
+      <p className="muted">
+        Note: This codebase was built with the assistance of GitHub Copilot and ChatGPT Codex.
       </p>
 
       <div className="panel panel--compact">
@@ -3634,6 +3995,10 @@ function DocsPage() {
             <strong>Emails:</strong> admin email log, trash, and test send with preset templates.
           </li>
           <li>
+            <strong>Rich text:</strong> Markdown + MathJax + HTML supported in titles,
+            descriptions, labels, and text values when enabled in Admin App settings.
+          </li>
+          <li>
             <strong>Admin dashboard:</strong> list forms/templates/submissions/users with bulk
             move-to-trash actions.
           </li>
@@ -3695,6 +4060,10 @@ function DocsPage() {
           </li>
           <li>
             <strong>Default timezone:</strong> admins can set a global default timezone (Admin App settings). Times are displayed in the viewer's local timezone.
+          </li>
+          <li>
+            <strong>Markdown + MathJax:</strong> enabled/disabled globally in Admin App settings.
+            When enabled, form titles, descriptions, labels, and text values render rich content.
           </li>
           <li>
             <strong>Canvas sync scope:</strong> admins can choose to sync active, concluded, or all Canvas courses (Admin Canvas page). This controls which courses appear in builders and Canvas tools.
@@ -3935,14 +4304,18 @@ function NotFoundPage() {
 }
 
 function DashboardPage({
-  user,
-  onLogin,
-  onNotice
-}: {
-  user: UserInfo | null;
-  onLogin: (provider: "google" | "github") => void;
-  onNotice: (message: string, type?: NoticeType) => void;
-}) {
+    user,
+    onLogin,
+    onNotice,
+    markdownEnabled,
+    mathjaxEnabled
+  }: {
+    user: UserInfo | null;
+    onLogin: (provider: "google" | "github") => void;
+    onNotice: (message: string, type?: NoticeType) => void;
+    markdownEnabled: boolean;
+    mathjaxEnabled: boolean;
+  }) {
   const [loading, setLoading] = useState(true);
   const [items, setItems] = useState<any[]>([]);
   const [error, setError] = useState<ApiError | null>(null);
@@ -4075,9 +4448,15 @@ function DashboardPage({
                 return (
                   <tr key={latest.id || slug}>
                     <td>
-                      <a className="text-decoration-none" href={`${PUBLIC_BASE}#/f/${slug}`}>
-                        <i className="bi bi-ui-checks" aria-hidden="true" /> {form.title || slug}
-                      </a>
+                        <a className="text-decoration-none" href={`${PUBLIC_BASE}#/f/${slug}`}>
+                          <i className="bi bi-ui-checks" aria-hidden="true" />{" "}
+                          <RichText
+                            text={form.title || slug}
+                            markdownEnabled={markdownEnabled}
+                            mathjaxEnabled={mathjaxEnabled}
+                            inline
+                          />
+                        </a>
                       <div className="muted">{slug}</div>
                       {form.deleted_at ? <div className="muted">Deleted</div> : null}
                     </td>
@@ -4359,10 +4738,14 @@ function AccountPage({
 
 function CanvasPage({
   user,
-  onLogin
+  onLogin,
+  markdownEnabled,
+  mathjaxEnabled
 }: {
   user: UserInfo | null;
   onLogin: (provider: "google" | "github") => void;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
 }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<ApiError | null>(null);
@@ -4513,7 +4896,14 @@ function CanvasPage({
             {canvasInfo?.enrolled_at ? (
               <div className="col-md-6">
                 <div className="muted">
-                  Registered via form {canvasInfo.form_title || "submission"} at
+                  Registered via form{" "}
+                  <RichText
+                    text={canvasInfo.form_title || "submission"}
+                    markdownEnabled={markdownEnabled}
+                    mathjaxEnabled={mathjaxEnabled}
+                    inline
+                  />{" "}
+                  at
                 </div>
                 <div className="d-flex flex-wrap gap-2 align-items-center">
                   <span>{formatTimeICT(canvasInfo.enrolled_at)}</span>
@@ -4537,11 +4927,15 @@ function CanvasPage({
 function SubmissionDetailPage({
   user,
   onLogin,
-  onNotice
+  onNotice,
+  markdownEnabled,
+  mathjaxEnabled
 }: {
   user: UserInfo | null;
   onLogin: (provider: "google" | "github") => void;
   onNotice: (message: string, type?: NoticeType) => void;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
 }) {
   const { id } = useParams();
   const location = useLocation();
@@ -4555,6 +4949,17 @@ function SubmissionDetailPage({
   const [fieldOrder, setFieldOrder] = useState<string[]>([]);
   const [showSubmitNotice, setShowSubmitNotice] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const renderLabel = (label: string) => (
+    <RichText
+      text={label}
+      markdownEnabled={markdownEnabled}
+      mathjaxEnabled={mathjaxEnabled}
+      inline
+    />
+  );
+  const renderValue = (value: string) => (
+    <RichText text={value} markdownEnabled={markdownEnabled} mathjaxEnabled={mathjaxEnabled} />
+  );
 
   useEffect(() => {
     if (!user || !id) {
@@ -4852,9 +5257,9 @@ function SubmissionDetailPage({
                           : raw;
                         return (
                           <tr key={key}>
-                            <th className="text-nowrap">{meta?.label || key}</th>
+                            <th className="text-nowrap">{renderLabel(meta?.label || key)}</th>
                             <td className="text-break">
-                              <div>{displayValue || "n/a"}</div>
+                              <div>{renderValue(displayValue || "n/a")}</div>
                               {showTimezone && tzValue ? (
                                 <div className="muted">Timezone: {tzValue}</div>
                               ) : null}
@@ -4864,11 +5269,13 @@ function SubmissionDetailPage({
                       }
                       return (
                         <tr key={key}>
-                          <th className="text-nowrap">{meta?.label || key}</th>
+                          <th className="text-nowrap">{renderLabel(meta?.label || key)}</th>
                           <td className="text-break">
-                            {typeof raw === "string" || typeof raw === "number" || typeof raw === "boolean"
-                              ? String(raw)
-                              : JSON.stringify(raw)}
+                            {typeof raw === "string"
+                              ? renderValue(raw)
+                              : typeof raw === "number" || typeof raw === "boolean"
+                                ? String(raw)
+                                : JSON.stringify(raw)}
                           </td>
                         </tr>
                       );
@@ -4897,7 +5304,7 @@ function SubmissionDetailPage({
                   <tbody>
                     {data.files.map((file: any) => (
                       <tr key={file.id}>
-                        <td>{fieldMeta[file.field_id]?.label || file.field_id}</td>
+                        <td>{renderLabel(fieldMeta[file.field_id]?.label || file.field_id)}</td>
                         <td className="text-break">{file.original_name}</td>
                         <td>{typeof file.size_bytes === "number" ? formatSize(file.size_bytes) : "n/a"}</td>
                         <td>
@@ -4953,13 +5360,17 @@ function AdminCanvasPage({
   onLogin,
   onNotice,
   appDefaultTimezone,
-  onUpdateDefaultTimezone
+  onUpdateDefaultTimezone,
+  markdownEnabled,
+  mathjaxEnabled
 }: {
   user: UserInfo | null;
   onLogin: (p: "google" | "github") => void;
   onNotice: (message: string, type?: NoticeType) => void;
   appDefaultTimezone: string;
   onUpdateDefaultTimezone: (tz: string) => Promise<boolean>;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
 }) {
   const [status, setStatus] = useState<"loading" | "ok" | "forbidden">("loading");
   const [courses, setCourses] = useState<any[]>([]);
@@ -4971,8 +5382,6 @@ function AdminCanvasPage({
   const [templates, setTemplates] = useState<any[]>([]);
   const [users, setUsers] = useState<any[]>([]);
   const [uploads, setUploads] = useState<any[]>([]);
-  const [submissions, setSubmissions] = useState<any[]>([]);
-  const [submissionsError, setSubmissionsError] = useState<string | null>(null);
   const [routines, setRoutines] = useState<any[]>([]);
   const [healthSummary, setHealthSummary] = useState<any[]>([]);
   const [healthHistory, setHealthHistory] = useState<any[]>([]);
@@ -5349,29 +5758,15 @@ function AdminCanvasPage({
             <select
               className="form-select"
               value={canvasSyncMode}
-              onChange={(event) =>
-                setCanvasSyncMode(event.target.value as "active" | "concluded" | "all")
-              }
-            >
-              <option value="active">Active courses only</option>
-              <option value="concluded">Concluded courses only</option>
-              <option value="all">Active + concluded</option>
-            </select>
-            <div className="muted mt-1">
-              Controls which Canvas courses are synced, searchable, and available in builders.
-            </div>
-          </div>
-          <div className="col-md-3">
-            <button
-              type="button"
-              className="btn btn-outline-primary"
               disabled={canvasSyncSaving}
-              onClick={async () => {
+              onChange={async (event) => {
+                const next = event.target.value as "active" | "concluded" | "all";
+                setCanvasSyncMode(next);
                 setCanvasSyncSaving(true);
                 const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
                   method: "PATCH",
                   headers: { "content-type": "application/json" },
-                  body: JSON.stringify({ canvasCourseSyncMode: canvasSyncMode })
+                  body: JSON.stringify({ canvasCourseSyncMode: next })
                 });
                 const payload = await response.json().catch(() => null);
                 setCanvasSyncSaving(false);
@@ -5385,8 +5780,13 @@ function AdminCanvasPage({
                 onNotice("Canvas sync scope updated.", "success");
               }}
             >
-              <i className="bi bi-save" aria-hidden="true" /> Save
-            </button>
+              <option value="active">Active courses only</option>
+              <option value="concluded">Concluded courses only</option>
+              <option value="all">Active + concluded</option>
+            </select>
+            <div className="muted mt-1">
+              Controls which Canvas courses are synced, searchable, and available in builders.
+            </div>
           </div>
         </div>
       </div>
@@ -5449,7 +5849,14 @@ function AdminCanvasPage({
                     retryQueue.map((item: any) => (
                       <tr key={item.id}>
                         <td className="text-break">
-                          <div>{item.form_title || item.form_slug || "Submission"}</div>
+                          <div>
+                            <RichText
+                              text={item.form_title || item.form_slug || "Submission"}
+                              markdownEnabled={markdownEnabled}
+                              mathjaxEnabled={mathjaxEnabled}
+                              inline
+                            />
+                          </div>
                           <div className="muted">{item.submission_id}</div>
                         </td>
                         <td>{item.submitter_email || "n/a"}</td>
@@ -5504,7 +5911,14 @@ function AdminCanvasPage({
                     deadletters.map((item: any) => (
                       <tr key={item.id}>
                         <td className="text-break">
-                          <div>{item.form_title || item.form_slug || "Submission"}</div>
+                          <div>
+                            <RichText
+                              text={item.form_title || item.form_slug || "Submission"}
+                              markdownEnabled={markdownEnabled}
+                              mathjaxEnabled={mathjaxEnabled}
+                              inline
+                            />
+                          </div>
                           <div className="muted">{item.submission_id}</div>
                         </td>
                         <td>{item.submitter_email || "n/a"}</td>
@@ -5857,15 +6271,36 @@ function AdminCanvasPage({
                           </span>
                         </td>
                         <td>{reg.section_name || reg.section_id || "n/a"}</td>
-                        <td>{reg.form_title || "n/a"}</td>
+                        <td>
+                          {reg.form_title ? (
+                            <RichText
+                              text={reg.form_title}
+                              markdownEnabled={markdownEnabled}
+                              mathjaxEnabled={mathjaxEnabled}
+                              inline
+                            />
+                          ) : (
+                            "n/a"
+                          )}
+                        </td>
                         <td>
                           {reg.submission_deleted ? (
                             <span title={reg.submission_id}>
-                              {reg.form_title || reg.form_slug || "Submission"}
+                              <RichText
+                                text={reg.form_title || reg.form_slug || "Submission"}
+                                markdownEnabled={markdownEnabled}
+                                mathjaxEnabled={mathjaxEnabled}
+                                inline
+                              />
                             </span>
                           ) : (
                             <Link to={`/me/submissions/${reg.submission_id}`} title={reg.submission_id}>
-                              {reg.form_title || reg.form_slug || "Submission"}
+                              <RichText
+                                text={reg.form_title || reg.form_slug || "Submission"}
+                                markdownEnabled={markdownEnabled}
+                                mathjaxEnabled={mathjaxEnabled}
+                                inline
+                              />
                             </Link>
                           )}
                           {reg.form_title ? (
@@ -6006,7 +6441,11 @@ function AdminPage({
   appDefaultTimezone,
   onUpdateDefaultTimezone,
   appCanvasDeleteSyncEnabled,
-  onUpdateCanvasDeleteSyncEnabled
+  onUpdateCanvasDeleteSyncEnabled,
+  appMarkdownEnabled,
+  appMathjaxEnabled,
+  onUpdateMarkdownEnabled,
+  onUpdateMathjaxEnabled
 }: {
   user: UserInfo | null;
   onLogin: (p: "google" | "github") => void;
@@ -6015,6 +6454,10 @@ function AdminPage({
   onUpdateDefaultTimezone: (tz: string) => Promise<boolean>;
   appCanvasDeleteSyncEnabled: boolean;
   onUpdateCanvasDeleteSyncEnabled: (enabled: boolean) => Promise<boolean>;
+  appMarkdownEnabled: boolean;
+  appMathjaxEnabled: boolean;
+  onUpdateMarkdownEnabled: (enabled: boolean) => Promise<boolean>;
+  onUpdateMathjaxEnabled: (enabled: boolean) => Promise<boolean>;
 }) {
   const [status, setStatus] = useState<"loading" | "ok" | "forbidden">("loading");
   const [error, setError] = useState<string | null>(null);
@@ -6035,6 +6478,8 @@ function AdminPage({
   const [settingsCanvasDeleteSync, setSettingsCanvasDeleteSync] = useState(
     appCanvasDeleteSyncEnabled
   );
+  const [settingsMarkdownEnabled, setSettingsMarkdownEnabled] = useState(appMarkdownEnabled);
+  const [settingsMathjaxEnabled, setSettingsMathjaxEnabled] = useState(appMathjaxEnabled);
   const [routineEdits, setRoutineEdits] = useState<Record<string, { cron: string; enabled: boolean }>>(
     {}
   );
@@ -6128,6 +6573,44 @@ function AdminPage({
   useEffect(() => {
     setSettingsCanvasDeleteSync(appCanvasDeleteSyncEnabled);
   }, [appCanvasDeleteSyncEnabled]);
+
+  useEffect(() => {
+    setSettingsMarkdownEnabled(appMarkdownEnabled);
+  }, [appMarkdownEnabled]);
+
+  useEffect(() => {
+    setSettingsMathjaxEnabled(appMathjaxEnabled);
+  }, [appMathjaxEnabled]);
+
+  async function handleTimezoneChange(next: string) {
+    setSettingsTimezone(next);
+    const ok = await onUpdateDefaultTimezone(next);
+    const message = ok ? "Default timezone updated." : "Failed to update timezone.";
+    onNotice(message, ok ? "success" : "error");
+  }
+
+  async function handleCanvasDeleteSyncChange(next: boolean) {
+    setSettingsCanvasDeleteSync(next);
+    const ok = await onUpdateCanvasDeleteSyncEnabled(next);
+    const message = ok
+      ? "Canvas delete/restore sync updated."
+      : "Failed to update Canvas delete/restore sync.";
+    onNotice(message, ok ? "success" : "error");
+  }
+
+  async function handleMarkdownToggle(next: boolean) {
+    setSettingsMarkdownEnabled(next);
+    const ok = await onUpdateMarkdownEnabled(next);
+    const message = ok ? "Markdown rendering updated." : "Failed to update Markdown setting.";
+    onNotice(message, ok ? "success" : "error");
+  }
+
+  async function handleMathjaxToggle(next: boolean) {
+    setSettingsMathjaxEnabled(next);
+    const ok = await onUpdateMathjaxEnabled(next);
+    const message = ok ? "MathJax rendering updated." : "Failed to update MathJax setting.";
+    onNotice(message, ok ? "success" : "error");
+  }
 
   async function updateFormStatus(
     slug: string,
@@ -6523,20 +7006,7 @@ function AdminPage({
         <div className="row g-3 align-items-end">
           <div className="col-md-6">
             <label className="form-label">Default timezone</label>
-            <TimezoneSelect idPrefix="admin-default-tz" value={settingsTimezone} onChange={setSettingsTimezone} />
-          </div>
-          <div className="col-md-3">
-            <button
-              type="button"
-              className="btn btn-outline-primary"
-              onClick={async () => {
-                const ok = await onUpdateDefaultTimezone(settingsTimezone);
-                const message = ok ? "Default timezone updated." : "Failed to update timezone.";
-                onNotice(message, ok ? "success" : "error");
-              }}
-            >
-              <i className="bi bi-save" aria-hidden="true" /> Save
-            </button>
+            <TimezoneSelect idPrefix="admin-default-tz" value={settingsTimezone} onChange={handleTimezoneChange} />
           </div>
           <div className="col-md-8">
             <label className="form-label">Canvas sync on delete/restore</label>
@@ -6546,7 +7016,7 @@ function AdminPage({
                 type="checkbox"
                 id="admin-canvas-delete-sync"
                 checked={settingsCanvasDeleteSync}
-                onChange={(event) => setSettingsCanvasDeleteSync(event.target.checked)}
+                onChange={(event) => handleCanvasDeleteSyncChange(event.target.checked)}
               />
               <label className="form-check-label" htmlFor="admin-canvas-delete-sync">
                 Deactivate/reactivate Canvas enrollments when moving submissions or users to trash
@@ -6557,20 +7027,35 @@ function AdminPage({
               If disabled, delete/restore actions will not change Canvas enrollments.
             </div>
           </div>
-          <div className="col-md-3">
-            <button
-              type="button"
-              className="btn btn-outline-primary"
-              onClick={async () => {
-                const ok = await onUpdateCanvasDeleteSyncEnabled(settingsCanvasDeleteSync);
-                const message = ok
-                  ? "Canvas delete/restore sync updated."
-                  : "Failed to update Canvas delete/restore sync.";
-                onNotice(message, ok ? "success" : "error");
-              }}
-            >
-              <i className="bi bi-save" aria-hidden="true" /> Save
-            </button>
+          <div className="col-md-6">
+            <label className="form-label">Markdown rendering</label>
+            <div className="form-check form-switch">
+              <input
+                className="form-check-input"
+                type="checkbox"
+                id="admin-markdown-enabled"
+                checked={settingsMarkdownEnabled}
+                onChange={(event) => handleMarkdownToggle(event.target.checked)}
+              />
+              <label className="form-check-label" htmlFor="admin-markdown-enabled">
+                Enable Markdown + HTML rendering in form content.
+              </label>
+            </div>
+          </div>
+          <div className="col-md-6">
+            <label className="form-label">MathJax rendering</label>
+            <div className="form-check form-switch">
+              <input
+                className="form-check-input"
+                type="checkbox"
+                id="admin-mathjax-enabled"
+                checked={settingsMathjaxEnabled}
+                onChange={(event) => handleMathjaxToggle(event.target.checked)}
+              />
+              <label className="form-check-label" htmlFor="admin-mathjax-enabled">
+                Enable MathJax rendering for formulas.
+              </label>
+            </div>
           </div>
         </div>
       </section>
@@ -6704,10 +7189,24 @@ function AdminPage({
                     <td>
                       <div>
                         <a className="text-decoration-none" href={`${PUBLIC_BASE}#/f/${form.slug}`}>
-                          {form.title || form.slug}
+                          <RichText
+                            text={form.title || form.slug}
+                            markdownEnabled={appMarkdownEnabled}
+                            mathjaxEnabled={appMathjaxEnabled}
+                            inline
+                          />
                         </a>
                       </div>
-                      {form.description ? <div className="muted">{form.description}</div> : null}
+                      {form.description ? (
+                        <div className="muted">
+                          <RichText
+                            text={form.description}
+                            markdownEnabled={appMarkdownEnabled}
+                            mathjaxEnabled={appMathjaxEnabled}
+                            inline
+                          />
+                        </div>
+                      ) : null}
                     </td>
                     <td>
                       <div className="status-badges status-badges--forms">
@@ -6777,7 +7276,11 @@ function AdminPage({
                             onClick={() =>
                               updateFormStatus(
                                 form.slug,
-                                { password_required: false },
+                                {
+                                  passwordRequired: false,
+                                  passwordRequireAccess: false,
+                                  passwordRequireSubmit: false
+                                },
                                 "Password requirement removed."
                               )
                             }
@@ -6904,7 +7407,12 @@ function AdminPage({
                     <td>
                       <div>
                         <Link className="text-decoration-none" to="/admin/builder">
-                          {template.name || template.key}
+                          <RichText
+                            text={template.name || template.key}
+                            markdownEnabled={appMarkdownEnabled}
+                            mathjaxEnabled={appMathjaxEnabled}
+                            inline
+                          />
                         </Link>
                       </div>
                     </td>
@@ -7255,7 +7763,14 @@ function AdminPage({
                         />
                       </td>
                       <td>
-                        <div>{title}</div>
+                        <div>
+                          <RichText
+                            text={title}
+                            markdownEnabled={appMarkdownEnabled}
+                            mathjaxEnabled={appMathjaxEnabled}
+                            inline
+                          />
+                        </div>
                         {title !== item.id ? (
                           <div className="muted">
                             <a
@@ -7731,10 +8246,14 @@ function AdminPage({
 
 function AdminEmailsPage({
   user,
-  onLogin
+  onLogin,
+  markdownEnabled,
+  mathjaxEnabled
 }: {
   user: UserInfo | null;
   onLogin: (p: "google" | "github") => void;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
 }) {
   const [status, setStatus] = useState<"loading" | "ok" | "forbidden">("loading");
   const [emails, setEmails] = useState<any[]>([]);
@@ -8148,7 +8667,12 @@ function AdminEmailsPage({
                       <td>
                         {item.submission_id ? (
                           <Link to={`/me/submissions/${item.submission_id}`} title={item.submission_id}>
-                            {item.form_title || item.form_slug || "Submission"}
+                            <RichText
+                              text={item.form_title || item.form_slug || "Submission"}
+                              markdownEnabled={markdownEnabled}
+                              mathjaxEnabled={mathjaxEnabled}
+                              inline
+                            />
                           </Link>
                         ) : (
                           <span className="muted">n/a</span>
@@ -8251,11 +8775,15 @@ function AdminEmailsPage({
 function TrashPage({
   user,
   onLogin,
-  onNotice
+  onNotice,
+  markdownEnabled,
+  mathjaxEnabled
 }: {
   user: UserInfo | null;
   onLogin: (provider: "google" | "github") => void;
   onNotice: (message: string, type?: NoticeType) => void;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
 }) {
   const isAdmin = Boolean(user?.isAdmin);
   const [loading, setLoading] = useState(true);
@@ -8636,7 +9164,14 @@ function TrashPage({
                       />
                     </td>
                     <td>
-                      <div>{item.title || item.slug}</div>
+                      <div>
+                        <RichText
+                          text={item.title || item.slug}
+                          markdownEnabled={markdownEnabled}
+                          mathjaxEnabled={mathjaxEnabled}
+                          inline
+                        />
+                      </div>
                       {item.title && item.slug ? <div className="muted">{item.slug}</div> : null}
                     </td>
                     <td>{item.deleted_at ? formatTimeICT(item.deleted_at) : "n/a"}</td>
@@ -8714,7 +9249,14 @@ function TrashPage({
                       />
                     </td>
                     <td>
-                      <div>{item.name || item.key}</div>
+                      <div>
+                        <RichText
+                          text={item.name || item.key}
+                          markdownEnabled={markdownEnabled}
+                          mathjaxEnabled={mathjaxEnabled}
+                          inline
+                        />
+                      </div>
                       {item.name && item.key ? <div className="muted">{item.key}</div> : null}
                     </td>
                     <td>{item.deleted_at ? formatTimeICT(item.deleted_at) : "n/a"}</td>
@@ -8868,10 +9410,28 @@ function TrashPage({
                       />
                     </td>
                     <td>
-                      <div>{item.form_title || item.form_slug || "Submission"}</div>
+                      <div>
+                        <RichText
+                          text={item.form_title || item.form_slug || "Submission"}
+                          markdownEnabled={markdownEnabled}
+                          mathjaxEnabled={mathjaxEnabled}
+                          inline
+                        />
+                      </div>
                       <div className="muted">{item.id}</div>
                     </td>
-                    <td>{item.form_title || "n/a"}</td>
+                    <td>
+                      {item.form_title ? (
+                        <RichText
+                          text={item.form_title}
+                          markdownEnabled={markdownEnabled}
+                          mathjaxEnabled={mathjaxEnabled}
+                          inline
+                        />
+                      ) : (
+                        "n/a"
+                      )}
+                    </td>
                     <td>{item.deleted_at ? formatTimeICT(item.deleted_at) : "n/a"}</td>
                     <td>{item.deleted_reason || "n/a"}</td>
                     <td className="table-actions">
@@ -8949,11 +9509,29 @@ function TrashPage({
                       />
                     </td>
                     <td>{item.original_name || item.id}</td>
-                    <td>{item.form_title || "n/a"}</td>
+                    <td>
+                      {item.form_title ? (
+                        <RichText
+                          text={item.form_title}
+                          markdownEnabled={markdownEnabled}
+                          mathjaxEnabled={mathjaxEnabled}
+                          inline
+                        />
+                      ) : (
+                        "n/a"
+                      )}
+                    </td>
                     <td>
                       {item.submission_id ? (
                         <>
-                          <div>{item.form_title || item.form_slug || "Submission"}</div>
+                          <div>
+                            <RichText
+                              text={item.form_title || item.form_slug || "Submission"}
+                              markdownEnabled={markdownEnabled}
+                              mathjaxEnabled={mathjaxEnabled}
+                              inline
+                            />
+                          </div>
                           {item.form_title ? (
                             <div className="muted">{item.submission_id}</div>
                           ) : null}
@@ -9090,11 +9668,15 @@ function TrashPage({
 function BuilderPage({
   user,
   onLogin,
-  appDefaultTimezone
+  appDefaultTimezone,
+  markdownEnabled,
+  mathjaxEnabled
 }: {
   user: UserInfo | null;
   onLogin: (p: "google" | "github") => void;
   appDefaultTimezone: string;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
 }) {
   const [status, setStatus] = useState<"loading" | "ok" | "forbidden">("loading");
   const [forms, setForms] = useState<any[]>([]);
@@ -9143,7 +9725,8 @@ function BuilderPage({
   const [formBuilderAvailabilityTimezone, setFormBuilderAvailabilityTimezone] = useState(
     getAppDefaultTimezone()
   );
-  const [formBuilderPasswordRequired, setFormBuilderPasswordRequired] = useState(false);
+  const [formBuilderPasswordRequireAccess, setFormBuilderPasswordRequireAccess] = useState(false);
+  const [formBuilderPasswordRequireSubmit, setFormBuilderPasswordRequireSubmit] = useState(false);
   const [formBuilderPassword, setFormBuilderPassword] = useState("");
   const [formBuilderPasswordVisible, setFormBuilderPasswordVisible] = useState(false);
   const [formBuilderCanvasEnabled, setFormBuilderCanvasEnabled] = useState(false);
@@ -9187,9 +9770,13 @@ function BuilderPage({
   const [formCreateAvailabilityTimezone, setFormCreateAvailabilityTimezone] = useState(
     getAppDefaultTimezone()
   );
-  const [formCreatePasswordRequired, setFormCreatePasswordRequired] = useState(false);
+  const [formCreatePasswordRequireAccess, setFormCreatePasswordRequireAccess] = useState(false);
+  const [formCreatePasswordRequireSubmit, setFormCreatePasswordRequireSubmit] = useState(false);
   const [formCreatePassword, setFormCreatePassword] = useState("");
   const [formCreatePasswordVisible, setFormCreatePasswordVisible] = useState(false);
+  const formCreatePasswordRequired = formCreatePasswordRequireAccess || formCreatePasswordRequireSubmit;
+  const formBuilderPasswordRequired =
+    formBuilderPasswordRequireAccess || formBuilderPasswordRequireSubmit;
   const [formCreateCanvasEnabled, setFormCreateCanvasEnabled] = useState(false);
   const [formCreateCanvasCourseId, setFormCreateCanvasCourseId] = useState("");
   const [formCreateCanvasAllowedSections, setFormCreateCanvasAllowedSections] = useState<
@@ -9786,7 +10373,8 @@ function BuilderPage({
       setFormBuilderAvailableFrom("");
       setFormBuilderAvailableUntil("");
       setFormBuilderAvailabilityTimezone(getAppDefaultTimezone());
-      setFormBuilderPasswordRequired(false);
+      setFormBuilderPasswordRequireAccess(false);
+      setFormBuilderPasswordRequireSubmit(false);
       setFormBuilderPassword("");
       setFormBuilderCanvasEnabled(false);
       setFormBuilderCanvasCourseId("");
@@ -9829,7 +10417,12 @@ function BuilderPage({
       setFormBuilderAvailableUntil(
         utcToLocalInputWithZone(selected.available_until ?? null, formBuilderAvailabilityTimezone)
       );
-      setFormBuilderPasswordRequired(Boolean(selected.password_required));
+      const accessFlag = Boolean(selected.password_require_access);
+      const submitFlag =
+        Boolean(selected.password_require_submit) ||
+        (!accessFlag && !selected.password_require_submit && Boolean(selected.password_required));
+      setFormBuilderPasswordRequireAccess(accessFlag);
+      setFormBuilderPasswordRequireSubmit(submitFlag);
       setFormBuilderPassword("");
       setFormBuilderCanvasEnabled(Boolean(selected.canvas_enabled));
       setFormBuilderCanvasCourseId(String(selected.canvas_course_id || ""));
@@ -10049,6 +10642,8 @@ function BuilderPage({
           availableFrom,
           availableUntil,
           passwordRequired: formBuilderPasswordRequired,
+          passwordRequireAccess: formBuilderPasswordRequireAccess,
+          passwordRequireSubmit: formBuilderPasswordRequireSubmit,
           formPassword: formBuilderPassword.trim() || null,
           canvasEnabled: formBuilderCanvasEnabled,
           canvasCourseId: formBuilderCanvasEnabled ? formBuilderCanvasCourseId || null : null,
@@ -10349,6 +10944,8 @@ function BuilderPage({
         availableFrom,
         availableUntil,
         passwordRequired: formCreatePasswordRequired,
+        passwordRequireAccess: formCreatePasswordRequireAccess,
+        passwordRequireSubmit: formCreatePasswordRequireSubmit,
         formPassword: formCreatePassword.trim() || null,
         canvasEnabled: formCreateCanvasEnabled,
         canvasCourseId: formCreateCanvasEnabled ? formCreateCanvasCourseId || null : null,
@@ -10371,7 +10968,8 @@ function BuilderPage({
     setFormCreateAvailableFrom("");
     setFormCreateAvailableUntil("");
     setFormCreateAvailabilityTimezone(getAppDefaultTimezone());
-    setFormCreatePasswordRequired(false);
+    setFormCreatePasswordRequireAccess(false);
+    setFormCreatePasswordRequireSubmit(false);
     setFormCreatePassword("");
     setFormCreateCanvasEnabled(false);
     setFormCreateCanvasCourseId("");
@@ -10583,6 +11181,13 @@ function BuilderPage({
         <h2>Builder</h2>
         {user ? <span className="badge">{getUserDisplayName(user)}</span> : null}
       </div>
+      {(markdownEnabled || mathjaxEnabled) ? (
+        <div className="alert alert-info">
+          <i className="bi bi-markdown" aria-hidden="true" /> Markdown
+          {mathjaxEnabled ? " + MathJax" : ""} and HTML input are supported in titles,
+          descriptions, labels, and placeholders.
+        </div>
+      ) : null}
       <div className="d-flex align-items-center gap-2 mb-3">
         <button type="button" className="btn btn-outline-primary btn-sm" onClick={() => loadBuilder()}>
           <i className="bi bi-arrow-clockwise" aria-hidden="true" /> Refresh
@@ -10643,6 +11248,17 @@ function BuilderPage({
                     value={formCreateTitle}
                     onChange={(event) => setFormCreateTitle(event.target.value)}
                   />
+                  {formCreateTitle ? (
+                    <div className="mt-2">
+                      <div className="muted">Preview</div>
+                      <RichText
+                        text={formCreateTitle}
+                        markdownEnabled={markdownEnabled}
+                        mathjaxEnabled={mathjaxEnabled}
+                        inline
+                      />
+                    </div>
+                  ) : null}
                 </div>
                 <div className="col-md-4">
                   <label className="form-label">Template</label>
@@ -10668,6 +11284,16 @@ function BuilderPage({
                     value={formCreateDescription}
                     onChange={(event) => setFormCreateDescription(event.target.value)}
                   />
+                  {formCreateDescription ? (
+                    <div className="mt-2">
+                      <div className="muted">Preview</div>
+                      <RichText
+                        text={formCreateDescription}
+                        markdownEnabled={markdownEnabled}
+                        mathjaxEnabled={mathjaxEnabled}
+                      />
+                    </div>
+                  ) : null}
                 </div>
                 <div className="col-md-3">
                   <label className="form-label">Auth policy</label>
@@ -10753,17 +11379,29 @@ function BuilderPage({
                   />
                 </div>
                 <div className="col-md-4">
-                  <label className="form-label">Password required</label>
+                  <label className="form-label">Password requirements</label>
                   <div className="form-check mt-2">
                     <input
                       className="form-check-input"
                       type="checkbox"
-                      checked={formCreatePasswordRequired}
-                      onChange={(event) => setFormCreatePasswordRequired(event.target.checked)}
-                      id="formCreatePasswordRequired"
+                      checked={formCreatePasswordRequireAccess}
+                      onChange={(event) => setFormCreatePasswordRequireAccess(event.target.checked)}
+                      id="formCreatePasswordRequireAccess"
                     />
-                    <label className="form-check-label" htmlFor="formCreatePasswordRequired">
-                      Yes
+                    <label className="form-check-label" htmlFor="formCreatePasswordRequireAccess">
+                      Require password to access
+                    </label>
+                  </div>
+                  <div className="form-check mt-1">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      checked={formCreatePasswordRequireSubmit}
+                      onChange={(event) => setFormCreatePasswordRequireSubmit(event.target.checked)}
+                      id="formCreatePasswordRequireSubmit"
+                    />
+                    <label className="form-check-label" htmlFor="formCreatePasswordRequireSubmit">
+                      Require password to submit
                     </label>
                   </div>
                   <div className="muted mt-2">
@@ -10882,6 +11520,16 @@ function BuilderPage({
                     onChange={(event) => setFormBuilderDescription(event.target.value)}
                     disabled={!formBuilderSlug}
                   />
+                  {formBuilderDescription ? (
+                    <div className="mt-2">
+                      <div className="muted">Preview</div>
+                      <RichText
+                        text={formBuilderDescription}
+                        markdownEnabled={markdownEnabled}
+                        mathjaxEnabled={mathjaxEnabled}
+                      />
+                    </div>
+                  ) : null}
                 </div>
               <div className="col-md-4">
                 <label className="form-label">Auth policy</label>
@@ -10970,18 +11618,31 @@ function BuilderPage({
                 />
               </div>
               <div className="col-md-4">
-                <label className="form-label">Password required</label>
+                <label className="form-label">Password requirements</label>
                 <div className="form-check mt-2">
                   <input
                     className="form-check-input"
                     type="checkbox"
-                    checked={formBuilderPasswordRequired}
-                    onChange={(event) => setFormBuilderPasswordRequired(event.target.checked)}
+                    checked={formBuilderPasswordRequireAccess}
+                    onChange={(event) => setFormBuilderPasswordRequireAccess(event.target.checked)}
                     disabled={!formBuilderSlug}
-                    id="formBuilderPasswordRequired"
+                    id="formBuilderPasswordRequireAccess"
                   />
-                  <label className="form-check-label" htmlFor="formBuilderPasswordRequired">
-                    Yes
+                  <label className="form-check-label" htmlFor="formBuilderPasswordRequireAccess">
+                    Require password to access
+                  </label>
+                </div>
+                <div className="form-check mt-1">
+                  <input
+                    className="form-check-input"
+                    type="checkbox"
+                    checked={formBuilderPasswordRequireSubmit}
+                    onChange={(event) => setFormBuilderPasswordRequireSubmit(event.target.checked)}
+                    disabled={!formBuilderSlug}
+                    id="formBuilderPasswordRequireSubmit"
+                  />
+                  <label className="form-check-label" htmlFor="formBuilderPasswordRequireSubmit">
+                    Require password to submit
                   </label>
                 </div>
                 <div className="muted mt-2">
@@ -11087,6 +11748,8 @@ function BuilderPage({
                   builderDateTimezone={formDateTimezone}
                   builderDateMode={formDateMode}
                   builderDateShowTimezone={formDateShowTimezone}
+                  markdownEnabled={markdownEnabled}
+                  mathjaxEnabled={mathjaxEnabled}
                   onTypeChange={setFormFieldType}
                   onCustomTypeChange={setFormFieldCustomType}
                   onIdChange={setFormFieldId}
@@ -11476,6 +12139,17 @@ function BuilderPage({
                   value={templateEditorName}
                   onChange={(event) => setTemplateEditorName(event.target.value)}
                 />
+                {templateEditorName ? (
+                  <div className="mt-2">
+                    <div className="muted">Preview</div>
+                    <RichText
+                      text={templateEditorName}
+                      markdownEnabled={markdownEnabled}
+                      mathjaxEnabled={mathjaxEnabled}
+                      inline
+                    />
+                  </div>
+                ) : null}
               </div>
               <div className="col-12">
                 <label className="form-label">Schema JSON</label>
@@ -11512,6 +12186,8 @@ function BuilderPage({
                   builderDateTimezone={builderDateTimezone}
                   builderDateMode={builderDateMode}
                   builderDateShowTimezone={builderDateShowTimezone}
+                  markdownEnabled={markdownEnabled}
+                  mathjaxEnabled={mathjaxEnabled}
                   onTypeChange={setBuilderType}
                   onCustomTypeChange={setBuilderCustomType}
                   onIdChange={setBuilderId}
@@ -11798,6 +12474,8 @@ function BuilderPage({
     const saved = localStorage.getItem(THEME_KEY);
     return saved === "light" || saved === "dark" ? saved : "dark";
   });
+  const [appMarkdownEnabled, setAppMarkdownEnabled] = useState(true);
+  const [appMathjaxEnabled, setAppMathjaxEnabled] = useState(true);
   const [appTimezone, setAppTimezoneState] = useState(getAppDefaultTimezone());
   const [appCanvasDeleteSyncEnabled, setAppCanvasDeleteSyncEnabled] = useState(true);
   const navigate = useNavigate();
@@ -11822,6 +12500,8 @@ function BuilderPage({
     localStorage.setItem(THEME_KEY, theme);
   }, [theme]);
 
+  useMathJax(appMathjaxEnabled);
+
   useEffect(() => {
     let active = true;
     async function loadSettings() {
@@ -11836,6 +12516,12 @@ function BuilderPage({
         }
         if (typeof payload?.canvasDeleteSyncEnabled === "boolean") {
           setAppCanvasDeleteSyncEnabled(payload.canvasDeleteSyncEnabled);
+        }
+        if (typeof payload?.markdownEnabled === "boolean") {
+          setAppMarkdownEnabled(payload.markdownEnabled);
+        }
+        if (typeof payload?.mathjaxEnabled === "boolean") {
+          setAppMathjaxEnabled(payload.mathjaxEnabled);
         }
       }
     }
@@ -11993,6 +12679,42 @@ function BuilderPage({
         setAppCanvasDeleteSyncEnabled(payload.canvasDeleteSyncEnabled);
       } else {
         setAppCanvasDeleteSyncEnabled(nextValue);
+      }
+      return true;
+    }
+
+    async function updateMarkdownEnabled(nextValue: boolean) {
+      const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ markdownEnabled: nextValue })
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        return false;
+      }
+      if (typeof payload?.markdownEnabled === "boolean") {
+        setAppMarkdownEnabled(payload.markdownEnabled);
+      } else {
+        setAppMarkdownEnabled(nextValue);
+      }
+      return true;
+    }
+
+    async function updateMathjaxEnabled(nextValue: boolean) {
+      const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mathjaxEnabled: nextValue })
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        return false;
+      }
+      if (typeof payload?.mathjaxEnabled === "boolean") {
+        setAppMathjaxEnabled(payload.mathjaxEnabled);
+      } else {
+        setAppMathjaxEnabled(nextValue);
       }
       return true;
     }
@@ -12161,7 +12883,19 @@ function BuilderPage({
       ) : null}
 
       <Routes>
-        <Route path="/" element={<HomePage forms={forms} loading={loading} error={error} user={user} />} />
+          <Route
+            path="/"
+            element={
+              <HomePage
+                forms={forms}
+                loading={loading}
+                error={error}
+                user={user}
+                markdownEnabled={appMarkdownEnabled}
+                mathjaxEnabled={appMathjaxEnabled}
+              />
+            }
+          />
         <Route
           path="/auth/callback"
           element={
@@ -12171,17 +12905,41 @@ function BuilderPage({
             />
           }
         />
-        <Route
-          path="/f/:slug"
-          element={<FormRoute user={user} onLogin={handleLogin} onNotice={pushNotice} />}
-        />
+          <Route
+            path="/f/:slug"
+            element={
+              <FormRoute
+                user={user}
+                onLogin={handleLogin}
+                onNotice={pushNotice}
+                markdownEnabled={appMarkdownEnabled}
+                mathjaxEnabled={appMathjaxEnabled}
+              />
+            }
+          />
         <Route
           path="/me"
-          element={<DashboardPage user={user} onLogin={handleLogin} onNotice={pushNotice} />}
+          element={
+            <DashboardPage
+              user={user}
+              onLogin={handleLogin}
+              onNotice={pushNotice}
+              markdownEnabled={appMarkdownEnabled}
+              mathjaxEnabled={appMathjaxEnabled}
+            />
+          }
         />
         <Route
           path="/dashboard"
-          element={<DashboardPage user={user} onLogin={handleLogin} onNotice={pushNotice} />}
+          element={
+            <DashboardPage
+              user={user}
+              onLogin={handleLogin}
+              onNotice={pushNotice}
+              markdownEnabled={appMarkdownEnabled}
+              mathjaxEnabled={appMathjaxEnabled}
+            />
+          }
         />
         <Route
           path="/account"
@@ -12194,10 +12952,28 @@ function BuilderPage({
             />
           }
         />
-        <Route path="/canvas" element={<CanvasPage user={user} onLogin={handleLogin} />} />
+        <Route
+          path="/canvas"
+          element={
+            <CanvasPage
+              user={user}
+              onLogin={handleLogin}
+              markdownEnabled={appMarkdownEnabled}
+              mathjaxEnabled={appMathjaxEnabled}
+            />
+          }
+        />
         <Route
           path="/me/submissions/:id"
-          element={<SubmissionDetailPage user={user} onLogin={handleLogin} onNotice={pushNotice} />}
+          element={
+            <SubmissionDetailPage
+              user={user}
+              onLogin={handleLogin}
+              onNotice={pushNotice}
+              markdownEnabled={appMarkdownEnabled}
+              mathjaxEnabled={appMathjaxEnabled}
+            />
+          }
         />
         <Route path="/docs" element={<DocsPage />} />
         <Route
@@ -12211,26 +12987,61 @@ function BuilderPage({
               onUpdateDefaultTimezone={updateDefaultTimezone}
               appCanvasDeleteSyncEnabled={appCanvasDeleteSyncEnabled}
               onUpdateCanvasDeleteSyncEnabled={updateCanvasDeleteSyncEnabled}
+              appMarkdownEnabled={appMarkdownEnabled}
+              appMathjaxEnabled={appMathjaxEnabled}
+              onUpdateMarkdownEnabled={updateMarkdownEnabled}
+              onUpdateMathjaxEnabled={updateMathjaxEnabled}
             />
           }
         />
         <Route
           path="/admin/canvas"
-          element={<AdminCanvasPage user={user} onLogin={handleLogin} onNotice={pushNotice} />}
+          element={
+            <AdminCanvasPage
+              user={user}
+              onLogin={handleLogin}
+              onNotice={pushNotice}
+              appDefaultTimezone={appTimezone}
+              onUpdateDefaultTimezone={updateDefaultTimezone}
+              markdownEnabled={appMarkdownEnabled}
+              mathjaxEnabled={appMathjaxEnabled}
+            />
+          }
         />
         <Route
           path="/admin/emails"
-          element={<AdminEmailsPage user={user} onLogin={handleLogin} />}
+          element={
+            <AdminEmailsPage
+              user={user}
+              onLogin={handleLogin}
+              markdownEnabled={appMarkdownEnabled}
+              mathjaxEnabled={appMathjaxEnabled}
+            />
+          }
         />
         <Route
           path="/trash"
-          element={<TrashPage user={user} onLogin={handleLogin} onNotice={pushNotice} />}
+          element={
+            <TrashPage
+              user={user}
+              onLogin={handleLogin}
+              onNotice={pushNotice}
+              markdownEnabled={appMarkdownEnabled}
+              mathjaxEnabled={appMathjaxEnabled}
+            />
+          }
         />
         <Route
           path="/admin/builder"
           element={
             user?.isAdmin ? (
-              <BuilderPage user={user} onLogin={handleLogin} appDefaultTimezone={appTimezone} />
+              <BuilderPage
+                user={user}
+                onLogin={handleLogin}
+                appDefaultTimezone={appTimezone}
+                markdownEnabled={appMarkdownEnabled}
+                mathjaxEnabled={appMathjaxEnabled}
+              />
             ) : (
               <NotFoundPage />
             )
@@ -12241,6 +13052,7 @@ function BuilderPage({
       <footer className="site-footer">
         <div>{APP_INFO.title}</div>
         <div>{APP_INFO.description}</div>
+        <div>Built with assistance from GitHub Copilot and ChatGPT Codex.</div>
         <div>
           (c) {new Date().getFullYear()} {APP_INFO.author}.{" "}
           License:{" "}
