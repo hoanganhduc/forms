@@ -3,7 +3,7 @@ import { HashRouter, Link, Route, Routes, useLocation, useNavigate, useParams } 
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { APP_INFO } from "./config";
-import { apiFetch, clearToken } from "./auth";
+import { apiFetch, clearToken, setToken } from "./auth";
 import { IANA_TIMEZONES } from "./timezones";
 
 const LICENSE_URL = `${APP_INFO.repoUrl}/blob/master/LICENSE`;
@@ -2021,6 +2021,7 @@ function AuthCallback({
     const queryParams = url.searchParams;
     const token = hashParams.get("token") || queryParams.get("token");
     if (token) {
+      setToken(token);
       onNotice("Logged in successfully.", "success");
     }
     const returnTo = queryParams.get("return_to") || localStorage.getItem(RETURN_TO_KEY);
