@@ -132,6 +132,7 @@ with VirusTotal scanning, and optional Google Drive finalization.
 - `GET /api/admin/routines`
 - `POST /api/admin/routines`
 - `POST /api/admin/routines/run`
+- `GET /api/admin/emails/presets`
 - `POST /api/uploads/init`
 - `PUT /api/uploads/put`
 - `POST /api/uploads/complete`
@@ -198,6 +199,9 @@ The API uses a staged upload flow:
   - Soft-deletes the user and all related submissions/files.
   - Clears auth cookie immediately.
   - Login is blocked for deleted users until an admin restores the account.
+- Admin App settings: “Canvas sync on delete/restore” toggles whether delete/restore
+  actions deactivate/reactivate Canvas enrollments, and whether hard delete actions
+  unenroll Canvas users.
 - Admin can restore or permanently delete users via the trash tools.
 - Soft-deleted items are visible in the Trash tab; admin can restore or purge.
 
@@ -214,6 +218,10 @@ The API uses a staged upload flow:
 ## Admin submissions access
 - Admin can open any submission detail at `/#/me/submissions/:id`.
 - Recent submissions list links each submission ID to that detail view.
+
+## Emails
+- Admin Emails page shows sent email logs and supports move-to-trash + restore.
+- Test send uses predefined templates from `GET /api/admin/emails/presets` plus a custom option.
 
 ## Secrets checklist
 - Never commit `.env`, `.env.local`, or `.dev.vars` files with real secrets.

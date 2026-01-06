@@ -3631,6 +3631,9 @@ function DocsPage() {
             <strong>Admin:</strong> manage forms/templates, review submissions, export CSV/TXT.
           </li>
           <li>
+            <strong>Emails:</strong> admin email log, trash, and test send with preset templates.
+          </li>
+          <li>
             <strong>Admin dashboard:</strong> list forms/templates/submissions/users with bulk
             move-to-trash actions.
           </li>
@@ -3737,6 +3740,10 @@ function DocsPage() {
             After submit: the API enrolls the user and records a status on the submission.
           </li>
           <li>
+            Admin App settings control whether delete/restore actions deactivate or reactivate
+            Canvas enrollments and whether hard delete actions unenroll Canvas users.
+          </li>
+          <li>
             Admin Canvas page exposes the retry queue and dead letters with Retry/Drop actions.
           </li>
         </ul>
@@ -3756,6 +3763,10 @@ function DocsPage() {
           <li>
             Tasks support bulk Run/Save and bulk Enable/Disable actions from the dashboard.
             Latest run time appears in the status column.
+          </li>
+          <li>
+            Admin Emails page loads test presets from <code>/api/admin/emails/presets</code> so new
+            predefined messages appear automatically in the dropdown.
           </li>
           <li>
             Routine run logs are retained (last 100 per task, last 30 days).
@@ -5940,7 +5951,20 @@ function AdminCanvasPage({
                                   setActionError(payload?.error || "Failed to delete submission.");
                                   return;
                                 }
-                                onNotice("Form submission deleted.", "success");
+                                if (payload?.canvasAction) {
+                                  const canvasLabel =
+                                    payload.canvasAction === "deactivated"
+                                      ? "deactivated"
+                                      : payload.canvasAction === "failed"
+                                        ? "failed"
+                                        : "skipped";
+                                  onNotice(
+                                    `Form submission deleted. Canvas deactivation: ${canvasLabel}.`,
+                                    payload.canvasAction === "failed" ? "warning" : "success"
+                                  );
+                                } else {
+                                  onNotice("Form submission deleted.", "success");
+                                }
                                 setCourses((prev) =>
                                   prev.map((course) => ({
                                     ...course,
@@ -5980,13 +6004,17 @@ function AdminPage({
   onLogin,
   onNotice,
   appDefaultTimezone,
-  onUpdateDefaultTimezone
+  onUpdateDefaultTimezone,
+  appCanvasDeleteSyncEnabled,
+  onUpdateCanvasDeleteSyncEnabled
 }: {
   user: UserInfo | null;
   onLogin: (p: "google" | "github") => void;
   onNotice: (message: string, type?: NoticeType) => void;
   appDefaultTimezone: string;
   onUpdateDefaultTimezone: (tz: string) => Promise<boolean>;
+  appCanvasDeleteSyncEnabled: boolean;
+  onUpdateCanvasDeleteSyncEnabled: (enabled: boolean) => Promise<boolean>;
 }) {
   const [status, setStatus] = useState<"loading" | "ok" | "forbidden">("loading");
   const [error, setError] = useState<string | null>(null);
@@ -6004,6 +6032,9 @@ function AdminPage({
   const [submissionFormFilter, setSubmissionFormFilter] = useState("");
   const [submissionUserFilter, setSubmissionUserFilter] = useState("");
   const [settingsTimezone, setSettingsTimezone] = useState(appDefaultTimezone);
+  const [settingsCanvasDeleteSync, setSettingsCanvasDeleteSync] = useState(
+    appCanvasDeleteSyncEnabled
+  );
   const [routineEdits, setRoutineEdits] = useState<Record<string, { cron: string; enabled: boolean }>>(
     {}
   );
@@ -6093,6 +6124,10 @@ function AdminPage({
   useEffect(() => {
     setSettingsTimezone(appDefaultTimezone || getAppDefaultTimezone());
   }, [appDefaultTimezone]);
+
+  useEffect(() => {
+    setSettingsCanvasDeleteSync(appCanvasDeleteSyncEnabled);
+  }, [appCanvasDeleteSyncEnabled]);
 
   async function updateFormStatus(
     slug: string,
@@ -6313,6 +6348,7 @@ function AdminPage({
       return;
     }
     setAdminBulkStatus({ label: "Deleting", done: 0, total: ids.length, type });
+    const canvasSummary = { deactivated: 0, failed: 0, skipped: 0 };
     for (let i = 0; i < ids.length; i += 1) {
       const id = ids[i];
       let endpoint = "";
@@ -6329,6 +6365,14 @@ function AdminPage({
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
         onNotice(payload?.error || `Failed to delete ${id}.`, "warning");
+      } else if ((type === "users" || type === "submissions") && payload?.canvasAction) {
+        if (payload.canvasAction === "deactivated") {
+          canvasSummary.deactivated += 1;
+        } else if (payload.canvasAction === "failed") {
+          canvasSummary.failed += 1;
+        } else {
+          canvasSummary.skipped += 1;
+        }
       }
       setAdminBulkStatus((prev) =>
         prev ? { ...prev, done: Math.min(prev.total, prev.done + 1) } : prev
@@ -6336,7 +6380,14 @@ function AdminPage({
     }
     setAdminSelected((prev) => ({ ...prev, [type]: new Set() }));
     setAdminBulkStatus(null);
-    onNotice("Selected items moved to trash.", "success");
+    if ((type === "users" || type === "submissions") && (canvasSummary.deactivated || canvasSummary.failed || canvasSummary.skipped)) {
+      onNotice(
+        `Selected items moved to trash. Canvas deactivation: ${canvasSummary.deactivated} deactivated, ${canvasSummary.failed} failed, ${canvasSummary.skipped} skipped.`,
+        canvasSummary.failed > 0 ? "warning" : "success"
+      );
+    } else {
+      onNotice("Selected items moved to trash.", "success");
+    }
     loadAdmin();
   }
 
@@ -6481,6 +6532,40 @@ function AdminPage({
               onClick={async () => {
                 const ok = await onUpdateDefaultTimezone(settingsTimezone);
                 const message = ok ? "Default timezone updated." : "Failed to update timezone.";
+                onNotice(message, ok ? "success" : "error");
+              }}
+            >
+              <i className="bi bi-save" aria-hidden="true" /> Save
+            </button>
+          </div>
+          <div className="col-md-8">
+            <label className="form-label">Canvas sync on delete/restore</label>
+            <div className="form-check form-switch">
+              <input
+                className="form-check-input"
+                type="checkbox"
+                id="admin-canvas-delete-sync"
+                checked={settingsCanvasDeleteSync}
+                onChange={(event) => setSettingsCanvasDeleteSync(event.target.checked)}
+              />
+              <label className="form-check-label" htmlFor="admin-canvas-delete-sync">
+                Deactivate/reactivate Canvas enrollments when moving submissions or users to trash
+                and restoring them.
+              </label>
+            </div>
+            <div className="muted mt-1">
+              If disabled, delete/restore actions will not change Canvas enrollments.
+            </div>
+          </div>
+          <div className="col-md-3">
+            <button
+              type="button"
+              className="btn btn-outline-primary"
+              onClick={async () => {
+                const ok = await onUpdateCanvasDeleteSyncEnabled(settingsCanvasDeleteSync);
+                const message = ok
+                  ? "Canvas delete/restore sync updated."
+                  : "Failed to update Canvas delete/restore sync.";
                 onNotice(message, ok ? "success" : "error");
               }}
             >
@@ -7034,7 +7119,20 @@ function AdminPage({
                               onNotice(payload?.error || "Failed to move user to trash.", "warning");
                               return;
                             }
-                            onNotice("User moved to trash.", "success");
+                            if (payload?.canvasAction) {
+                              const canvasLabel =
+                                payload.canvasAction === "deactivated"
+                                  ? "deactivated"
+                                  : payload.canvasAction === "failed"
+                                    ? "failed"
+                                    : "skipped";
+                              onNotice(
+                                `User moved to trash. Canvas deactivation: ${canvasLabel}.`,
+                                payload.canvasAction === "failed" ? "warning" : "success"
+                              );
+                            } else {
+                              onNotice("User moved to trash.", "success");
+                            }
                             loadAdmin();
                           }}
                         >
@@ -7193,7 +7291,20 @@ function AdminPage({
                               onNotice(payload?.error || "Failed to move submission to trash.", "warning");
                               return;
                             }
-                            onNotice("Submission moved to trash.", "success");
+                            if (payload?.canvasAction) {
+                              const canvasLabel =
+                                payload.canvasAction === "deactivated"
+                                  ? "deactivated"
+                                  : payload.canvasAction === "failed"
+                                    ? "failed"
+                                    : "skipped";
+                              onNotice(
+                                `Submission moved to trash. Canvas deactivation: ${canvasLabel}.`,
+                                payload.canvasAction === "failed" ? "warning" : "success"
+                              );
+                            } else {
+                              onNotice("Submission moved to trash.", "success");
+                            }
                             loadAdmin();
                           }}
                         >
@@ -7640,10 +7751,18 @@ function AdminEmailsPage({
   const [testRecipient, setTestRecipient] = useState("");
   const [testSubject, setTestSubject] = useState("Test email from Form App");
   const [testBody, setTestBody] = useState("This is a test email from Form App.");
+  const [testPresetKey, setTestPresetKey] = useState("custom");
+  const [testPresetList, setTestPresetList] = useState<
+    Array<{ key: string; label: string; subject?: string; body?: string }>
+  >([]);
   const [testStatus, setTestStatus] = useState<string | null>(null);
   const [actionStatus, setActionStatus] = useState<{ message: string; type: NoticeType } | null>(
     null
   );
+  const testPresets = useMemo(() => {
+    const custom = [{ key: "custom", label: "Custom" }];
+    return [...custom, ...(Array.isArray(testPresetList) ? testPresetList : [])];
+  }, [testPresetList]);
 
   useEffect(() => {
     let active = true;
@@ -7662,6 +7781,33 @@ function AdminEmailsPage({
       );
     }
     loadForms();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    async function loadPresets() {
+      const response = await apiFetch(`${API_BASE}/api/admin/emails/presets`);
+      const payload = await response.json().catch(() => null);
+      if (!active) return;
+      if (!response.ok || !Array.isArray(payload?.data)) {
+        setTestPresetList([]);
+        return;
+      }
+      setTestPresetList(
+        payload.data
+          .map((item: any) => ({
+            key: String(item.key || ""),
+            label: String(item.label || item.key || ""),
+            subject: typeof item.subject === "string" ? item.subject : "",
+            body: typeof item.body === "string" ? item.body : ""
+          }))
+          .filter((item) => item.key)
+      );
+    }
+    loadPresets();
     return () => {
       active = false;
     };
@@ -7744,6 +7890,31 @@ function AdminEmailsPage({
           <h3 className="mb-0">Test email</h3>
         </div>
         <div className="row g-3">
+          <div className="col-md-4">
+            <label className="form-label">Preset</label>
+            <select
+              className="form-select"
+              value={testPresetKey}
+              onChange={(event) => {
+                const nextKey = event.target.value;
+                setTestPresetKey(nextKey);
+                const preset = testPresets.find((item) => item.key === nextKey);
+                if (preset?.subject) {
+                  setTestSubject(preset.subject);
+                }
+                if (preset?.body) {
+                  setTestBody(preset.body);
+                }
+              }}
+            >
+              {testPresets.map((preset) => (
+                <option key={preset.key} value={preset.key}>
+                  {preset.label}
+                </option>
+              ))}
+            </select>
+            <div className="muted mt-1">Selecting a preset will overwrite the subject/body.</div>
+          </div>
           <div className="col-md-4">
             <label className="form-label">Recipient</label>
             <input
@@ -8217,11 +8388,12 @@ function TrashPage({
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ type, id })
     });
+    const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      const payload = await response.json().catch(() => null);
       setError(payload?.error || "Restore failed.");
       return;
     }
+    await loadTrash();
     if (type === "submission") {
       if (payload?.canvasAction) {
         const canvasLabel = String(payload.canvasAction);
@@ -8235,7 +8407,6 @@ function TrashPage({
     } else {
       onNotice("Item restored.", "success");
     }
-    await loadTrash();
   }
 
   async function purgeItem(type: string, id: string) {
@@ -8248,12 +8419,21 @@ function TrashPage({
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ type, id })
     });
+    const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      const payload = await response.json().catch(() => null);
       setError(payload?.error || "Permanent delete failed.");
       return;
     }
-    onNotice("Item deleted.", "success");
+    if ((type === "user" || type === "submission") && payload?.canvasAction) {
+      const canvasLabel =
+        payload.canvasAction === "unenrolled" ? "unenrolled" : "skipped";
+      onNotice(
+        `Item deleted. Canvas unenroll: ${canvasLabel}.`,
+        payload.canvasAction === "skipped" ? "warning" : "success"
+      );
+    } else {
+      onNotice("Item deleted.", "success");
+    }
     await loadTrash();
   }
 
@@ -8268,14 +8448,26 @@ function TrashPage({
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ type: trashType })
     });
+    const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      const payload = await response.json().catch(() => null);
       setError(payload?.error || "Empty trash failed.");
       setBulkStatus(null);
       return;
     }
     advanceBulk();
-    finishBulk("Trash emptied.");
+    const summary = payload?.canvasSummary;
+    if (summary && (summary.users || summary.submissions)) {
+      const usersSummary = summary.users
+        ? `${summary.users.unenrolled || 0} users unenrolled, ${summary.users.skipped || 0} skipped`
+        : null;
+      const submissionsSummary = summary.submissions
+        ? `${summary.submissions.unenrolled || 0} submissions unenrolled, ${summary.submissions.skipped || 0} skipped`
+        : null;
+      const parts = [usersSummary, submissionsSummary].filter(Boolean);
+      finishBulk(parts.length > 0 ? `Trash emptied. Canvas unenroll: ${parts.join(" | ")}.` : "Trash emptied.");
+    } else {
+      finishBulk("Trash emptied.");
+    }
     await loadTrash();
   }
 
@@ -8298,12 +8490,35 @@ function TrashPage({
       return;
     }
     startBulk("Permanently deleting items", ids.length);
+    const singular = toSingular(type);
+    const canvasSummary = { unenrolled: 0, skipped: 0 };
     for (const id of ids) {
-      await purgeItem(toSingular(type), id);
+      const response = await apiFetch(`${API_BASE}${isAdmin ? "/api/admin/trash/purge" : "/api/me/trash/purge"}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type: singular, id })
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        setError(payload?.error || "Permanent delete failed.");
+      } else if ((singular === "user" || singular === "submission") && payload?.canvasAction) {
+        if (payload.canvasAction === "unenrolled") {
+          canvasSummary.unenrolled += 1;
+        } else {
+          canvasSummary.skipped += 1;
+        }
+      }
       advanceBulk();
     }
     setSelected((prev) => ({ ...prev, [type]: new Set() }));
-    finishBulk("Items deleted.");
+    if ((singular === "user" || singular === "submission") && (canvasSummary.unenrolled || canvasSummary.skipped)) {
+      finishBulk(
+        `Items deleted. Canvas unenroll: ${canvasSummary.unenrolled} unenrolled, ${canvasSummary.skipped} skipped.`
+      );
+    } else {
+      finishBulk("Items deleted.");
+    }
+    await loadTrash();
   }
 
   const forms = Array.isArray(data.forms) ? data.forms : [];
@@ -11584,6 +11799,7 @@ function BuilderPage({
     return saved === "light" || saved === "dark" ? saved : "dark";
   });
   const [appTimezone, setAppTimezoneState] = useState(getAppDefaultTimezone());
+  const [appCanvasDeleteSyncEnabled, setAppCanvasDeleteSyncEnabled] = useState(true);
   const navigate = useNavigate();
     const location = useLocation();
 
@@ -11612,10 +11828,15 @@ function BuilderPage({
       const response = await apiFetch(`${API_BASE}/api/settings`);
       const payload = await response.json().catch(() => null);
       if (!active) return;
-      if (response.ok && typeof payload?.timezoneDefault === "string" && payload.timezoneDefault.trim()) {
-        const nextTz = payload.timezoneDefault.trim();
-        setAppDefaultTimezone(nextTz);
-        setAppTimezoneState(nextTz);
+      if (response.ok) {
+        if (typeof payload?.timezoneDefault === "string" && payload.timezoneDefault.trim()) {
+          const nextTz = payload.timezoneDefault.trim();
+          setAppDefaultTimezone(nextTz);
+          setAppTimezoneState(nextTz);
+        }
+        if (typeof payload?.canvasDeleteSyncEnabled === "boolean") {
+          setAppCanvasDeleteSyncEnabled(payload.canvasDeleteSyncEnabled);
+        }
       }
     }
     loadSettings().catch(() => null);
@@ -11755,6 +11976,24 @@ function BuilderPage({
       }
       setAppDefaultTimezone(nextTz);
       setAppTimezoneState(nextTz);
+      return true;
+    }
+
+    async function updateCanvasDeleteSyncEnabled(nextValue: boolean) {
+      const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ canvasDeleteSyncEnabled: nextValue })
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        return false;
+      }
+      if (typeof payload?.canvasDeleteSyncEnabled === "boolean") {
+        setAppCanvasDeleteSyncEnabled(payload.canvasDeleteSyncEnabled);
+      } else {
+        setAppCanvasDeleteSyncEnabled(nextValue);
+      }
       return true;
     }
   const navLinks: Array<{ to: string; label: string; icon: string; show: boolean }> = [
@@ -11970,6 +12209,8 @@ function BuilderPage({
               onNotice={pushNotice}
               appDefaultTimezone={appTimezone}
               onUpdateDefaultTimezone={updateDefaultTimezone}
+              appCanvasDeleteSyncEnabled={appCanvasDeleteSyncEnabled}
+              onUpdateCanvasDeleteSyncEnabled={updateCanvasDeleteSyncEnabled}
             />
           }
         />

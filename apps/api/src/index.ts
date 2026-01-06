@@ -201,6 +201,7 @@ function parseAllowedOrigins(value: string | undefined): string[] {
 
 const APP_SETTING_DEFAULT_TIMEZONE = "timezone_default";
 const APP_SETTING_CANVAS_COURSE_SYNC_MODE = "canvas_course_sync_mode";
+const APP_SETTING_CANVAS_DELETE_SYNC = "canvas_delete_sync";
 
 async function getAppSetting(env: Env, key: string): Promise<string | null> {
   try {
@@ -1133,6 +1134,20 @@ function normalizeCanvasCourseSyncMode(value: string | null): "active" | "conclu
   if (mode === "concluded") return "concluded";
   if (mode === "all") return "all";
   return "active";
+}
+
+function normalizeCanvasDeleteSyncEnabled(value: string | null): boolean {
+  if (!value) return true;
+  const normalized = String(value).trim().toLowerCase();
+  if (["0", "false", "disabled", "off", "no"].includes(normalized)) {
+    return false;
+  }
+  return true;
+}
+
+async function isCanvasDeleteSyncEnabled(env: Env): Promise<boolean> {
+  const value = await getAppSetting(env, APP_SETTING_CANVAS_DELETE_SYNC);
+  return normalizeCanvasDeleteSyncEnabled(value);
 }
 
 async function getCanvasCourseSyncMode(env: Env): Promise<"active" | "concluded" | "all"> {
@@ -2831,17 +2846,20 @@ async function canvasApplyTaskForUserCourses(
   env: Env,
   userId: string,
   task: "deactivate" | "delete" | "reactivate"
-) {
+): Promise<{ attempted: number; failed: number }> {
   const email = await getUserPrimaryEmail(env, userId);
-  if (!email) return;
+  if (!email) return { attempted: 0, failed: 0 };
   const { results } = await env.DB.prepare(
     "SELECT DISTINCT canvas_course_id as course_id FROM submissions WHERE user_id=? AND canvas_course_id IS NOT NULL"
   )
     .bind(userId)
     .all<{ course_id: string }>();
+  let attempted = 0;
+  let failed = 0;
   for (const row of results) {
     if (!row?.course_id) continue;
     try {
+      attempted += 1;
       if (task === "reactivate") {
         const result = await canvasReactivateByEmail(env, String(row.course_id), email);
         if (!result.ok) {
@@ -2857,6 +2875,7 @@ async function canvasApplyTaskForUserCourses(
         await canvasApplyEnrollmentTaskByEmail(env, String(row.course_id), email, task);
       }
     } catch {
+      failed += 1;
       // Best effort; do not block deletion flows.
     }
   }
@@ -2869,6 +2888,7 @@ async function canvasApplyTaskForUserCourses(
       userId
     )
     .run();
+  return { attempted, failed };
 }
 
 function titleCaseFromEmail(email: string) {
@@ -3553,9 +3573,12 @@ async function softDeleteUser(
   userId: string,
   deletedBy: string | null,
   reason: string
-) {
+): Promise<{ ok: boolean; canvas?: { attempted: number; failed: number } }> {
   // Soft-delete user and cascade soft-delete to their submissions and uploads.
-  await canvasApplyTaskForUserCourses(env, userId, "deactivate");
+  const canvasDeleteSyncEnabled = await isCanvasDeleteSyncEnabled(env);
+  const canvasResult = canvasDeleteSyncEnabled
+    ? await canvasApplyTaskForUserCourses(env, userId, "deactivate")
+    : { attempted: 0, failed: 0 };
   const result = await env.DB.prepare(
     "UPDATE users SET deleted_at=datetime('now'), deleted_by=?, deleted_reason=? WHERE id=? AND deleted_at IS NULL"
   )
@@ -3579,7 +3602,7 @@ async function softDeleteUser(
     deletedBy,
     reason
   );
-  return result.success !== false;
+  return { ok: result.success !== false, canvas: canvasResult };
 }
 
 async function softDeleteSubmissionForUser(
@@ -3600,19 +3623,22 @@ async function softDeleteSubmissionForUser(
     .all<{ id: string }>();
   let attempted = 0;
   let failed = 0;
-  for (const row of submissions) {
-    if (row?.id) {
-      const result = await deactivateCanvasForSubmission(env, row.id);
-      if (result.attempted) {
-        attempted += 1;
-      }
-      if (!result.ok) {
-        failed += 1;
-        return {
-          ok: false,
-          error: result.error || "canvas_deactivate_failed",
-          canvas: { attempted, failed }
-        };
+  const canvasDeleteSyncEnabled = await isCanvasDeleteSyncEnabled(env);
+  if (canvasDeleteSyncEnabled) {
+    for (const row of submissions) {
+      if (row?.id) {
+        const result = await deactivateCanvasForSubmission(env, row.id);
+        if (result.attempted) {
+          attempted += 1;
+        }
+        if (!result.ok) {
+          failed += 1;
+          return {
+            ok: false,
+            error: result.error || "canvas_deactivate_failed",
+            canvas: { attempted, failed }
+          };
+        }
       }
     }
   }
@@ -3649,12 +3675,20 @@ async function softDeleteSubmissionById(
   submissionId: string,
   deletedBy: string | null,
   reason: string
-) {
-  await deactivateCanvasForSubmission(env, submissionId);
+): Promise<{ ok: boolean; canvas?: { attempted: number; failed: number } }> {
+  const canvasDeleteSyncEnabled = await isCanvasDeleteSyncEnabled(env);
+  let attempted = 0;
+  let failed = 0;
+  if (canvasDeleteSyncEnabled) {
+    const result = await deactivateCanvasForSubmission(env, submissionId);
+    if (result.attempted) attempted += 1;
+    if (!result.ok && result.attempted) failed += 1;
+  }
   await updateSubmissionsSoftDelete(env, "id=?", [submissionId], deletedBy, reason);
   await updateSoftDeleteTable(env, "submission_file_items", "submission_id=?", [submissionId], deletedBy, reason);
   await updateSoftDeleteTable(env, "submission_uploads", "submission_id=?", [submissionId], deletedBy, reason);
   await updateSoftDeleteTable(env, "submission_files", "submission_id=?", [submissionId], deletedBy, reason);
+  return { ok: true, canvas: { attempted, failed } };
 }
 
 async function restoreForm(env: Env, slug: string) {
@@ -3708,7 +3742,10 @@ async function restoreUser(env: Env, userId: string) {
     "submission_id IN (SELECT id FROM submissions WHERE user_id=?)",
     [userId]
   );
-  await canvasApplyTaskForUserCourses(env, userId, "reactivate");
+  const canvasDeleteSyncEnabled = await isCanvasDeleteSyncEnabled(env);
+  if (canvasDeleteSyncEnabled) {
+    await canvasApplyTaskForUserCourses(env, userId, "reactivate");
+  }
   return result.success !== false;
 }
 
@@ -3720,6 +3757,10 @@ async function restoreSubmission(
   await updateRestoreTable(env, "submission_file_items", "submission_id=?", [submissionId]);
   await updateRestoreTable(env, "submission_uploads", "submission_id=?", [submissionId]);
   await updateRestoreTable(env, "submission_files", "submission_id=?", [submissionId]);
+  const canvasDeleteSyncEnabled = await isCanvasDeleteSyncEnabled(env);
+  if (!canvasDeleteSyncEnabled) {
+    return { ok: true, canvasError: null, canvasStatus: "skipped" };
+  }
   const canvasResult = await reactivateCanvasForSubmission(env, submissionId);
   return {
     ok: true,
@@ -3845,7 +3886,10 @@ async function hardDeleteTemplate(env: Env, key: string) {
 
 async function hardDeleteUser(env: Env, userId: string) {
   const accessToken = await getDriveAccessToken(env);
-  await canvasApplyTaskForUserCourses(env, userId, "delete");
+  const canvasDeleteSyncEnabled = await isCanvasDeleteSyncEnabled(env);
+  if (canvasDeleteSyncEnabled) {
+    await canvasApplyTaskForUserCourses(env, userId, "delete");
+  }
   if (accessToken) {
     const userKeys = await getUserDriveKeys(env, userId);
     if (userKeys.length > 0) {
@@ -3956,7 +4000,10 @@ async function hardDeleteFileItem(env: Env, fileId: string) {
 }
 
 async function hardDeleteSubmission(env: Env, submissionId: string) {
-  await unenrollCanvasForSubmission(env, submissionId);
+  const canvasDeleteSyncEnabled = await isCanvasDeleteSyncEnabled(env);
+  if (canvasDeleteSyncEnabled) {
+    await unenrollCanvasForSubmission(env, submissionId);
+  }
   const accessToken = await getDriveAccessToken(env);
   if (accessToken) {
     await deleteDriveFilesForSubmission(env, submissionId, accessToken);
@@ -6158,11 +6205,13 @@ export default {
     if (request.method === "GET" && url.pathname === "/api/settings") {
       const timezoneDefault = await getAppSetting(env, APP_SETTING_DEFAULT_TIMEZONE);
       const canvasCourseSyncMode = await getAppSetting(env, APP_SETTING_CANVAS_COURSE_SYNC_MODE);
+      const canvasDeleteSync = await getAppSetting(env, APP_SETTING_CANVAS_DELETE_SYNC);
       return jsonResponse(
         200,
         {
           timezoneDefault,
           canvasCourseSyncMode: normalizeCanvasCourseSyncMode(canvasCourseSyncMode),
+          canvasDeleteSyncEnabled: normalizeCanvasDeleteSyncEnabled(canvasDeleteSync),
           requestId
         },
         requestId,
@@ -6649,8 +6698,14 @@ export default {
         const body = (await request.json().catch(() => null)) as {
           timezoneDefault?: string | null;
           canvasCourseSyncMode?: string | null;
+          canvasDeleteSyncEnabled?: boolean | null;
         } | null;
-        if (!body || (!("timezoneDefault" in body) && !("canvasCourseSyncMode" in body))) {
+        if (
+          !body ||
+          (!("timezoneDefault" in body) &&
+            !("canvasCourseSyncMode" in body) &&
+            !("canvasDeleteSyncEnabled" in body))
+        ) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             message: "settings_required"
           });
@@ -6686,6 +6741,22 @@ export default {
             const mode = normalizeCanvasCourseSyncMode(body.canvasCourseSyncMode);
             await setAppSetting(env, APP_SETTING_CANVAS_COURSE_SYNC_MODE, mode);
             responsePayload.canvasCourseSyncMode = mode;
+          }
+        }
+
+        if ("canvasDeleteSyncEnabled" in body) {
+          if (body.canvasDeleteSyncEnabled === null) {
+            await deleteAppSetting(env, APP_SETTING_CANVAS_DELETE_SYNC);
+            responsePayload.canvasDeleteSyncEnabled = true;
+          } else if (typeof body.canvasDeleteSyncEnabled !== "boolean") {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "canvasDeleteSyncEnabled",
+              message: "invalid_value"
+            });
+          } else {
+            const value = body.canvasDeleteSyncEnabled ? "enabled" : "disabled";
+            await setAppSetting(env, APP_SETTING_CANVAS_DELETE_SYNC, value);
+            responsePayload.canvasDeleteSyncEnabled = body.canvasDeleteSyncEnabled;
           }
         }
 
@@ -6923,8 +6994,16 @@ export default {
             message: "required"
           });
         }
-        await softDeleteSubmissionById(env, submissionId, adminPayload?.userId ?? null, "admin_delete");
-        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+        const result = await softDeleteSubmissionById(env, submissionId, adminPayload?.userId ?? null, "admin_delete");
+        const attempted = result.canvas?.attempted ?? 0;
+        const failed = result.canvas?.failed ?? 0;
+        const canvasAction = attempted === 0 ? "skipped" : failed > 0 ? "failed" : "deactivated";
+        return jsonResponse(
+          200,
+          { ok: result.ok, canvasAction, canvasAttempts: attempted, canvasFailed: failed, requestId },
+          requestId,
+          corsHeaders
+        );
       }
 
       const canvasReinviteMatch = url.pathname.match(
@@ -7191,7 +7270,7 @@ export default {
         let results: unknown[] = [];
         try {
           const totalRow = await env.DB.prepare(
-            `SELECT COUNT(1) as total FROM email_logs ${whereClause}`
+            `SELECT COUNT(1) as total FROM email_logs l ${whereClause}`
           )
             .bind(...params)
             .first<{ total: number }>();
@@ -7213,7 +7292,7 @@ export default {
             }
             whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
             const totalRow = await env.DB.prepare(
-              `SELECT COUNT(1) as total FROM email_logs ${whereClause}`
+              `SELECT COUNT(1) as total FROM email_logs l ${whereClause}`
             )
               .bind(...params)
               .first<{ total: number }>();
@@ -7234,6 +7313,66 @@ export default {
           requestId,
           corsHeaders
         );
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/admin/emails/presets") {
+        const sampleFormLink = `${env.BASE_URL_WEB ?? ""}#/f/hus-demo-1`;
+        const welcomeMessage = buildCanvasWelcomeMessage({
+          formTitle: "HUS Demo 1",
+          courseLabel: "Demo Course",
+          sectionLabel: "Section 1",
+          submittedName: "Nguyễn Văn An",
+          submittedEmail: "anhduc.hoang1990@gmail.com",
+          studentId: "23001234",
+          className: "K63A5",
+          dob: "1999-11-11",
+          formLink: sampleFormLink
+        });
+        const informMessage = buildCanvasInformMessage({
+          formTitle: "HUS Demo 1",
+          courseLabel: "Demo Course",
+          sectionLabel: "Section 1",
+          submittedName: "Nguyễn Văn An",
+          submittedEmail: "anhduc.hoang1990@gmail.com",
+          studentId: "23001234",
+          className: "K63A5",
+          dob: "1999-11-11",
+          formLink: sampleFormLink
+        });
+        const alertMessage = buildCanvasNameAlertMessage({
+          submittedName: "Nguyễn Văn An",
+          canvasFullName: "Nguyen Van An",
+          canvasDisplayName: "Nguyen Van An",
+          formLink: sampleFormLink
+        });
+        const goodbyeMessage = buildAccountGoodbyeMessage();
+        const data = [
+          {
+            key: "welcome",
+            label: "Welcome message",
+            subject: welcomeMessage.subject,
+            body: welcomeMessage.body
+          },
+          {
+            key: "update",
+            label: "Update message",
+            subject: informMessage.subject,
+            body: informMessage.body
+          },
+          {
+            key: "alert",
+            label: "Name mismatch alert",
+            subject: alertMessage.subject,
+            body: alertMessage.body
+          },
+          {
+            key: "goodbye",
+            label: "Goodbye message",
+            subject: goodbyeMessage.subject,
+            body: goodbyeMessage.body
+          }
+        ];
+        return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
       }
 
       const adminEmailDeleteMatch = url.pathname.match(/^\/api\/admin\/emails\/([^/]+)$/);
@@ -7766,8 +7905,16 @@ export default {
         if (userMatch) {
           const userId = decodeURIComponent(userMatch[1]);
           const authPayload = await getAuthPayload(request, env);
-          await softDeleteUser(env, userId, authPayload?.userId ?? null, "admin_deleted");
-          return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+          const result = await softDeleteUser(env, userId, authPayload?.userId ?? null, "admin_deleted");
+          const attempted = result.canvas?.attempted ?? 0;
+          const failed = result.canvas?.failed ?? 0;
+          const canvasAction = attempted === 0 ? "skipped" : failed > 0 ? "failed" : "deactivated";
+          return jsonResponse(
+            200,
+            { ok: result.ok, canvasAction, canvasAttempts: attempted, canvasFailed: failed, requestId },
+            requestId,
+            corsHeaders
+          );
         }
       }
 
@@ -8035,14 +8182,23 @@ export default {
           });
         }
         let ok = false;
+        let canvasAction: string | null = null;
         if (type === "form") {
           ok = await hardDeleteForm(env, id);
         } else if (type === "template") {
           ok = await hardDeleteTemplate(env, id);
         } else if (type === "user") {
           ok = await hardDeleteUser(env, id);
+          if (ok) {
+            const enabled = await isCanvasDeleteSyncEnabled(env);
+            canvasAction = enabled ? "unenrolled" : "skipped";
+          }
         } else if (type === "submission") {
           ok = await hardDeleteSubmission(env, id);
+          if (ok) {
+            const enabled = await isCanvasDeleteSyncEnabled(env);
+            canvasAction = enabled ? "unenrolled" : "skipped";
+          }
         } else if (type === "file") {
           ok = await hardDeleteFileItem(env, id);
         } else if (type === "email") {
@@ -8055,7 +8211,7 @@ export default {
             message: "unsupported_type"
           });
         }
-        return jsonResponse(200, { ok, requestId }, requestId, corsHeaders);
+        return jsonResponse(200, { ok, canvasAction, requestId }, requestId, corsHeaders);
       }
 
       if (request.method === "POST") {
@@ -8075,6 +8231,11 @@ export default {
           return errorResponse(400, "invalid_json", requestId, corsHeaders);
         }
         const type = (body?.type || "all").toLowerCase();
+        const canvasDeleteSyncEnabled = await isCanvasDeleteSyncEnabled(env);
+        const canvasSummary = {
+          users: { unenrolled: 0, skipped: 0 },
+          submissions: { unenrolled: 0, skipped: 0 }
+        };
         if (type === "all" || type === "forms") {
           const { results } = await env.DB.prepare("SELECT slug FROM forms WHERE deleted_at IS NOT NULL")
             .all<{ slug: string }>();
@@ -8098,7 +8259,14 @@ export default {
             .all<{ id: string }>();
           for (const row of results) {
             if (row?.id) {
-              await hardDeleteUser(env, row.id);
+              const ok = await hardDeleteUser(env, row.id);
+              if (ok) {
+                if (canvasDeleteSyncEnabled) {
+                  canvasSummary.users.unenrolled += 1;
+                } else {
+                  canvasSummary.users.skipped += 1;
+                }
+              }
             }
           }
         }
@@ -8109,7 +8277,14 @@ export default {
             .all<{ id: string }>();
           for (const row of results) {
             if (row?.id) {
-              await hardDeleteSubmission(env, row.id);
+              const ok = await hardDeleteSubmission(env, row.id);
+              if (ok) {
+                if (canvasDeleteSyncEnabled) {
+                  canvasSummary.submissions.unenrolled += 1;
+                } else {
+                  canvasSummary.submissions.skipped += 1;
+                }
+              }
             }
           }
         }
@@ -8135,7 +8310,7 @@ export default {
             }
           }
         }
-        return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+        return jsonResponse(200, { ok: true, canvasSummary, requestId }, requestId, corsHeaders);
       }
       if (request.method === "POST" && url.pathname === "/api/admin/forms/restore") {
         let body: { type?: string; form?: any; template?: any } | null = null;
@@ -9290,8 +9465,16 @@ export default {
         const submissionMatch = url.pathname.match(/^\/api\/admin\/submissions\/([^/]+)$/);
         if (submissionMatch) {
           const submissionId = decodeURIComponent(submissionMatch[1]);
-          await softDeleteSubmissionById(env, submissionId, adminPayload.userId, "admin_deleted");
-          return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+          const result = await softDeleteSubmissionById(env, submissionId, adminPayload.userId, "admin_deleted");
+          const attempted = result.canvas?.attempted ?? 0;
+          const failed = result.canvas?.failed ?? 0;
+          const canvasAction = attempted === 0 ? "skipped" : failed > 0 ? "failed" : "deactivated";
+          return jsonResponse(
+            200,
+            { ok: result.ok, canvasAction, canvasAttempts: attempted, canvasFailed: failed, requestId },
+            requestId,
+            corsHeaders
+          );
         }
       }
 
