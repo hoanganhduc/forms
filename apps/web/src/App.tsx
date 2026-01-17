@@ -106,7 +106,7 @@ function renderRichTextHtml(text: string, markdownEnabled: boolean, inline: bool
     const escaped = escapeHtml(text);
     return inline ? escaped.replace(/\n/g, "<br />") : escaped.replace(/\n/g, "<br />");
   }
-  marked.setOptions({ gfm: true, breaks: true, mangle: false, headerIds: false });
+  marked.setOptions({ gfm: true, breaks: true });
   const html = inline ? marked.parseInline(text) : marked.parse(text);
   return sanitizeRichHtml(String(html));
 }
@@ -191,15 +191,15 @@ function TimezoneSelect({
     const queryWithUnderscores = normalized.replace(/\s+/g, "_");
     const filtered = normalized
       ? ALL_TIMEZONES.filter((tz) => {
-          const tzLower = tz.toLowerCase();
-          const tzSpaces = tzLower.replace(/_/g, " ");
-          return (
-            tzLower.includes(normalized) ||
-            tzLower.includes(queryWithUnderscores) ||
-            tzSpaces.includes(normalized) ||
-            tzSpaces.includes(queryWithSpaces)
-          );
-        })
+        const tzLower = tz.toLowerCase();
+        const tzSpaces = tzLower.replace(/_/g, " ");
+        return (
+          tzLower.includes(normalized) ||
+          tzLower.includes(queryWithUnderscores) ||
+          tzSpaces.includes(normalized) ||
+          tzSpaces.includes(queryWithSpaces)
+        );
+      })
       : ALL_TIMEZONES.slice();
     return filtered;
   }, [query]);
@@ -374,6 +374,8 @@ type FormDetail = {
   password_required?: boolean;
   password_require_access?: boolean;
   password_require_submit?: boolean;
+  reminder_enabled?: boolean;
+  reminder_frequency?: string | null;
   is_open?: boolean;
   canvas_enabled?: boolean;
   canvas_course_id?: string | null;
@@ -1047,13 +1049,13 @@ function updateFieldInSchemaText(
   }
   const currentField = parsed.fields[targetIndex] || {};
   const nextField = { ...currentField, ...payload.field };
-    if (
-      payload.field?.type !== "email" &&
-      payload.field?.type !== "github_username" &&
-      payload.field?.type !== "date"
-    ) {
-      delete (nextField as any).rules;
-    }
+  if (
+    payload.field?.type !== "email" &&
+    payload.field?.type !== "github_username" &&
+    payload.field?.type !== "date"
+  ) {
+    delete (nextField as any).rules;
+  }
   parsed.fields[targetIndex] = nextField;
   return { text: JSON.stringify(parsed, null, 2) };
 }
@@ -1653,8 +1655,8 @@ function parseFileRules(raw: string | null | undefined): FieldRuleset {
         const record = value as Record<string, unknown>;
         const extensions = Array.isArray(record.extensions)
           ? record.extensions
-              .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
-              .filter((ext) => ext.length > 0)
+            .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
+            .filter((ext) => ext.length > 0)
           : [];
         const maxBytes = typeof record.maxBytes === "number" ? record.maxBytes : defaultRule.maxBytes;
         const maxFiles = typeof record.maxFiles === "number" ? record.maxFiles : defaultRule.maxFiles;
@@ -1665,15 +1667,15 @@ function parseFileRules(raw: string | null | undefined): FieldRuleset {
     const record = parsed as Record<string, unknown>;
     const extensions = Array.isArray(record.allowedExtensions)
       ? record.allowedExtensions
-          .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
-          .filter((ext) => ext.length > 0)
+        .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
+        .filter((ext) => ext.length > 0)
       : [];
     const maxBytes =
       typeof record.maxFileSizeBytes === "number"
         ? record.maxFileSizeBytes
         : typeof record.maxSizeBytes === "number"
-        ? record.maxSizeBytes
-        : defaultRule.maxBytes;
+          ? record.maxSizeBytes
+          : defaultRule.maxBytes;
     const maxFiles = typeof record.maxFiles === "number" ? record.maxFiles : defaultRule.maxFiles;
     return { fields: {}, defaultRule: { extensions, maxBytes, maxFiles } };
   } catch (error) {
@@ -1782,13 +1784,13 @@ function AuthBar({
         <>
           <div className="auth-user">
             <div className="auth-user-title">Signed in</div>
-          <div className="auth-user-meta">
-            {getUserDisplayName(user)} -{" "}
-            {providerIcon ? <i className={`bi ${providerIcon}`} aria-hidden="true" /> : null}{" "}
-            {providerLabel}
+            <div className="auth-user-meta">
+              {getUserDisplayName(user)} -{" "}
+              {providerIcon ? <i className={`bi ${providerIcon}`} aria-hidden="true" /> : null}{" "}
+              {providerLabel}
+            </div>
           </div>
-          </div>
-          <button type="button" className="btn btn-outline-secondary btn-sm" onClick={onLogout}>
+          <button type="button" className="btn btn-outline-secondary btn-sm" onClick={() => onLogout()}>
             <i className="bi bi-box-arrow-right" aria-hidden="true" /> Logout
           </button>
         </>
@@ -2355,7 +2357,7 @@ function FormPage({
     let active = true;
     async function loadFilesForSubmission(id: string) {
       const response = await apiFetch(
-        `${API_BASE}/api/forms/${form.slug}/files?submissionId=${encodeURIComponent(id)}`
+        `${API_BASE}/api/forms/${form?.slug || ""}/files?submissionId=${encodeURIComponent(id)}`
       );
       const payload = await response.json().catch(() => null);
       if (!active) return;
@@ -2369,7 +2371,7 @@ function FormPage({
         return;
       }
       const response = await apiFetch(
-        `${API_BASE}/api/forms/${encodeURIComponent(form.slug)}/my-submission`
+        `${API_BASE}/api/forms/${encodeURIComponent(form?.slug || "")}/my-submission`
       );
       const text = await response.text();
       let payload: any = null;
@@ -2384,7 +2386,7 @@ function FormPage({
         const submissionData = payload.data.data_json ?? payload.data.data ?? null;
         if (submissionData && typeof submissionData === "object") {
           const nextValues: Record<string, string> = { ...(submissionData as Record<string, string>) };
-          form.fields
+          form?.fields || []
             .filter((field) => field.type === "date")
             .forEach((field) => {
               const raw = (submissionData as Record<string, unknown>)[field.id];
@@ -2403,8 +2405,8 @@ function FormPage({
                   mode === "time"
                     ? utcToLocalTimeOnly(raw, tz)
                     : mode === "date"
-                    ? utcToLocalDateOnly(raw, tz)
-                    : utcToLocalDateTime(raw, tz);
+                      ? utcToLocalDateOnly(raw, tz)
+                      : utcToLocalDateTime(raw, tz);
                 if (local) {
                   nextValues[field.id] = local;
                 }
@@ -2563,35 +2565,35 @@ function FormPage({
   const submitLabel = "Submit";
   const isFormComplete = Boolean(
     form &&
-      form.fields.every((field) => {
-        if (field.type === "file") {
-          const files = selectedFiles[field.id] || [];
-          const existing = existingFilesByField[field.id] || [];
-          if (field.required && files.length === 0 && existing.length === 0) return false;
-          return true;
-        }
-        const raw = values[field.id] || "";
-        const autofillValue = getAutofillValue(field);
-        const value = (raw.trim() || autofillValue).trim();
-        if (field.required && !value) return false;
-        if (value && validateFieldValue(field, value)) return false;
+    form.fields.every((field) => {
+      if (field.type === "file") {
+        const files = selectedFiles[field.id] || [];
+        const existing = existingFilesByField[field.id] || [];
+        if (field.required && files.length === 0 && existing.length === 0) return false;
         return true;
-      }) &&
-      hasPassword
+      }
+      const raw = values[field.id] || "";
+      const autofillValue = getAutofillValue(field);
+      const value = (raw.trim() || autofillValue).trim();
+      if (field.required && !value) return false;
+      if (value && validateFieldValue(field, value)) return false;
+      return true;
+    }) &&
+    hasPassword
   );
   const submitDisabledReason = !canSubmit
     ? "Please sign in to submit."
     : !isOpen
-    ? "Form is closed."
-    : locked
-    ? "Form is locked."
-    : isAnyUploading
-    ? "Files are uploading."
-    : !hasPassword
-    ? "Enter the form password."
-    : !isFormComplete
-    ? "Complete required fields and select required files."
-    : "";
+      ? "Form is closed."
+      : locked
+        ? "Form is locked."
+        : isAnyUploading
+          ? "Files are uploading."
+          : !hasPassword
+            ? "Enter the form password."
+            : !isFormComplete
+              ? "Complete required fields and select required files."
+              : "";
   const canvasFieldsPosition = form?.canvas_fields_position || "bottom";
   const canvasCourseTitle =
     form?.canvas_enabled && form?.canvas_course_name ? form.canvas_course_name : null;
@@ -3094,7 +3096,7 @@ function FormPage({
   });
   if (canvasNodes.length > 0) {
     if (canvasFieldsPosition === "top") {
-      fieldNodes.unshift(...canvasNodes);
+      fieldNodes.unshift(...(canvasNodes as any[]));
     } else if (canvasFieldsPosition === "after_identity") {
       let insertAfter = -1;
       form?.fields?.forEach((field, index) => {
@@ -3106,12 +3108,12 @@ function FormPage({
         insertAfter = 0;
       }
       if (insertAfter < 0) {
-        fieldNodes.unshift(...canvasNodes);
+        fieldNodes.unshift(...(canvasNodes as any[]));
       } else {
-        fieldNodes.splice(insertAfter + 1, 0, ...canvasNodes);
+        fieldNodes.splice(insertAfter + 1, 0, ...(canvasNodes as any[]));
       }
     } else {
-      fieldNodes.push(...canvasNodes);
+      fieldNodes.push(...(canvasNodes as any[]));
     }
   }
 
@@ -3267,9 +3269,8 @@ function FormPage({
           : "";
         const serverInfo =
           payload?.detail?.maxFiles || payload?.detail?.maxBytes
-            ? ` Server limits: maxFiles=${payload?.detail?.maxFiles ?? "n/a"}, maxBytes=${
-                payload?.detail?.maxBytes ?? "n/a"
-              }.`
+            ? ` Server limits: maxFiles=${payload?.detail?.maxFiles ?? "n/a"}, maxBytes=${payload?.detail?.maxBytes ?? "n/a"
+            }.`
             : "";
         throw new Error(
           `${payload?.error || "Upload failed"}${serverMessage ? `: ${serverMessage}` : ""}.${info}${details}${guidance}${serverInfo}`.trim()
@@ -3517,8 +3518,8 @@ function FormPage({
           mode === "time"
             ? timeOnlyToUtcIso(normalized, tz)
             : mode === "date"
-            ? dateOnlyToUtcIso(normalized, tz)
-            : zonedTimeToUtcIso(normalized, tz);
+              ? dateOnlyToUtcIso(normalized, tz)
+              : zonedTimeToUtcIso(normalized, tz);
         if (!utcIso) {
           errors[field.id] = mode === "time" ? "Invalid time" : mode === "date" ? "Invalid date" : "Invalid date/time";
           return;
@@ -4305,18 +4306,18 @@ function NotFoundPage() {
 }
 
 function DashboardPage({
-    user,
-    onLogin,
-    onNotice,
-    markdownEnabled,
-    mathjaxEnabled
-  }: {
-    user: UserInfo | null;
-    onLogin: (provider: "google" | "github") => void;
-    onNotice: (message: string, type?: NoticeType) => void;
-    markdownEnabled: boolean;
-    mathjaxEnabled: boolean;
-  }) {
+  user,
+  onLogin,
+  onNotice,
+  markdownEnabled,
+  mathjaxEnabled
+}: {
+  user: UserInfo | null;
+  onLogin: (provider: "google" | "github") => void;
+  onNotice: (message: string, type?: NoticeType) => void;
+  markdownEnabled: boolean;
+  mathjaxEnabled: boolean;
+}) {
   const [loading, setLoading] = useState(true);
   const [items, setItems] = useState<any[]>([]);
   const [error, setError] = useState<ApiError | null>(null);
@@ -4449,15 +4450,15 @@ function DashboardPage({
                 return (
                   <tr key={latest.id || slug}>
                     <td>
-                        <a className="text-decoration-none" href={`${PUBLIC_BASE}#/f/${slug}`}>
-                          <i className="bi bi-ui-checks" aria-hidden="true" />{" "}
-                          <RichText
-                            text={form.title || slug}
-                            markdownEnabled={markdownEnabled}
-                            mathjaxEnabled={mathjaxEnabled}
-                            inline
-                          />
-                        </a>
+                      <a className="text-decoration-none" href={`${PUBLIC_BASE}#/f/${slug}`}>
+                        <i className="bi bi-ui-checks" aria-hidden="true" />{" "}
+                        <RichText
+                          text={form.title || slug}
+                          markdownEnabled={markdownEnabled}
+                          mathjaxEnabled={mathjaxEnabled}
+                          inline
+                        />
+                      </a>
                       <div className="muted">{slug}</div>
                       {form.deleted_at ? <div className="muted">Deleted</div> : null}
                     </td>
@@ -4490,25 +4491,25 @@ function DashboardPage({
                     </td>
                     <td>
                       <div className="d-flex gap-2 flex-wrap">
-                      <a className="btn btn-outline-primary btn-sm" href={`${PUBLIC_BASE}#/f/${slug}`}>
-                        <i className="bi bi-pencil-square" aria-hidden="true" />{" "}
-                        {entry.canEdit ? "Edit" : "Open"}
-                      </a>
-                      {entry.latestSubmissionId ? (
-                        <Link
-                          className="btn btn-outline-secondary btn-sm"
-                          to={`/me/submissions/${entry.latestSubmissionId}`}
+                        <a className="btn btn-outline-primary btn-sm" href={`${PUBLIC_BASE}#/f/${slug}`}>
+                          <i className="bi bi-pencil-square" aria-hidden="true" />{" "}
+                          {entry.canEdit ? "Edit" : "Open"}
+                        </a>
+                        {entry.latestSubmissionId ? (
+                          <Link
+                            className="btn btn-outline-secondary btn-sm"
+                            to={`/me/submissions/${entry.latestSubmissionId}`}
+                          >
+                            <i className="bi bi-eye" aria-hidden="true" /> View
+                          </Link>
+                        ) : null}
+                        <button
+                          type="button"
+                          className="btn btn-outline-danger btn-sm"
+                          onClick={() => handleDeleteSubmission(slug, Boolean(form.canvas_enabled))}
                         >
-                          <i className="bi bi-eye" aria-hidden="true" /> View
-                        </Link>
-                      ) : null}
-                      <button
-                        type="button"
-                        className="btn btn-outline-danger btn-sm"
-                        onClick={() => handleDeleteSubmission(slug, Boolean(form.canvas_enabled))}
-                      >
-                        <i className="bi bi-trash" aria-hidden="true" /> Delete
-                      </button>
+                          <i className="bi bi-trash" aria-hidden="true" /> Delete
+                        </button>
                       </div>
                     </td>
                   </tr>
@@ -4814,16 +4815,16 @@ function CanvasPage({
 
   const hasCanvasInfo = Boolean(
     canvasInfo &&
-      (canvasInfo.user_id ||
-        canvasInfo.course_id ||
-        canvasInfo.course_name ||
-        canvasInfo.course_code ||
-        canvasInfo.section_id ||
-        canvasInfo.section_name ||
-        canvasInfo.status ||
-        canvasInfo.name ||
-        canvasInfo.enrolled_at ||
-        canvasInfo.form_title)
+    (canvasInfo.user_id ||
+      canvasInfo.course_id ||
+      canvasInfo.course_name ||
+      canvasInfo.course_code ||
+      canvasInfo.section_id ||
+      canvasInfo.section_name ||
+      canvasInfo.status ||
+      canvasInfo.name ||
+      canvasInfo.enrolled_at ||
+      canvasInfo.form_title)
   );
 
   return (
@@ -4848,16 +4849,16 @@ function CanvasPage({
             <h3 className="mb-0">Your Canvas enrollment</h3>
           </div>
           <div className="row g-3">
-            {canvasInfo?.full_name ? (
+            {(canvasInfo as any)?.full_name ? (
               <div className="col-md-6">
                 <div className="muted">Canvas full name</div>
-                <div>{canvasInfo.full_name}</div>
+                <div>{(canvasInfo as any).full_name}</div>
               </div>
             ) : null}
-            {canvasInfo?.display_name ? (
+            {(canvasInfo as any)?.display_name ? (
               <div className="col-md-6">
                 <div className="muted">Canvas display name</div>
-                <div>{canvasInfo.display_name}</div>
+                <div>{(canvasInfo as any).display_name}</div>
               </div>
             ) : null}
             {canvasInfo?.user_id ? (
@@ -4970,7 +4971,7 @@ function SubmissionDetailPage({
     let active = true;
     async function loadSubmission() {
       setLoading(true);
-      const response = await apiFetch(`${API_BASE}/api/me/submissions/${encodeURIComponent(id)}`);
+      const response = await apiFetch(`${API_BASE}/api/me/submissions/${encodeURIComponent(String(id))}`);
       const payload = await response.json().catch(() => null);
       if (!active) return;
       if (!response.ok) {
@@ -5178,9 +5179,9 @@ function SubmissionDetailPage({
             <div className="muted">
               Canvas enrollment: {data.canvas.status === "deleted" ? "unenrolled" : data.canvas.status}
               {data.canvas.error &&
-              data.canvas.status !== "deactivated" &&
-              data.canvas.status !== "deleted" &&
-              data.canvas.status !== "invited"
+                data.canvas.status !== "deactivated" &&
+                data.canvas.status !== "deleted" &&
+                data.canvas.status !== "invited"
                 ? ` (${data.canvas.error})`
                 : ""}
             </div>
@@ -5213,75 +5214,75 @@ function SubmissionDetailPage({
               <div className="table-responsive">
                 <table className="table table-sm">
                   <tbody>
-                  {(() => {
-                    const dataObject = data.data_json as Record<string, unknown>;
-                    const orderedKeys = fieldOrder.filter(
-                      (key) => key in dataObject && fieldMeta[key]?.type !== "file"
-                    );
-                    const remainingKeys = Object.keys(dataObject).filter(
-                      (key) =>
-                        !orderedKeys.includes(key) &&
-                        !key.endsWith("__tz") &&
-                        fieldMeta[key]?.type !== "file"
-                    );
-                    const allKeys = [...orderedKeys, ...remainingKeys];
-                    if (allKeys.length === 0) {
-                      return (
-                        <tr>
-                          <td className="muted">No data</td>
-                        </tr>
+                    {(() => {
+                      const dataObject = data.data_json as Record<string, unknown>;
+                      const orderedKeys = fieldOrder.filter(
+                        (key) => key in dataObject && fieldMeta[key]?.type !== "file"
                       );
-                    }
-                    return allKeys.map((key) => {
-                      const meta = fieldMeta[key];
-                      const raw = dataObject[key];
-                      if (meta?.type === "date" && typeof raw === "string") {
-                        const rules = meta.rules || {};
-                        const mode =
-                          typeof rules.mode === "string" && rules.mode.trim()
-                            ? rules.mode.trim()
-                            : "datetime";
-                        const showTimezone = rules.timezoneOptional !== true;
-                        const tzKey = `${key}__tz`;
-                        const tzValue =
-                          typeof dataObject[tzKey] === "string" && String(dataObject[tzKey]).trim()
-                            ? String(dataObject[tzKey])
-                            : typeof rules.timezoneDefault === "string"
-                              ? String(rules.timezoneDefault)
-                              : getAppDefaultTimezone();
-                        const displayValue = raw.endsWith("Z")
-                          ? mode === "time"
-                            ? utcToLocalTimeOnly(raw, tzValue)
-                            : mode === "date"
-                              ? utcToLocalDateOnly(raw, tzValue)
-                              : utcToLocalDateTime(raw, tzValue)
-                          : raw;
+                      const remainingKeys = Object.keys(dataObject).filter(
+                        (key) =>
+                          !orderedKeys.includes(key) &&
+                          !key.endsWith("__tz") &&
+                          fieldMeta[key]?.type !== "file"
+                      );
+                      const allKeys = [...orderedKeys, ...remainingKeys];
+                      if (allKeys.length === 0) {
+                        return (
+                          <tr>
+                            <td className="muted">No data</td>
+                          </tr>
+                        );
+                      }
+                      return allKeys.map((key) => {
+                        const meta = fieldMeta[key];
+                        const raw = dataObject[key];
+                        if (meta?.type === "date" && typeof raw === "string") {
+                          const rules = meta.rules || {};
+                          const mode =
+                            typeof rules.mode === "string" && rules.mode.trim()
+                              ? rules.mode.trim()
+                              : "datetime";
+                          const showTimezone = rules.timezoneOptional !== true;
+                          const tzKey = `${key}__tz`;
+                          const tzValue =
+                            typeof dataObject[tzKey] === "string" && String(dataObject[tzKey]).trim()
+                              ? String(dataObject[tzKey])
+                              : typeof rules.timezoneDefault === "string"
+                                ? String(rules.timezoneDefault)
+                                : getAppDefaultTimezone();
+                          const displayValue = raw.endsWith("Z")
+                            ? mode === "time"
+                              ? utcToLocalTimeOnly(raw, tzValue)
+                              : mode === "date"
+                                ? utcToLocalDateOnly(raw, tzValue)
+                                : utcToLocalDateTime(raw, tzValue)
+                            : raw;
+                          return (
+                            <tr key={key}>
+                              <th className="text-nowrap">{renderLabel(meta?.label || key)}</th>
+                              <td className="text-break">
+                                <div>{renderValue(displayValue || "n/a")}</div>
+                                {showTimezone && tzValue ? (
+                                  <div className="muted">Timezone: {tzValue}</div>
+                                ) : null}
+                              </td>
+                            </tr>
+                          );
+                        }
                         return (
                           <tr key={key}>
                             <th className="text-nowrap">{renderLabel(meta?.label || key)}</th>
                             <td className="text-break">
-                              <div>{renderValue(displayValue || "n/a")}</div>
-                              {showTimezone && tzValue ? (
-                                <div className="muted">Timezone: {tzValue}</div>
-                              ) : null}
+                              {typeof raw === "string"
+                                ? renderValue(raw)
+                                : typeof raw === "number" || typeof raw === "boolean"
+                                  ? String(raw)
+                                  : JSON.stringify(raw)}
                             </td>
                           </tr>
                         );
-                      }
-                      return (
-                        <tr key={key}>
-                          <th className="text-nowrap">{renderLabel(meta?.label || key)}</th>
-                          <td className="text-break">
-                            {typeof raw === "string"
-                              ? renderValue(raw)
-                              : typeof raw === "number" || typeof raw === "boolean"
-                                ? String(raw)
-                                : JSON.stringify(raw)}
-                          </td>
-                        </tr>
-                      );
-                    });
-                  })()}
+                      });
+                    })()}
                   </tbody>
                 </table>
               </div>
@@ -5594,8 +5595,8 @@ function AdminCanvasPage({
       task === "delete"
         ? "Enrollment deleted."
         : task === "reactivate"
-        ? "Enrollment reactivated."
-        : "Enrollment deactivated.",
+          ? "Enrollment reactivated."
+          : "Enrollment deactivated.",
       "success"
     );
     setCourses((prev) =>
@@ -5603,18 +5604,18 @@ function AdminCanvasPage({
         ...course,
         registrations: Array.isArray(course.registrations)
           ? course.registrations.map((reg: any) =>
-              reg.submission_id === submissionId
-                ? {
-                    ...reg,
-                    status:
-                      task === "delete"
-                        ? "deleted"
-                        : task === "reactivate"
-                        ? "invited"
-                        : "deactivated"
-                  }
-                : reg
-            )
+            reg.submission_id === submissionId
+              ? {
+                ...reg,
+                status:
+                  task === "delete"
+                    ? "deleted"
+                    : task === "reactivate"
+                      ? "invited"
+                      : "deactivated"
+              }
+              : reg
+          )
           : course.registrations
       }))
     );
@@ -5645,10 +5646,10 @@ function AdminCanvasPage({
         ...course,
         registrations: Array.isArray(course.registrations)
           ? course.registrations.map((reg: any) =>
-              reg.submission_id === submissionId
-                ? { ...reg, status: payload?.status || "invited", error: payload?.error || null }
-                : reg
-            )
+            reg.submission_id === submissionId
+              ? { ...reg, status: payload?.status || "invited", error: payload?.error || null }
+              : reg
+          )
           : course.registrations
       }))
     );
@@ -6045,10 +6046,9 @@ function AdminCanvasPage({
                       {user.courses
                         .map(
                           (course: any) =>
-                            `${course.name || course.id}${
-                              Array.isArray(course.roles) && course.roles.length > 0
-                                ? ` (${course.roles.join(", ")})`
-                                : ""
+                            `${course.name || course.id}${Array.isArray(course.roles) && course.roles.length > 0
+                              ? ` (${course.roles.join(", ")})`
+                              : ""
                             }`
                         )
                         .join("; ")}
@@ -6214,8 +6214,8 @@ function AdminCanvasPage({
                         <td>
                           {reg.name || "n/a"}
                           {reg.name &&
-                          (!reg.canvas_full_name || !reg.canvas_display_name) &&
-                          reg.status !== "deleted" ? (
+                            (!reg.canvas_full_name || !reg.canvas_display_name) &&
+                            reg.status !== "deleted" ? (
                             <span className="badge text-bg-warning ms-2">
                               <i className="bi bi-person-x" aria-hidden="true" /> Missing in Canvas
                             </span>
@@ -6226,7 +6226,7 @@ function AdminCanvasPage({
                             (normalizeNameValue(reg.name) !==
                               normalizeNameValue(reg.canvas_full_name) ||
                               normalizeNameValue(reg.name) !==
-                                normalizeNameValue(reg.canvas_display_name)) ? (
+                              normalizeNameValue(reg.canvas_display_name)) ? (
                             <span className="badge text-bg-warning ms-2">
                               <i className="bi bi-exclamation-triangle" aria-hidden="true" /> Mismatch
                             </span>
@@ -6241,31 +6241,29 @@ function AdminCanvasPage({
                         <td>{reg.email || reg.github_username || reg.user_id || "n/a"}</td>
                         <td>
                           <span
-                            className={`badge ${
-                              reg.status === "invited"
-                                ? "text-bg-success"
-                                : reg.status === "failed"
+                            className={`badge ${reg.status === "invited"
+                              ? "text-bg-success"
+                              : reg.status === "failed"
                                 ? "text-bg-danger"
                                 : reg.status === "deactivated"
-                                ? "text-bg-warning"
-                                : reg.status === "deleted"
-                                ? "text-bg-dark"
-                                : "text-bg-secondary"
-                            }`}
+                                  ? "text-bg-warning"
+                                  : reg.status === "deleted"
+                                    ? "text-bg-dark"
+                                    : "text-bg-secondary"
+                              }`}
                             title={reg.error || ""}
                           >
                             <i
-                              className={`bi ${
-                                reg.status === "invited"
-                                  ? "bi-check-circle"
-                                  : reg.status === "failed"
+                              className={`bi ${reg.status === "invited"
+                                ? "bi-check-circle"
+                                : reg.status === "failed"
                                   ? "bi-exclamation-triangle"
                                   : reg.status === "deactivated"
-                                  ? "bi-person-dash"
-                                  : reg.status === "deleted"
-                                  ? "bi-person-x"
-                                  : "bi-clock"
-                              }`}
+                                    ? "bi-person-dash"
+                                    : reg.status === "deleted"
+                                      ? "bi-person-x"
+                                      : "bi-clock"
+                                }`}
                               aria-hidden="true"
                             />{" "}
                             {reg.status === "deleted" ? "unenrolled" : reg.status}
@@ -6312,8 +6310,8 @@ function AdminCanvasPage({
                         <td>
                           <div className="d-flex flex-wrap gap-2">
                             {reg.name &&
-                            (!reg.canvas_full_name || !reg.canvas_display_name) &&
-                            reg.status !== "deleted" ? (
+                              (!reg.canvas_full_name || !reg.canvas_display_name) &&
+                              reg.status !== "deleted" ? (
                               <button
                                 type="button"
                                 className="btn btn-outline-warning"
@@ -6322,12 +6320,12 @@ function AdminCanvasPage({
                                 <i className="bi bi-person-x" aria-hidden="true" /> Alert
                               </button>
                             ) : reg.name &&
-                            reg.canvas_full_name &&
-                            reg.canvas_display_name &&
-                            reg.status !== "deleted" &&
-                            (normalizeNameValue(reg.name) !==
-                              normalizeNameValue(reg.canvas_full_name) ||
-                              normalizeNameValue(reg.name) !==
+                              reg.canvas_full_name &&
+                              reg.canvas_display_name &&
+                              reg.status !== "deleted" &&
+                              (normalizeNameValue(reg.name) !==
+                                normalizeNameValue(reg.canvas_full_name) ||
+                                normalizeNameValue(reg.name) !==
                                 normalizeNameValue(reg.canvas_display_name)) ? (
                               <button
                                 type="button"
@@ -6406,8 +6404,8 @@ function AdminCanvasPage({
                                     ...course,
                                     registrations: Array.isArray(course.registrations)
                                       ? course.registrations.filter(
-                                          (item: any) => item.submission_id !== reg.submission_id
-                                        )
+                                        (item: any) => item.submission_id !== reg.submission_id
+                                      )
                                       : course.registrations
                                   }))
                                 );
@@ -7213,9 +7211,8 @@ function AdminPage({
                       <div className="status-badges status-badges--forms">
                         <button
                           type="button"
-                          className={`badge status-pill status-pill--lock ${
-                            form.is_locked ? "text-bg-danger" : "text-bg-success"
-                          }`}
+                          className={`badge status-pill status-pill--lock ${form.is_locked ? "text-bg-danger" : "text-bg-success"
+                            }`}
                           title={form.is_locked ? "Form is locked" : "Form is open"}
                           disabled={statusActionId === form.slug}
                           onClick={() =>
@@ -7231,9 +7228,8 @@ function AdminPage({
                         </button>
                         <button
                           type="button"
-                          className={`badge status-pill status-pill--visibility ${
-                            form.is_public ? "text-bg-info" : "text-bg-secondary"
-                          }`}
+                          className={`badge status-pill status-pill--visibility ${form.is_public ? "text-bg-info" : "text-bg-secondary"
+                            }`}
                           title={form.is_public ? "Public form" : "Private form"}
                           disabled={statusActionId === form.slug}
                           onClick={() =>
@@ -7295,8 +7291,8 @@ function AdminPage({
                         {form.updated_at
                           ? formatTimeICT(form.updated_at)
                           : form.created_at
-                          ? formatTimeICT(form.created_at)
-                          : "n/a"}
+                            ? formatTimeICT(form.created_at)
+                            : "n/a"}
                       </div>
                     </td>
                     <td>{Number(form.submission_count) || 0}</td>
@@ -7423,8 +7419,8 @@ function AdminPage({
                         {template.updated_at
                           ? formatTimeICT(template.updated_at)
                           : template.created_at
-                          ? formatTimeICT(template.created_at)
-                          : "n/a"}
+                            ? formatTimeICT(template.created_at)
+                            : "n/a"}
                       </div>
                     </td>
                     <td>
@@ -7545,12 +7541,12 @@ function AdminPage({
                     canvasStatus === "invited"
                       ? "text-bg-info"
                       : canvasStatus === "failed"
-                      ? "text-bg-danger"
-                      : canvasStatus === "pending"
-                      ? "text-bg-warning"
-                      : canvasStatus
-                      ? "text-bg-success"
-                      : "text-bg-secondary";
+                        ? "text-bg-danger"
+                        : canvasStatus === "pending"
+                          ? "text-bg-warning"
+                          : canvasStatus
+                            ? "text-bg-success"
+                            : "text-bg-secondary";
                   return (
                     <tr key={item.id}>
                       <td>
@@ -7614,45 +7610,45 @@ function AdminPage({
                               <i className="bi bi-shield-plus" aria-hidden="true" /> Promote
                             </button>
                           ) : null}
-                        <button
-                          type="button"
-                          className="btn btn-outline-danger btn-sm"
-                          onClick={async () => {
-                            if (!window.confirm("Move this user to trash?")) return;
-                            const response = await apiFetch(
-                              `${API_BASE}/api/admin/users/${encodeURIComponent(item.id)}`,
-                              { method: "DELETE" }
-                            );
-                            const payload = await response.json().catch(() => null);
-                            if (!response.ok) {
-                              onNotice(payload?.error || "Failed to move user to trash.", "warning");
-                              return;
-                            }
-                            if (payload?.canvasAction) {
-                              const canvasLabel =
-                                payload.canvasAction === "deactivated"
-                                  ? "deactivated"
-                                  : payload.canvasAction === "failed"
-                                    ? "failed"
-                                    : "skipped";
-                              onNotice(
-                                `User moved to trash. Canvas deactivation: ${canvasLabel}.`,
-                                payload.canvasAction === "failed" ? "warning" : "success"
+                          <button
+                            type="button"
+                            className="btn btn-outline-danger btn-sm"
+                            onClick={async () => {
+                              if (!window.confirm("Move this user to trash?")) return;
+                              const response = await apiFetch(
+                                `${API_BASE}/api/admin/users/${encodeURIComponent(item.id)}`,
+                                { method: "DELETE" }
                               );
-                            } else {
-                              onNotice("User moved to trash.", "success");
-                            }
-                            loadAdmin();
-                          }}
-                        >
-                          <i className="bi bi-trash" aria-hidden="true" /> Delete
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
+                              const payload = await response.json().catch(() => null);
+                              if (!response.ok) {
+                                onNotice(payload?.error || "Failed to move user to trash.", "warning");
+                                return;
+                              }
+                              if (payload?.canvasAction) {
+                                const canvasLabel =
+                                  payload.canvasAction === "deactivated"
+                                    ? "deactivated"
+                                    : payload.canvasAction === "failed"
+                                      ? "failed"
+                                      : "skipped";
+                                onNotice(
+                                  `User moved to trash. Canvas deactivation: ${canvasLabel}.`,
+                                  payload.canvasAction === "failed" ? "warning" : "success"
+                                );
+                              } else {
+                                onNotice("User moved to trash.", "success");
+                              }
+                              loadAdmin();
+                            }}
+                          >
+                            <i className="bi bi-trash" aria-hidden="true" /> Delete
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
             </table>
           </div>
         )}
@@ -7783,51 +7779,51 @@ function AdminPage({
                           </div>
                         ) : null}
                       </td>
-                    <td>
-                      {item.submitter_email ||
-                        item.submitter_github_username ||
-                        userOptions.find((option) => option.id === item.user_id)?.label ||
-                        item.user_id ||
-                        "n/a"}
-                    </td>
-                    <td>{item.created_at ? formatTimeICT(item.created_at) : "n/a"}</td>
-                    <td>
-                      <div className="d-flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          className="btn btn-outline-danger btn-sm"
-                          onClick={async () => {
-                            if (!window.confirm("Move this submission to trash?")) return;
-                            const response = await apiFetch(
-                              `${API_BASE}/api/admin/submissions/${encodeURIComponent(item.id)}`,
-                              { method: "DELETE" }
-                            );
-                            const payload = await response.json().catch(() => null);
-                            if (!response.ok) {
-                              onNotice(payload?.error || "Failed to move submission to trash.", "warning");
-                              return;
-                            }
-                            if (payload?.canvasAction) {
-                              const canvasLabel =
-                                payload.canvasAction === "deactivated"
-                                  ? "deactivated"
-                                  : payload.canvasAction === "failed"
-                                    ? "failed"
-                                    : "skipped";
-                              onNotice(
-                                `Submission moved to trash. Canvas deactivation: ${canvasLabel}.`,
-                                payload.canvasAction === "failed" ? "warning" : "success"
+                      <td>
+                        {item.submitter_email ||
+                          item.submitter_github_username ||
+                          userOptions.find((option) => option.id === item.user_id)?.label ||
+                          item.user_id ||
+                          "n/a"}
+                      </td>
+                      <td>{item.created_at ? formatTimeICT(item.created_at) : "n/a"}</td>
+                      <td>
+                        <div className="d-flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            className="btn btn-outline-danger btn-sm"
+                            onClick={async () => {
+                              if (!window.confirm("Move this submission to trash?")) return;
+                              const response = await apiFetch(
+                                `${API_BASE}/api/admin/submissions/${encodeURIComponent(item.id)}`,
+                                { method: "DELETE" }
                               );
-                            } else {
-                              onNotice("Submission moved to trash.", "success");
-                            }
-                            loadAdmin();
-                          }}
-                        >
-                          <i className="bi bi-trash" aria-hidden="true" /> Delete
-                        </button>
-                      </div>
-                    </td>
+                              const payload = await response.json().catch(() => null);
+                              if (!response.ok) {
+                                onNotice(payload?.error || "Failed to move submission to trash.", "warning");
+                                return;
+                              }
+                              if (payload?.canvasAction) {
+                                const canvasLabel =
+                                  payload.canvasAction === "deactivated"
+                                    ? "deactivated"
+                                    : payload.canvasAction === "failed"
+                                      ? "failed"
+                                      : "skipped";
+                                onNotice(
+                                  `Submission moved to trash. Canvas deactivation: ${canvasLabel}.`,
+                                  payload.canvasAction === "failed" ? "warning" : "success"
+                                );
+                              } else {
+                                onNotice("Submission moved to trash.", "success");
+                              }
+                              loadAdmin();
+                            }}
+                          >
+                            <i className="bi bi-trash" aria-hidden="true" /> Delete
+                          </button>
+                        </div>
+                      </td>
                     </tr>
                   );
                 })}
@@ -7960,13 +7956,12 @@ function AdminPage({
                     <td>
                       <button
                         type="button"
-                        className={`badge border-0 ${
-                          task.last_status === "ok"
-                            ? "text-bg-success"
-                            : task.last_status
+                        className={`badge border-0 ${task.last_status === "ok"
+                          ? "text-bg-success"
+                          : task.last_status
                             ? "text-bg-warning"
                             : "text-bg-secondary"
-                        }`}
+                          }`}
                         onClick={async () => {
                           const nextId = activeRoutineLogId === task.id ? null : task.id;
                           setActiveRoutineLogId(nextId);
@@ -8317,14 +8312,14 @@ function AdminEmailsPage({
         return;
       }
       setTestPresetList(
-        payload.data
-          .map((item: any) => ({
-            key: String(item.key || ""),
-            label: String(item.label || item.key || ""),
-            subject: typeof item.subject === "string" ? item.subject : "",
-            body: typeof item.body === "string" ? item.body : ""
+        Array.isArray(payload?.data)
+          ? payload.data.map((p: any) => ({
+            key: String(p.key),
+            label: String(p.label),
+            subject: p.subject ? String(p.subject) : undefined,
+            body: p.body ? String(p.body) : undefined
           }))
-          .filter((item) => item.key)
+          : []
       );
     }
     loadPresets();
@@ -8419,11 +8414,11 @@ function AdminEmailsPage({
                 const nextKey = event.target.value;
                 setTestPresetKey(nextKey);
                 const preset = testPresets.find((item) => item.key === nextKey);
-                if (preset?.subject) {
-                  setTestSubject(preset.subject);
+                if ((preset as any)?.subject) {
+                  setTestSubject((preset as any).subject);
                 }
-                if (preset?.body) {
-                  setTestBody(preset.body);
+                if ((preset as any)?.body) {
+                  setTestBody((preset as any).body);
                 }
               }}
             >
@@ -8654,13 +8649,12 @@ function AdminEmailsPage({
                       <td>{item.subject}</td>
                       <td>
                         <span
-                          className={`badge ${
-                            item.status === "sent"
-                              ? "text-bg-success"
-                              : item.status === "failed"
+                          className={`badge ${item.status === "sent"
+                            ? "text-bg-success"
+                            : item.status === "failed"
                               ? "text-bg-danger"
                               : "text-bg-secondary"
-                          }`}
+                            }`}
                         >
                           {item.status}
                         </span>
@@ -8801,19 +8795,19 @@ function TrashPage({
 
   const typeOptions = isAdmin
     ? [
-        { value: "all", label: "All" },
-        { value: "forms", label: "Forms" },
-        { value: "templates", label: "Templates" },
-        { value: "users", label: "Users" },
-        { value: "submissions", label: "Submissions" },
-        { value: "files", label: "Files" },
-        { value: "emails", label: "Emails" }
-      ]
+      { value: "all", label: "All" },
+      { value: "forms", label: "Forms" },
+      { value: "templates", label: "Templates" },
+      { value: "users", label: "Users" },
+      { value: "submissions", label: "Submissions" },
+      { value: "files", label: "Files" },
+      { value: "emails", label: "Emails" }
+    ]
     : [
-        { value: "all", label: "All" },
-        { value: "submissions", label: "Submissions" },
-        { value: "files", label: "Files" }
-      ];
+      { value: "all", label: "All" },
+      { value: "submissions", label: "Submissions" },
+      { value: "files", label: "Files" }
+    ];
 
   function startBulk(label: string, total: number) {
     setBulkStatus({ label, done: 0, total });
@@ -9622,13 +9616,12 @@ function TrashPage({
                     <td>{item.subject || "n/a"}</td>
                     <td>
                       <span
-                        className={`badge ${
-                          item.status === "sent"
-                            ? "text-bg-success"
-                            : item.status === "failed"
+                        className={`badge ${item.status === "sent"
+                          ? "text-bg-success"
+                          : item.status === "failed"
                             ? "text-bg-danger"
                             : "text-bg-secondary"
-                        }`}
+                          }`}
                       >
                         {item.status || "n/a"}
                       </span>
@@ -9669,12 +9662,14 @@ function TrashPage({
 function BuilderPage({
   user,
   onLogin,
+  onNotice,
   appDefaultTimezone,
   markdownEnabled,
   mathjaxEnabled
 }: {
   user: UserInfo | null;
   onLogin: (p: "google" | "github") => void;
+  onNotice: (message: string, type?: "success" | "error") => void;
   appDefaultTimezone: string;
   markdownEnabled: boolean;
   mathjaxEnabled: boolean;
@@ -9794,6 +9789,14 @@ function BuilderPage({
   const [canvasSectionsNeedsSync, setCanvasSectionsNeedsSync] = useState(false);
   const [canvasSyncing, setCanvasSyncing] = useState(false);
   const [canvasError, setCanvasError] = useState<string | null>(null);
+  const [formBuilderReminderEnabled, setFormBuilderReminderEnabled] = useState(false);
+  const [formBuilderReminderValue, setFormBuilderReminderValue] = useState(1);
+  const [formBuilderReminderUnit, setFormBuilderReminderUnit] = useState("weeks");
+  const [formBuilderReminderUntil, setFormBuilderReminderUntil] = useState("");
+  const [formCreateReminderEnabled, setFormCreateReminderEnabled] = useState(false);
+  const [formCreateReminderValue, setFormCreateReminderValue] = useState(1);
+  const [formCreateReminderUnit, setFormCreateReminderUnit] = useState("weeks");
+  const [formCreateReminderUntil, setFormCreateReminderUntil] = useState("");
 
   const prevDefaultTimezoneRef = useRef(appDefaultTimezone);
   useEffect(() => {
@@ -10327,14 +10330,14 @@ function BuilderPage({
     const extensions = Array.isArray(rules.allowedExtensions)
       ? rules.allowedExtensions
       : Array.isArray(rules.extensions)
-      ? rules.extensions
-      : [];
+        ? rules.extensions
+        : [];
     const maxBytes =
       typeof rules.maxFileSizeBytes === "number"
         ? rules.maxFileSizeBytes
         : typeof rules.maxSizeBytes === "number"
-        ? rules.maxSizeBytes
-        : 10 * 1024 * 1024;
+          ? rules.maxSizeBytes
+          : 10 * 1024 * 1024;
     const maxFiles = typeof rules.maxFiles === "number" ? rules.maxFiles : 1;
     setFileFieldId(String((field as any).id || ""));
     setFileFieldLabel(String((field as any).label || ""));
@@ -10380,7 +10383,16 @@ function BuilderPage({
       setFormBuilderCanvasEnabled(false);
       setFormBuilderCanvasCourseId("");
       setFormBuilderCanvasAllowedSections(null);
+      setFormBuilderCanvasAllowedSections(null);
       setFormBuilderCanvasPosition("bottom");
+      setFormBuilderReminderEnabled(false);
+      setFormBuilderReminderValue(1);
+      setFormBuilderReminderUnit("weeks");
+      setFormBuilderReminderUntil("");
+      setFormCreateReminderEnabled(false);
+      setFormCreateReminderValue(1);
+      setFormCreateReminderUnit("weeks");
+      setFormCreateReminderUntil("");
       setFormBuilderSlugEdit("");
       return;
     }
@@ -10427,7 +10439,23 @@ function BuilderPage({
       setFormBuilderPassword("");
       setFormBuilderCanvasEnabled(Boolean(selected.canvas_enabled));
       setFormBuilderCanvasCourseId(String(selected.canvas_course_id || ""));
+      setFormBuilderCanvasCourseId(String(selected.canvas_course_id || ""));
       setFormBuilderCanvasPosition(String(selected.canvas_fields_position || "bottom"));
+      setFormBuilderReminderEnabled(Boolean(selected.reminder_enabled));
+      const freq = String(selected.reminder_frequency || "1:weeks");
+      if (freq.includes(":")) {
+        const [val, unit] = freq.split(":");
+        setFormBuilderReminderValue(parseInt(val) || 1);
+        setFormBuilderReminderUnit(unit || "weeks");
+      } else {
+        // Backward compatibility
+        if (freq === "daily") { setFormBuilderReminderValue(1); setFormBuilderReminderUnit("days"); }
+        else if (freq === "monthly") { setFormBuilderReminderValue(1); setFormBuilderReminderUnit("months"); }
+        else { setFormBuilderReminderValue(1); setFormBuilderReminderUnit("weeks"); }
+      }
+      setFormBuilderReminderUntil(
+        utcToLocalInputWithZone(selected.reminder_until ?? null, formBuilderAvailabilityTimezone)
+      );
       if (selected.canvas_allowed_section_ids_json) {
         try {
           const parsed = JSON.parse(String(selected.canvas_allowed_section_ids_json));
@@ -10482,27 +10510,27 @@ function BuilderPage({
       })
     });
     const payload = await response.json().catch(() => null);
-      if (!response.ok) {
-        const detailMessage =
-          payload?.detail?.message ||
-          payload?.detail?.field ||
-          (typeof payload?.detail === "string" ? payload.detail : null);
-        setFormBuilderStatus(
-          detailMessage
-            ? `${payload?.error || "Failed to update form"}: ${detailMessage}`
-            : payload?.error || "Failed to update form."
-        );
-        onNotice("Failed to update form schema.", "error");
-        return;
-      }
-      if (nextSlug) {
-        setFormBuilderSlug(nextSlug);
-        setFormBuilderSlugEdit(nextSlug);
-      }
-      setFormBuilderStatus("Form schema updated.");
-      onNotice("Form schema updated.", "success");
-      await loadBuilder();
+    if (!response.ok) {
+      const detailMessage =
+        payload?.detail?.message ||
+        payload?.detail?.field ||
+        (typeof payload?.detail === "string" ? payload.detail : null);
+      setFormBuilderStatus(
+        detailMessage
+          ? `${payload?.error || "Failed to update form"}: ${detailMessage}`
+          : payload?.error || "Failed to update form."
+      );
+      onNotice("Failed to update form schema.", "error");
+      return;
     }
+    if (nextSlug) {
+      setFormBuilderSlug(nextSlug);
+      setFormBuilderSlugEdit(nextSlug);
+    }
+    setFormBuilderStatus("Form schema updated.");
+    onNotice("Form schema updated.", "success");
+    await loadBuilder();
+  }
 
   function generatePassword(length: number = 12) {
     const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%";
@@ -10651,7 +10679,10 @@ function BuilderPage({
           ...(formBuilderCanvasEnabled && canvasAllowedSectionIds
             ? { canvasAllowedSectionIds }
             : {}),
-          canvasFieldsPosition: formBuilderCanvasPosition
+          canvasFieldsPosition: formBuilderCanvasPosition,
+          reminderEnabled: formBuilderReminderEnabled,
+          reminderFrequency: `${formBuilderReminderValue}:${formBuilderReminderUnit}`,
+          reminderUntil: localInputToUtcWithZone(formBuilderReminderUntil, formBuilderAvailabilityTimezone) || null,
         })
       });
       payload = await response.json().catch(() => null);
@@ -10680,7 +10711,7 @@ function BuilderPage({
     setFormBuilderStatus("Form settings updated.");
     onNotice("Form settings updated.", "success");
     await loadBuilder();
-    }
+  }
 
   function handleCopyFormLink() {
     if (!formBuilderSlug) {
@@ -10862,14 +10893,14 @@ function BuilderPage({
     const extensions = Array.isArray(rules.allowedExtensions)
       ? rules.allowedExtensions
       : Array.isArray(rules.extensions)
-      ? rules.extensions
-      : [];
+        ? rules.extensions
+        : [];
     const maxBytes =
       typeof rules.maxFileSizeBytes === "number"
         ? rules.maxFileSizeBytes
         : typeof rules.maxSizeBytes === "number"
-        ? rules.maxSizeBytes
-        : 10 * 1024 * 1024;
+          ? rules.maxSizeBytes
+          : 10 * 1024 * 1024;
     const maxFiles = typeof rules.maxFiles === "number" ? rules.maxFiles : 1;
     setFormFileFieldId(String((field as any).id || ""));
     setFormFileFieldLabel(String((field as any).label || ""));
@@ -10953,7 +10984,10 @@ function BuilderPage({
         ...(formCreateCanvasEnabled && createCanvasAllowedSectionIds
           ? { canvasAllowedSectionIds: createCanvasAllowedSectionIds }
           : {}),
-        canvasFieldsPosition: formCreateCanvasPosition
+        canvasFieldsPosition: formCreateCanvasPosition,
+        reminderEnabled: formCreateReminderEnabled,
+        reminderFrequency: `${formCreateReminderValue}:${formCreateReminderUnit}`,
+        reminderUntil: localInputToUtcWithZone(formCreateReminderUntil, formCreateAvailabilityTimezone) || null
       })
     });
     const payload = await response.json().catch(() => null);
@@ -10976,6 +11010,10 @@ function BuilderPage({
     setFormCreateCanvasCourseId("");
     setFormCreateCanvasAllowedSections(null);
     setFormCreateCanvasPosition("bottom");
+    setFormCreateReminderEnabled(false);
+    setFormCreateReminderValue(1);
+    setFormCreateReminderUnit("weeks");
+    setFormCreateReminderUntil("");
     await loadBuilder();
   }
 
@@ -11204,19 +11242,19 @@ function BuilderPage({
                 <button
                   type="button"
                   className={`btn ${formBuilderMode === "create" ? "btn-primary" : "btn-outline-primary"}`}
-                    onClick={() => {
-                      setFormBuilderMode("create");
-      setFormBuilderSlug("");
-      setFormBuilderSlugEdit("");
-      setFormBuilderSchema("");
-      setFormBuilderStatus(null);
-      setFormCreateCanvasEnabled(false);
-      setFormCreateCanvasCourseId("");
-      setFormCreateCanvasAllowedSections(null);
-      setFormCreateCanvasPosition("bottom");
-      setFormCreateAvailabilityTimezone(getAppDefaultTimezone());
-      setFormDateShowTimezone(true);
-    }}
+                  onClick={() => {
+                    setFormBuilderMode("create");
+                    setFormBuilderSlug("");
+                    setFormBuilderSlugEdit("");
+                    setFormBuilderSchema("");
+                    setFormBuilderStatus(null);
+                    setFormCreateCanvasEnabled(false);
+                    setFormCreateCanvasCourseId("");
+                    setFormCreateCanvasAllowedSections(null);
+                    setFormCreateCanvasPosition("bottom");
+                    setFormCreateAvailabilityTimezone(getAppDefaultTimezone());
+                    setFormDateShowTimezone(true);
+                  }}
                 >
                   <i className="bi bi-plus-circle" aria-hidden="true" /> New form
                 </button>
@@ -11408,7 +11446,7 @@ function BuilderPage({
                   <div className="muted mt-2">
                     Password protection is independent of auth policy.
                   </div>
-                  {formCreatePasswordRequired ? (
+                  {(formCreatePasswordRequireAccess || formCreatePasswordRequireSubmit) ? (
                     <>
                       <div className="input-group mt-2">
                         <input
@@ -11459,18 +11497,69 @@ function BuilderPage({
                     </>
                   ) : null}
                 </div>
+                <div className="col-md-3">
+                  <label className="form-label">Reminders</label>
+                  <div className="form-check mt-2">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      checked={formCreateReminderEnabled}
+                      onChange={(event) => setFormCreateReminderEnabled(event.target.checked)}
+                      id="formCreateReminderEnabled"
+                    />
+                    <label className="form-check-label" htmlFor="formCreateReminderEnabled">
+                      Enabled
+                    </label>
+                  </div>
+                </div>
+                {formCreateReminderEnabled && (
+                  <div className="col-md-4">
+                    <label className="form-label">Reminder Frequency</label>
+                    <div className="input-group">
+                      <input
+                        type="number"
+                        className="form-control"
+                        min="1"
+                        value={formCreateReminderValue}
+                        onChange={(e) =>
+                          setFormCreateReminderValue(Math.max(1, parseInt(e.target.value) || 1))
+                        }
+                      />
+                      <select
+                        className="form-select"
+                        value={formCreateReminderUnit}
+                        onChange={(event) => setFormCreateReminderUnit(event.target.value)}
+                      >
+                        <option value="days">Day(s)</option>
+                        <option value="weeks">Week(s)</option>
+                        <option value="months">Month(s)</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
+                {formCreateReminderEnabled && (
+                  <div className="col-md-3">
+                    <label className="form-label">Reminder until</label>
+                    <input
+                      className="form-control"
+                      type="datetime-local"
+                      value={formCreateReminderUntil}
+                      onChange={(event) => setFormCreateReminderUntil(event.target.value)}
+                    />
+                  </div>
+                )}
                 <div className="col-12">
-                {renderCanvasConfig({
-                  enabled: formCreateCanvasEnabled,
-                  onEnabledChange: setFormCreateCanvasEnabled,
-                  courseId: formCreateCanvasCourseId,
-                  onCourseIdChange: setFormCreateCanvasCourseId,
-                  allowedSectionIds: formCreateCanvasAllowedSections,
-                  onAllowedSectionIdsChange: setFormCreateCanvasAllowedSections,
-                  fieldsPosition: formCreateCanvasPosition,
-                  onFieldsPositionChange: setFormCreateCanvasPosition,
-                  idPrefix: "form-create"
-                })}
+                  {renderCanvasConfig({
+                    enabled: formCreateCanvasEnabled,
+                    onEnabledChange: setFormCreateCanvasEnabled,
+                    courseId: formCreateCanvasCourseId,
+                    onCourseIdChange: setFormCreateCanvasCourseId,
+                    allowedSectionIds: formCreateCanvasAllowedSections,
+                    onAllowedSectionIdsChange: setFormCreateCanvasAllowedSections,
+                    fieldsPosition: formCreateCanvasPosition,
+                    onFieldsPositionChange: setFormCreateCanvasPosition,
+                    idPrefix: "form-create"
+                  })}
                 </div>
                 <div className="col-12 d-flex flex-wrap gap-2 mt-2">
                   <button type="button" className="btn btn-primary" onClick={handleCreateForm}>
@@ -11480,513 +11569,569 @@ function BuilderPage({
                 </div>
               </div>
             ) : null}
-              {formBuilderMode === "edit" ? (
-                <div>
-                  <div className="row g-3">
-                    <div className="col-md-4">
-                      <label className="form-label">Form</label>
-                      <select
-                        className="form-select"
-                        value={formBuilderSlug}
-                        onChange={(event) => {
-                          const value = event.target.value;
-                          setFormBuilderSlug(value);
-                          handleLoadFormSchema(value);
-                        }}
-                      >
-                        <option value="">Select form</option>
-                        {safeForms
-                          .filter((form) => typeof form.slug === "string")
-                          .map((form) => (
-                            <option key={form.slug} value={form.slug}>
-                              {form.title} ({form.slug})
-                            </option>
-                          ))}
-                      </select>
-                    </div>
-                    <div className="col-md-4">
-                      <label className="form-label">Slug</label>
-                      <input
-                        className="form-control"
-                        value={formBuilderSlugEdit}
-                        onChange={(event) => setFormBuilderSlugEdit(event.target.value)}
-                        disabled={!formBuilderSlug}
-                      />
-                    </div>
-                    <div className="col-md-4">
-                  <label className="form-label">Description</label>
-                  <input
-                    className="form-control"
-                    value={formBuilderDescription}
-                    onChange={(event) => setFormBuilderDescription(event.target.value)}
-                    disabled={!formBuilderSlug}
-                  />
-                  {formBuilderDescription ? (
-                    <div className="mt-2">
-                      <div className="muted">Preview</div>
-                      <RichText
-                        text={formBuilderDescription}
-                        markdownEnabled={markdownEnabled}
-                        mathjaxEnabled={mathjaxEnabled}
-                      />
-                    </div>
-                  ) : null}
-                </div>
-              <div className="col-md-4">
-                <label className="form-label">Auth policy</label>
-                <select
-                  className="form-select"
-                  value={formBuilderAuthPolicy}
-                  onChange={(event) => setFormBuilderAuthPolicy(event.target.value)}
-                  disabled={!formBuilderSlug}
-                >
-                  <option value="optional">Optional</option>
-                  <option value="required">Required</option>
-                  <option value="google">Google</option>
-                  <option value="github">GitHub</option>
-                  <option value="either">Either</option>
-                </select>
-              </div>
-              <div className="col-md-2">
-                <label className="form-label">Public</label>
-                <div className="form-check mt-2">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    checked={formBuilderPublic}
-                    onChange={(event) => setFormBuilderPublic(event.target.checked)}
-                    disabled={!formBuilderSlug}
-                    id="formBuilderPublic"
-                  />
-                  <label className="form-check-label" htmlFor="formBuilderPublic">
-                    Yes
-                  </label>
-                </div>
-              </div>
-              <div className="col-md-2">
-                <label className="form-label">Locked</label>
-                <div className="form-check mt-2">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    checked={formBuilderLocked}
-                    onChange={(event) => setFormBuilderLocked(event.target.checked)}
-                    disabled={!formBuilderSlug}
-                    id="formBuilderLocked"
-                  />
-                  <label className="form-check-label" htmlFor="formBuilderLocked">
-                    Yes
-                  </label>
-                </div>
-              </div>
-              <div className="col-md-4">
-                <label className="form-label">Available from</label>
-                <input
-                  className="form-control"
-                  type="datetime-local"
-                  value={formBuilderAvailableFrom}
-                  onChange={(event) => setFormBuilderAvailableFrom(event.target.value)}
-                  disabled={!formBuilderSlug || formBuilderLocked}
-                />
-              </div>
-              <div className="col-md-4">
-                <label className="form-label">Available until</label>
-                <input
-                  className="form-control"
-                  type="datetime-local"
-                  value={formBuilderAvailableUntil}
-                  onChange={(event) => setFormBuilderAvailableUntil(event.target.value)}
-                  disabled={!formBuilderSlug || formBuilderLocked}
-                />
-              </div>
-              <div className="col-md-4">
-                <label className="form-label">Availability timezone</label>
-                <TimezoneSelect
-                  idPrefix="form-availability"
-                  value={formBuilderAvailabilityTimezone}
-                  onChange={(nextTz) => {
-                    const shifted = shiftAvailabilityValues(
-                      formBuilderAvailabilityTimezone,
-                      nextTz,
-                      formBuilderAvailableFrom,
-                      formBuilderAvailableUntil
-                    );
-                    setFormBuilderAvailabilityTimezone(nextTz);
-                    setFormBuilderAvailableFrom(shifted.from);
-                    setFormBuilderAvailableUntil(shifted.until);
-                  }}
-                  disabled={!formBuilderSlug || formBuilderLocked}
-                />
-              </div>
-              <div className="col-md-4">
-                <label className="form-label">Password requirements</label>
-                <div className="form-check mt-2">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    checked={formBuilderPasswordRequireAccess}
-                    onChange={(event) => setFormBuilderPasswordRequireAccess(event.target.checked)}
-                    disabled={!formBuilderSlug}
-                    id="formBuilderPasswordRequireAccess"
-                  />
-                  <label className="form-check-label" htmlFor="formBuilderPasswordRequireAccess">
-                    Require password to access
-                  </label>
-                </div>
-                <div className="form-check mt-1">
-                  <input
-                    className="form-check-input"
-                    type="checkbox"
-                    checked={formBuilderPasswordRequireSubmit}
-                    onChange={(event) => setFormBuilderPasswordRequireSubmit(event.target.checked)}
-                    disabled={!formBuilderSlug}
-                    id="formBuilderPasswordRequireSubmit"
-                  />
-                  <label className="form-check-label" htmlFor="formBuilderPasswordRequireSubmit">
-                    Require password to submit
-                  </label>
-                </div>
-                <div className="muted mt-2">
-                  Password protection is independent of auth policy.
-                </div>
-                {formBuilderPasswordRequired ? (
-                  <>
-                    <div className="input-group mt-2">
-                      <input
-                        className="form-control"
-                        type={formBuilderPasswordVisible ? "text" : "password"}
-                        placeholder="Set new password"
-                        value={formBuilderPassword}
-                        onChange={(event) => setFormBuilderPassword(event.target.value)}
-                        disabled={!formBuilderSlug}
-                      />
-                      <button
-                        type="button"
-                        className="btn btn-outline-secondary"
-                        onClick={() => setFormBuilderPasswordVisible((prev) => !prev)}
-                        aria-label={formBuilderPasswordVisible ? "Hide password" : "Show password"}
-                        disabled={!formBuilderSlug}
-                      >
-                        <i
-                          className={`bi ${formBuilderPasswordVisible ? "bi-eye-slash" : "bi-eye"}`}
-                          aria-hidden="true"
-                        />
-                      </button>
-                    </div>
-                    <button
-                      type="button"
-                      className="btn btn-outline-secondary btn-sm mt-2"
-                      onClick={() => setFormBuilderPassword(generatePassword())}
-                      disabled={!formBuilderSlug}
-                    >
-                      <i className="bi bi-shuffle" aria-hidden="true" /> Generate password
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-outline-secondary btn-sm mt-2"
-                      onClick={() => {
-                        if (!formBuilderPassword.trim()) {
-                          setFormBuilderStatus("Generate a password first.");
-                          return;
-                        }
-                        navigator.clipboard
-                          .writeText(formBuilderPassword.trim())
-                          .then(() => {
-                            setFormBuilderStatus("Password copied.");
-                            onNotice("Password copied.", "success");
-                          })
-                          .catch(() => setFormBuilderStatus("Unable to copy password."));
+            {formBuilderMode === "edit" ? (
+              <div>
+                <div className="row g-3">
+                  <div className="col-md-4">
+                    <label className="form-label">Form</label>
+                    <select
+                      className="form-select"
+                      value={formBuilderSlug}
+                      onChange={(event) => {
+                        const value = event.target.value;
+                        setFormBuilderSlug(value);
+                        handleLoadFormSchema(value);
                       }}
+                    >
+                      <option value="">Select form</option>
+                      {safeForms
+                        .filter((form) => typeof form.slug === "string")
+                        .map((form) => (
+                          <option key={form.slug} value={form.slug}>
+                            {form.title} ({form.slug})
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Slug</label>
+                    <input
+                      className="form-control"
+                      value={formBuilderSlugEdit}
+                      onChange={(event) => setFormBuilderSlugEdit(event.target.value)}
+                      disabled={!formBuilderSlug}
+                    />
+                  </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Description</label>
+                    <input
+                      className="form-control"
+                      value={formBuilderDescription}
+                      onChange={(event) => setFormBuilderDescription(event.target.value)}
+                      disabled={!formBuilderSlug}
+                    />
+                    {formBuilderDescription ? (
+                      <div className="mt-2">
+                        <div className="muted">Preview</div>
+                        <RichText
+                          text={formBuilderDescription}
+                          markdownEnabled={markdownEnabled}
+                          mathjaxEnabled={mathjaxEnabled}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Auth policy</label>
+                    <select
+                      className="form-select"
+                      value={formBuilderAuthPolicy}
+                      onChange={(event) => setFormBuilderAuthPolicy(event.target.value)}
                       disabled={!formBuilderSlug}
                     >
-                      <i className="bi bi-clipboard" aria-hidden="true" /> Copy password
-                    </button>
-                  </>
-                ) : null}
-              </div>
-              <div className="col-12">
-                {renderCanvasConfig({
-                  enabled: formBuilderCanvasEnabled,
-                  onEnabledChange: setFormBuilderCanvasEnabled,
-                  courseId: formBuilderCanvasCourseId,
-                  onCourseIdChange: setFormBuilderCanvasCourseId,
-                  allowedSectionIds: formBuilderCanvasAllowedSections,
-                  onAllowedSectionIdsChange: setFormBuilderCanvasAllowedSections,
-                  fieldsPosition: formBuilderCanvasPosition,
-                  onFieldsPositionChange: setFormBuilderCanvasPosition,
-                  idPrefix: "form-edit"
-                })}
-              </div>
-              <div className="col-12">
-                <label className="form-label">Schema JSON</label>
-                <textarea
-                  className="form-control"
-                  rows={6}
-                  value={formBuilderSchema}
-                  onChange={(event) => setFormBuilderSchema(event.target.value)}
-                />
-                <div className="muted mt-1">
-                  Changes here override the form schema. File rules are mirrored automatically.
-                </div>
-                {formRulesError ? (
-                  <div className="alert alert-warning mt-2 py-2">{formRulesError}</div>
-                ) : null}
-              </div>
-              <div className="col-12">
-                <FieldBuilderPanel
-                  idPrefix="form"
-                  title="Form fields"
-                  builderType={formFieldType}
-                  builderCustomType={formFieldCustomType}
-                  builderId={formFieldId}
-                  builderLabel={formFieldLabel}
-                  builderRequired={formFieldRequired}
-                  builderPlaceholder={formFieldPlaceholder}
-                  builderOptions={formFieldOptions}
-                  builderMultiple={formFieldMultiple}
-                  builderEmailDomain={formEmailDomain}
-                  builderAutofillFromLogin={formAutofillFromLogin}
-                  builderDateTimezone={formDateTimezone}
-                  builderDateMode={formDateMode}
-                  builderDateShowTimezone={formDateShowTimezone}
-                  markdownEnabled={markdownEnabled}
-                  mathjaxEnabled={mathjaxEnabled}
-                  onTypeChange={setFormFieldType}
-                  onCustomTypeChange={setFormFieldCustomType}
-                  onIdChange={setFormFieldId}
-                  onLabelChange={setFormFieldLabel}
-                  onRequiredChange={setFormFieldRequired}
-                  onPlaceholderChange={setFormFieldPlaceholder}
-                  onOptionsChange={setFormFieldOptions}
-                  onMultipleChange={setFormFieldMultiple}
-                  onEmailDomainChange={setFormEmailDomain}
-                  onAutofillFromLoginChange={setFormAutofillFromLogin}
-                  onDateTimezoneChange={setFormDateTimezone}
-                  onDateModeChange={setFormDateMode}
-                  onDateShowTimezoneChange={setFormDateShowTimezone}
-                  onAddField={handleAddFormField}
-                  fields={formTextFields}
-                  onRemoveField={handleRemoveFormField}
-                  onEditField={handleSelectFormField}
-                  onMoveField={handleMoveFormField}
-                  onReorderField={handleReorderFormField}
-                />
-                {formTextFields.length > 0 ? (
-                  <div className="panel panel--compact mt-3">
-                    <div className="panel-header">
-                      <h4 className="mb-0">Edit existing field</h4>
-                    </div>
-                    <div className="row g-3">
-                      <div className="col-md-4">
-                        <label className="form-label">Select field</label>
-                        <select
-                          className="form-select"
-                          value={formFieldEditId}
-                          onChange={(event) => {
-                            const value = event.target.value;
-                            const target = formSchemaFields.find(
-                              (field) => field.type !== "file" && field.id === value
-                            ) as Record<string, unknown> | undefined;
-                            handleSelectFormField(value, target || null);
-                          }}
-                        >
-                          <option value="">Choose field</option>
-                          {formTextFields.map((field) => (
-                              <option key={String(field.id)} value={String(field.id)}>
-                                {String(field.label || field.id)}
-                              </option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="col-md-8 d-flex align-items-end">
-                        <button
-                          type="button"
-                          className="btn btn-outline-secondary"
-                          disabled={!formFieldEditId}
-                          onClick={handleUpdateFormField}
-                        >
-                          <i className="bi bi-pencil-square" aria-hidden="true" /> Update field
-                        </button>
-                      </div>
+                      <option value="optional">Optional</option>
+                      <option value="required">Required</option>
+                      <option value="google">Google</option>
+                      <option value="github">GitHub</option>
+                      <option value="either">Either</option>
+                    </select>
+                  </div>
+                  <div className="col-md-2">
+                    <label className="form-label">Public</label>
+                    <div className="form-check mt-2">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formBuilderPublic}
+                        onChange={(event) => setFormBuilderPublic(event.target.checked)}
+                        disabled={!formBuilderSlug}
+                        id="formBuilderPublic"
+                      />
+                      <label className="form-check-label" htmlFor="formBuilderPublic">
+                        Yes
+                      </label>
                     </div>
                   </div>
-                ) : null}
-              </div>
-              <div className="col-12">
-                <FileFieldBuilderPanel
-                  idPrefix="form-file"
-                  title="Form file fields"
-                  fieldId={formFileFieldId}
-                  fieldLabel={formFileFieldLabel}
-                  fieldRequired={formFileFieldRequired}
-                  fieldExtensions={formFileFieldExtensions}
-                  fieldMaxSizeMb={formFileFieldMaxSizeMb}
-                  fieldMaxFiles={formFileFieldMaxFiles}
-                  onIdChange={setFormFileFieldId}
-                  onLabelChange={setFormFileFieldLabel}
-                  onRequiredChange={setFormFileFieldRequired}
-                  onExtensionsChange={setFormFileFieldExtensions}
-                  onMaxSizeChange={setFormFileFieldMaxSizeMb}
-                  onMaxFilesChange={setFormFileFieldMaxFiles}
-                  onAdd={handleAddFormFileField}
-                />
-                {formFileFields.length > 0 ? (
-                  <div className="panel panel--compact mt-3">
-                    <div className="panel-header">
-                      <h4 className="mb-0">Edit existing file field</h4>
+                  <div className="col-md-2">
+                    <label className="form-label">Locked</label>
+                    <div className="form-check mt-2">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formBuilderLocked}
+                        onChange={(event) => setFormBuilderLocked(event.target.checked)}
+                        disabled={!formBuilderSlug}
+                        id="formBuilderLocked"
+                      />
+                      <label className="form-check-label" htmlFor="formBuilderLocked">
+                        Yes
+                      </label>
                     </div>
-                    <div className="row g-3">
-                      <div className="col-md-4">
-                        <label className="form-label">Select file field</label>
+                  </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Available from</label>
+                    <input
+                      className="form-control"
+                      type="datetime-local"
+                      value={formBuilderAvailableFrom}
+                      onChange={(event) => setFormBuilderAvailableFrom(event.target.value)}
+                      disabled={!formBuilderSlug || formBuilderLocked}
+                    />
+                  </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Available until</label>
+                    <input
+                      className="form-control"
+                      type="datetime-local"
+                      value={formBuilderAvailableUntil}
+                      onChange={(event) => setFormBuilderAvailableUntil(event.target.value)}
+                      disabled={!formBuilderSlug || formBuilderLocked}
+                    />
+                  </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Availability timezone</label>
+                    <TimezoneSelect
+                      idPrefix="form-availability"
+                      value={formBuilderAvailabilityTimezone}
+                      onChange={(nextTz) => {
+                        const shifted = shiftAvailabilityValues(
+                          formBuilderAvailabilityTimezone,
+                          nextTz,
+                          formBuilderAvailableFrom,
+                          formBuilderAvailableUntil
+                        );
+                        setFormBuilderAvailabilityTimezone(nextTz);
+                        setFormBuilderAvailableFrom(shifted.from);
+                        setFormBuilderAvailableUntil(shifted.until);
+                      }}
+                      disabled={!formBuilderSlug || formBuilderLocked}
+                    />
+                  </div>
+                  <div className="col-md-2">
+                    <label className="form-label">Reminders</label>
+                    <div className="form-check mt-2">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formBuilderReminderEnabled}
+                        onChange={(event) => setFormBuilderReminderEnabled(event.target.checked)}
+                        disabled={!formBuilderSlug}
+                        id="formBuilderReminderEnabled"
+                      />
+                      <label className="form-check-label" htmlFor="formBuilderReminderEnabled">
+                        Enabled
+                      </label>
+                    </div>
+                  </div>
+                  {formBuilderReminderEnabled && (
+                    <div className="col-md-4">
+                      <label className="form-label">Reminder Frequency</label>
+                      <div className="input-group">
+                        <input
+                          type="number"
+                          className="form-control"
+                          min="1"
+                          value={formBuilderReminderValue}
+                          onChange={(e) => setFormBuilderReminderValue(Math.max(1, parseInt(e.target.value) || 1))}
+                          disabled={!formBuilderSlug}
+                        />
                         <select
                           className="form-select"
-                          value={formFileEditId}
-                          onChange={(event) => {
-                            const value = event.target.value;
-                            const target = formFileFields.find(
-                              (field) => field.type === "file" && field.id === value
-                            ) as Record<string, unknown> | undefined;
-                            handleSelectFormFileField(value, target || null);
-                          }}
+                          value={formBuilderReminderUnit}
+                          onChange={(event) => setFormBuilderReminderUnit(event.target.value)}
+                          disabled={!formBuilderSlug}
                         >
-                          <option value="">Choose field</option>
-                          {formFileFields.map((field) => (
-                              <option key={String(field.id)} value={String(field.id)}>
-                                {String(field.label || field.id)}
-                              </option>
-                          ))}
+                          <option value="days">Day(s)</option>
+                          <option value="weeks">Week(s)</option>
+                          <option value="months">Month(s)</option>
                         </select>
                       </div>
-                      <div className="col-md-8 d-flex align-items-end">
-                        <button
-                          type="button"
-                          className="btn btn-outline-secondary"
-                          disabled={!formFileEditId}
-                          onClick={handleUpdateFormFileField}
-                        >
-                          <i className="bi bi-sliders" aria-hidden="true" /> Update file field rules
-                        </button>
+                    </div>
+                  )}
+                  {formBuilderReminderEnabled && (
+                    <div className="col-md-3">
+                      <label className="form-label">Reminder until</label>
+                      <input
+                        className="form-control"
+                        type="datetime-local"
+                        value={formBuilderReminderUntil}
+                        onChange={(event) => setFormBuilderReminderUntil(event.target.value)}
+                        disabled={!formBuilderSlug}
+                      />
+                      <div className="muted mt-1" style={{ fontSize: "0.8rem" }}>
+                        No reminders sent after this date.
                       </div>
                     </div>
-                    <div className="table-responsive mt-3">
-                      <table className="table table-sm">
-                        <thead>
-                          <tr>
-                            <th style={{ width: "2.5rem" }}></th>
-                            <th>Id</th>
-                            <th>Label</th>
-                            <th>Extensions</th>
-                            <th>Max size</th>
-                            <th>Max files</th>
-                            <th></th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {formFileFields.map((field, index) => {
-                              const rules = (field as any).rules || {};
-                              const extensions = Array.isArray(rules.allowedExtensions)
-                                ? rules.allowedExtensions
-                                : Array.isArray(rules.extensions)
-                                ? rules.extensions
-                                : [];
-                              const maxBytes =
-                                typeof rules.maxFileSizeBytes === "number"
-                                  ? rules.maxFileSizeBytes
-                                  : typeof rules.maxSizeBytes === "number"
-                                  ? rules.maxSizeBytes
-                                  : 0;
-                              const maxFiles =
-                                typeof rules.maxFiles === "number" ? rules.maxFiles : 0;
-                              return (
-                                <tr
-                                  key={String(field.id)}
-                                  className={
-                                    formFileDragOverId === String(field.id) ? "table-active" : undefined
-                                  }
-                                  onDragOver={(event) => {
-                                    event.preventDefault();
-                                    event.dataTransfer.dropEffect = "move";
-                                  }}
-                                  onDragEnter={() => {
-                                    setFormFileDragOverId(String(field.id));
-                                  }}
-                                  onDragLeave={() => {
-                                    setFormFileDragOverId((prev) =>
-                                      prev === String(field.id) ? null : prev
-                                    );
-                                  }}
-                                  onDrop={(event) => {
-                                    event.preventDefault();
-                                    const draggedId = event.dataTransfer.getData("text/plain");
-                                    if (!draggedId) return;
-                                    handleReorderFormField(draggedId, index);
-                                    setFormFileDragOverId(null);
-                                  }}
-                                >
-                                  <td>
-                                    <span
-                                      role="button"
-                                      title="Drag to reorder"
-                                      draggable
-                                      onDragStart={(event) => {
-                                        event.dataTransfer.setData("text/plain", String(field.id));
-                                        event.dataTransfer.effectAllowed = "move";
-                                      }}
-                                      style={{ cursor: "grab" }}
-                                    >
-                                      <i className="bi bi-grip-vertical" aria-hidden="true" />
-                                    </span>
-                                  </td>
-                                  <td>{String(field.id)}</td>
-                                  <td>{String(field.label || "")}</td>
-                                  <td>{extensions.length > 0 ? extensions.join(", ") : "any"}</td>
-                                  <td>{maxBytes ? formatSize(maxBytes) : "default"}</td>
-                                  <td>{maxFiles || "default"}</td>
-                                  <td>
-                                    <div className="btn-group btn-group-sm me-2" role="group">
+                  )}
+                  <div className="col-md-4">
+                    <label className="form-label">Password requirements</label>
+                    <div className="form-check mt-2">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formBuilderPasswordRequireAccess}
+                        onChange={(event) => setFormBuilderPasswordRequireAccess(event.target.checked)}
+                        disabled={!formBuilderSlug}
+                        id="formBuilderPasswordRequireAccess"
+                      />
+                      <label className="form-check-label" htmlFor="formBuilderPasswordRequireAccess">
+                        Require password to access
+                      </label>
+                    </div>
+                    <div className="form-check mt-1">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formBuilderPasswordRequireSubmit}
+                        onChange={(event) => setFormBuilderPasswordRequireSubmit(event.target.checked)}
+                        disabled={!formBuilderSlug}
+                        id="formBuilderPasswordRequireSubmit"
+                      />
+                      <label className="form-check-label" htmlFor="formBuilderPasswordRequireSubmit">
+                        Require password to submit
+                      </label>
+                    </div>
+                    <div className="muted mt-2">
+                      Password protection is independent of auth policy.
+                    </div>
+                    {formBuilderPasswordRequired ? (
+                      <>
+                        <div className="input-group mt-2">
+                          <input
+                            className="form-control"
+                            type={formBuilderPasswordVisible ? "text" : "password"}
+                            placeholder="Set new password"
+                            value={formBuilderPassword}
+                            onChange={(event) => setFormBuilderPassword(event.target.value)}
+                            disabled={!formBuilderSlug}
+                          />
+                          <button
+                            type="button"
+                            className="btn btn-outline-secondary"
+                            onClick={() => setFormBuilderPasswordVisible((prev) => !prev)}
+                            aria-label={formBuilderPasswordVisible ? "Hide password" : "Show password"}
+                            disabled={!formBuilderSlug}
+                          >
+                            <i
+                              className={`bi ${formBuilderPasswordVisible ? "bi-eye-slash" : "bi-eye"}`}
+                              aria-hidden="true"
+                            />
+                          </button>
+                        </div>
+                        <button
+                          type="button"
+                          className="btn btn-outline-secondary btn-sm mt-2"
+                          onClick={() => setFormBuilderPassword(generatePassword())}
+                          disabled={!formBuilderSlug}
+                        >
+                          <i className="bi bi-shuffle" aria-hidden="true" /> Generate password
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-outline-secondary btn-sm mt-2"
+                          onClick={() => {
+                            if (!formBuilderPassword.trim()) {
+                              setFormBuilderStatus("Generate a password first.");
+                              return;
+                            }
+                            navigator.clipboard
+                              .writeText(formBuilderPassword.trim())
+                              .then(() => {
+                                setFormBuilderStatus("Password copied.");
+                                onNotice("Password copied.", "success");
+                              })
+                              .catch(() => setFormBuilderStatus("Unable to copy password."));
+                          }}
+                          disabled={!formBuilderSlug}
+                        >
+                          <i className="bi bi-clipboard" aria-hidden="true" /> Copy password
+                        </button>
+                      </>
+                    ) : null}
+                  </div>
+                  <div className="col-12">
+                    {renderCanvasConfig({
+                      enabled: formBuilderCanvasEnabled,
+                      onEnabledChange: setFormBuilderCanvasEnabled,
+                      courseId: formBuilderCanvasCourseId,
+                      onCourseIdChange: setFormBuilderCanvasCourseId,
+                      allowedSectionIds: formBuilderCanvasAllowedSections,
+                      onAllowedSectionIdsChange: setFormBuilderCanvasAllowedSections,
+                      fieldsPosition: formBuilderCanvasPosition,
+                      onFieldsPositionChange: setFormBuilderCanvasPosition,
+                      idPrefix: "form-edit"
+                    })}
+                  </div>
+                  <div className="col-12">
+                    <label className="form-label">Schema JSON</label>
+                    <textarea
+                      className="form-control"
+                      rows={6}
+                      value={formBuilderSchema}
+                      onChange={(event) => setFormBuilderSchema(event.target.value)}
+                    />
+                    <div className="muted mt-1">
+                      Changes here override the form schema. File rules are mirrored automatically.
+                    </div>
+                    {formRulesError ? (
+                      <div className="alert alert-warning mt-2 py-2">{formRulesError}</div>
+                    ) : null}
+                  </div>
+                  <div className="col-12">
+                    <FieldBuilderPanel
+                      idPrefix="form"
+                      title="Form fields"
+                      builderType={formFieldType}
+                      builderCustomType={formFieldCustomType}
+                      builderId={formFieldId}
+                      builderLabel={formFieldLabel}
+                      builderRequired={formFieldRequired}
+                      builderPlaceholder={formFieldPlaceholder}
+                      builderOptions={formFieldOptions}
+                      builderMultiple={formFieldMultiple}
+                      builderEmailDomain={formEmailDomain}
+                      builderAutofillFromLogin={formAutofillFromLogin}
+                      builderDateTimezone={formDateTimezone}
+                      builderDateMode={formDateMode}
+                      builderDateShowTimezone={formDateShowTimezone}
+                      markdownEnabled={markdownEnabled}
+                      mathjaxEnabled={mathjaxEnabled}
+                      onTypeChange={setFormFieldType}
+                      onCustomTypeChange={setFormFieldCustomType}
+                      onIdChange={setFormFieldId}
+                      onLabelChange={setFormFieldLabel}
+                      onRequiredChange={setFormFieldRequired}
+                      onPlaceholderChange={setFormFieldPlaceholder}
+                      onOptionsChange={setFormFieldOptions}
+                      onMultipleChange={setFormFieldMultiple}
+                      onEmailDomainChange={setFormEmailDomain}
+                      onAutofillFromLoginChange={setFormAutofillFromLogin}
+                      onDateTimezoneChange={setFormDateTimezone}
+                      onDateModeChange={setFormDateMode}
+                      onDateShowTimezoneChange={setFormDateShowTimezone}
+                      onAddField={handleAddFormField}
+                      fields={formTextFields}
+                      onRemoveField={handleRemoveFormField}
+                      onEditField={handleSelectFormField}
+                      onMoveField={handleMoveFormField}
+                      onReorderField={handleReorderFormField}
+                    />
+                    {formTextFields.length > 0 ? (
+                      <div className="panel panel--compact mt-3">
+                        <div className="panel-header">
+                          <h4 className="mb-0">Edit existing field</h4>
+                        </div>
+                        <div className="row g-3">
+                          <div className="col-md-4">
+                            <label className="form-label">Select field</label>
+                            <select
+                              className="form-select"
+                              value={formFieldEditId}
+                              onChange={(event) => {
+                                const value = event.target.value;
+                                const target = formSchemaFields.find(
+                                  (field) => field.type !== "file" && field.id === value
+                                ) as Record<string, unknown> | undefined;
+                                handleSelectFormField(value, target || null);
+                              }}
+                            >
+                              <option value="">Choose field</option>
+                              {formTextFields.map((field) => (
+                                <option key={String(field.id)} value={String(field.id)}>
+                                  {String(field.label || field.id)}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="col-md-8 d-flex align-items-end">
+                            <button
+                              type="button"
+                              className="btn btn-outline-secondary"
+                              disabled={!formFieldEditId}
+                              onClick={handleUpdateFormField}
+                            >
+                              <i className="bi bi-pencil-square" aria-hidden="true" /> Update field
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="col-12">
+                    <FileFieldBuilderPanel
+                      idPrefix="form-file"
+                      title="Form file fields"
+                      fieldId={formFileFieldId}
+                      fieldLabel={formFileFieldLabel}
+                      fieldRequired={formFileFieldRequired}
+                      fieldExtensions={formFileFieldExtensions}
+                      fieldMaxSizeMb={formFileFieldMaxSizeMb}
+                      fieldMaxFiles={formFileFieldMaxFiles}
+                      onIdChange={setFormFileFieldId}
+                      onLabelChange={setFormFileFieldLabel}
+                      onRequiredChange={setFormFileFieldRequired}
+                      onExtensionsChange={setFormFileFieldExtensions}
+                      onMaxSizeChange={setFormFileFieldMaxSizeMb}
+                      onMaxFilesChange={setFormFileFieldMaxFiles}
+                      onAdd={handleAddFormFileField}
+                    />
+                    {formFileFields.length > 0 ? (
+                      <div className="panel panel--compact mt-3">
+                        <div className="panel-header">
+                          <h4 className="mb-0">Edit existing file field</h4>
+                        </div>
+                        <div className="row g-3">
+                          <div className="col-md-4">
+                            <label className="form-label">Select file field</label>
+                            <select
+                              className="form-select"
+                              value={formFileEditId}
+                              onChange={(event) => {
+                                const value = event.target.value;
+                                const target = formFileFields.find(
+                                  (field) => field.type === "file" && field.id === value
+                                ) as Record<string, unknown> | undefined;
+                                handleSelectFormFileField(value, target || null);
+                              }}
+                            >
+                              <option value="">Choose field</option>
+                              {formFileFields.map((field) => (
+                                <option key={String(field.id)} value={String(field.id)}>
+                                  {String(field.label || field.id)}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="col-md-8 d-flex align-items-end">
+                            <button
+                              type="button"
+                              className="btn btn-outline-secondary"
+                              disabled={!formFileEditId}
+                              onClick={handleUpdateFormFileField}
+                            >
+                              <i className="bi bi-sliders" aria-hidden="true" /> Update file field rules
+                            </button>
+                          </div>
+                        </div>
+                        <div className="table-responsive mt-3">
+                          <table className="table table-sm">
+                            <thead>
+                              <tr>
+                                <th style={{ width: "2.5rem" }}></th>
+                                <th>Id</th>
+                                <th>Label</th>
+                                <th>Extensions</th>
+                                <th>Max size</th>
+                                <th>Max files</th>
+                                <th></th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {formFileFields.map((field, index) => {
+                                const rules = (field as any).rules || {};
+                                const extensions = Array.isArray(rules.allowedExtensions)
+                                  ? rules.allowedExtensions
+                                  : Array.isArray(rules.extensions)
+                                    ? rules.extensions
+                                    : [];
+                                const maxBytes =
+                                  typeof rules.maxFileSizeBytes === "number"
+                                    ? rules.maxFileSizeBytes
+                                    : typeof rules.maxSizeBytes === "number"
+                                      ? rules.maxSizeBytes
+                                      : 0;
+                                const maxFiles =
+                                  typeof rules.maxFiles === "number" ? rules.maxFiles : 0;
+                                return (
+                                  <tr
+                                    key={String(field.id)}
+                                    className={
+                                      formFileDragOverId === String(field.id) ? "table-active" : undefined
+                                    }
+                                    onDragOver={(event) => {
+                                      event.preventDefault();
+                                      event.dataTransfer.dropEffect = "move";
+                                    }}
+                                    onDragEnter={() => {
+                                      setFormFileDragOverId(String(field.id));
+                                    }}
+                                    onDragLeave={() => {
+                                      setFormFileDragOverId((prev) =>
+                                        prev === String(field.id) ? null : prev
+                                      );
+                                    }}
+                                    onDrop={(event) => {
+                                      event.preventDefault();
+                                      const draggedId = event.dataTransfer.getData("text/plain");
+                                      if (!draggedId) return;
+                                      handleReorderFormField(draggedId, index);
+                                      setFormFileDragOverId(null);
+                                    }}
+                                  >
+                                    <td>
+                                      <span
+                                        role="button"
+                                        title="Drag to reorder"
+                                        draggable
+                                        onDragStart={(event) => {
+                                          event.dataTransfer.setData("text/plain", String(field.id));
+                                          event.dataTransfer.effectAllowed = "move";
+                                        }}
+                                        style={{ cursor: "grab" }}
+                                      >
+                                        <i className="bi bi-grip-vertical" aria-hidden="true" />
+                                      </span>
+                                    </td>
+                                    <td>{String(field.id)}</td>
+                                    <td>{String(field.label || "")}</td>
+                                    <td>{extensions.length > 0 ? extensions.join(", ") : "any"}</td>
+                                    <td>{maxBytes ? formatSize(maxBytes) : "default"}</td>
+                                    <td>{maxFiles || "default"}</td>
+                                    <td>
+                                      <div className="btn-group btn-group-sm me-2" role="group">
+                                        <button
+                                          type="button"
+                                          className="btn btn-outline-secondary"
+                                          onClick={() => handleMoveFormField(String(field.id), "up")}
+                                          disabled={!field.id || index === 0}
+                                        >
+                                          <i className="bi bi-arrow-up" aria-hidden="true" />
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="btn btn-outline-secondary"
+                                          onClick={() => handleMoveFormField(String(field.id), "down")}
+                                          disabled={!field.id || index === formFileFields.length - 1}
+                                        >
+                                          <i className="bi bi-arrow-down" aria-hidden="true" />
+                                        </button>
+                                      </div>
                                       <button
                                         type="button"
-                                        className="btn btn-outline-secondary"
-                                        onClick={() => handleMoveFormField(String(field.id), "up")}
-                                        disabled={!field.id || index === 0}
+                                        className="btn btn-outline-secondary btn-sm"
+                                        onClick={() =>
+                                          handleSelectFormFileField(String(field.id), field as Record<string, unknown>)
+                                        }
                                       >
-                                        <i className="bi bi-arrow-up" aria-hidden="true" />
+                                        <i className="bi bi-pencil" aria-hidden="true" /> Edit
                                       </button>
                                       <button
                                         type="button"
-                                        className="btn btn-outline-secondary"
-                                        onClick={() => handleMoveFormField(String(field.id), "down")}
-                                        disabled={!field.id || index === formFileFields.length - 1}
+                                        className="btn btn-outline-danger btn-sm ms-2"
+                                        onClick={() => handleRemoveFormField(String(field.id))}
                                       >
-                                        <i className="bi bi-arrow-down" aria-hidden="true" />
+                                        <i className="bi bi-trash" aria-hidden="true" /> Remove
                                       </button>
-                                    </div>
-                                    <button
-                                      type="button"
-                                      className="btn btn-outline-secondary btn-sm"
-                                      onClick={() =>
-                                        handleSelectFormFileField(String(field.id), field as Record<string, unknown>)
-                                      }
-                                    >
-                                      <i className="bi bi-pencil" aria-hidden="true" /> Edit
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="btn btn-outline-danger btn-sm ms-2"
-                                      onClick={() => handleRemoveFormField(String(field.id))}
-                                    >
-                                      <i className="bi bi-trash" aria-hidden="true" /> Remove
-                                    </button>
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                        </tbody>
-                      </table>
-                    </div>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
-                ) : null}
-              </div>
                 </div>
                 <div className="d-flex flex-wrap gap-2 mt-3">
                   <button
@@ -12080,14 +12225,14 @@ function BuilderPage({
                 <button
                   type="button"
                   className={`btn ${templateBuilderMode === "create" ? "btn-primary" : "btn-outline-primary"}`}
-                    onClick={() => {
-                      setTemplateBuilderMode("create");
-                      setTemplateEditorKey("");
-                      setTemplateEditorOriginalKey("");
-                      setTemplateEditorName("");
-                      setTemplateEditorSchema("");
-                      setTemplateEditorStatus(null);
-                    }}
+                  onClick={() => {
+                    setTemplateBuilderMode("create");
+                    setTemplateEditorKey("");
+                    setTemplateEditorOriginalKey("");
+                    setTemplateEditorName("");
+                    setTemplateEditorSchema("");
+                    setTemplateEditorStatus(null);
+                  }}
                 >
                   <i className="bi bi-plus-circle" aria-hidden="true" /> New template
                 </button>
@@ -12230,9 +12375,9 @@ function BuilderPage({
                         >
                           <option value="">Choose field</option>
                           {templateTextFields.map((field) => (
-                              <option key={String(field.id)} value={String(field.id)}>
-                                {String(field.label || field.id)}
-                              </option>
+                            <option key={String(field.id)} value={String(field.id)}>
+                              {String(field.label || field.id)}
+                            </option>
                           ))}
                         </select>
                       </div>
@@ -12289,9 +12434,9 @@ function BuilderPage({
                         >
                           <option value="">Choose field</option>
                           {templateFileFields.map((field) => (
-                              <option key={String(field.id)} value={String(field.id)}>
-                                {String(field.label || field.id)}
-                              </option>
+                            <option key={String(field.id)} value={String(field.id)}>
+                              {String(field.label || field.id)}
+                            </option>
                           ))}
                         </select>
                       </div>
@@ -12321,107 +12466,107 @@ function BuilderPage({
                         </thead>
                         <tbody>
                           {templateFileFields.map((field, index) => {
-                              const rules = (field as any).rules || {};
-                              const extensions = Array.isArray(rules.allowedExtensions)
-                                ? rules.allowedExtensions
-                                : Array.isArray(rules.extensions)
+                            const rules = (field as any).rules || {};
+                            const extensions = Array.isArray(rules.allowedExtensions)
+                              ? rules.allowedExtensions
+                              : Array.isArray(rules.extensions)
                                 ? rules.extensions
                                 : [];
-                              const maxBytes =
-                                typeof rules.maxFileSizeBytes === "number"
-                                  ? rules.maxFileSizeBytes
-                                  : typeof rules.maxSizeBytes === "number"
+                            const maxBytes =
+                              typeof rules.maxFileSizeBytes === "number"
+                                ? rules.maxFileSizeBytes
+                                : typeof rules.maxSizeBytes === "number"
                                   ? rules.maxSizeBytes
                                   : 0;
-                              const maxFiles =
-                                typeof rules.maxFiles === "number" ? rules.maxFiles : 0;
-                              return (
-                                <tr
-                                  key={String(field.id)}
-                                  className={
-                                    templateFileDragOverId === String(field.id) ? "table-active" : undefined
-                                  }
-                                  onDragOver={(event) => {
-                                    event.preventDefault();
-                                    event.dataTransfer.dropEffect = "move";
-                                  }}
-                                  onDragEnter={() => {
-                                    setTemplateFileDragOverId(String(field.id));
-                                  }}
-                                  onDragLeave={() => {
-                                    setTemplateFileDragOverId((prev) =>
-                                      prev === String(field.id) ? null : prev
-                                    );
-                                  }}
-                                  onDrop={(event) => {
-                                    event.preventDefault();
-                                    const draggedId = event.dataTransfer.getData("text/plain");
-                                    if (!draggedId) return;
-                                    handleReorderTemplateField(draggedId, index);
-                                    setTemplateFileDragOverId(null);
-                                  }}
-                                >
-                                  <td>
-                                    <span
-                                      role="button"
-                                      title="Drag to reorder"
-                                      draggable
-                                      onDragStart={(event) => {
-                                        event.dataTransfer.setData("text/plain", String(field.id));
-                                        event.dataTransfer.effectAllowed = "move";
-                                      }}
-                                      style={{ cursor: "grab" }}
-                                    >
-                                      <i className="bi bi-grip-vertical" aria-hidden="true" />
-                                    </span>
-                                  </td>
-                                  <td>{String(field.id)}</td>
-                                  <td>{String(field.label || "")}</td>
-                                  <td>{extensions.length > 0 ? extensions.join(", ") : "any"}</td>
-                                  <td>{maxBytes ? formatSize(maxBytes) : "default"}</td>
-                                  <td>{maxFiles || "default"}</td>
-                                  <td>
-                                    <div className="btn-group btn-group-sm me-2" role="group">
-                                      <button
-                                        type="button"
-                                        className="btn btn-outline-secondary"
-                                        onClick={() => handleMoveTemplateField(String(field.id), "up")}
-                                        disabled={!field.id || index === 0}
-                                      >
-                                        <i className="bi bi-arrow-up" aria-hidden="true" />
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="btn btn-outline-secondary"
-                                        onClick={() => handleMoveTemplateField(String(field.id), "down")}
-                                        disabled={!field.id || index === templateFileFields.length - 1}
-                                      >
-                                        <i className="bi bi-arrow-down" aria-hidden="true" />
-                                      </button>
-                                    </div>
+                            const maxFiles =
+                              typeof rules.maxFiles === "number" ? rules.maxFiles : 0;
+                            return (
+                              <tr
+                                key={String(field.id)}
+                                className={
+                                  templateFileDragOverId === String(field.id) ? "table-active" : undefined
+                                }
+                                onDragOver={(event) => {
+                                  event.preventDefault();
+                                  event.dataTransfer.dropEffect = "move";
+                                }}
+                                onDragEnter={() => {
+                                  setTemplateFileDragOverId(String(field.id));
+                                }}
+                                onDragLeave={() => {
+                                  setTemplateFileDragOverId((prev) =>
+                                    prev === String(field.id) ? null : prev
+                                  );
+                                }}
+                                onDrop={(event) => {
+                                  event.preventDefault();
+                                  const draggedId = event.dataTransfer.getData("text/plain");
+                                  if (!draggedId) return;
+                                  handleReorderTemplateField(draggedId, index);
+                                  setTemplateFileDragOverId(null);
+                                }}
+                              >
+                                <td>
+                                  <span
+                                    role="button"
+                                    title="Drag to reorder"
+                                    draggable
+                                    onDragStart={(event) => {
+                                      event.dataTransfer.setData("text/plain", String(field.id));
+                                      event.dataTransfer.effectAllowed = "move";
+                                    }}
+                                    style={{ cursor: "grab" }}
+                                  >
+                                    <i className="bi bi-grip-vertical" aria-hidden="true" />
+                                  </span>
+                                </td>
+                                <td>{String(field.id)}</td>
+                                <td>{String(field.label || "")}</td>
+                                <td>{extensions.length > 0 ? extensions.join(", ") : "any"}</td>
+                                <td>{maxBytes ? formatSize(maxBytes) : "default"}</td>
+                                <td>{maxFiles || "default"}</td>
+                                <td>
+                                  <div className="btn-group btn-group-sm me-2" role="group">
                                     <button
                                       type="button"
-                                      className="btn btn-outline-secondary btn-sm"
-                                      onClick={() =>
-                                        handleSelectTemplateFileField(
-                                          String(field.id),
-                                          field as Record<string, unknown>
-                                        )
-                                      }
+                                      className="btn btn-outline-secondary"
+                                      onClick={() => handleMoveTemplateField(String(field.id), "up")}
+                                      disabled={!field.id || index === 0}
                                     >
-                                      <i className="bi bi-pencil" aria-hidden="true" /> Edit
+                                      <i className="bi bi-arrow-up" aria-hidden="true" />
                                     </button>
                                     <button
                                       type="button"
-                                      className="btn btn-outline-danger btn-sm ms-2"
-                                      onClick={() => handleRemoveField(String(field.id))}
+                                      className="btn btn-outline-secondary"
+                                      onClick={() => handleMoveTemplateField(String(field.id), "down")}
+                                      disabled={!field.id || index === templateFileFields.length - 1}
                                     >
-                                      <i className="bi bi-trash" aria-hidden="true" /> Remove
+                                      <i className="bi bi-arrow-down" aria-hidden="true" />
                                     </button>
-                                  </td>
-                                </tr>
-                              );
-                            })}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    className="btn btn-outline-secondary btn-sm"
+                                    onClick={() =>
+                                      handleSelectTemplateFileField(
+                                        String(field.id),
+                                        field as Record<string, unknown>
+                                      )
+                                    }
+                                  >
+                                    <i className="bi bi-pencil" aria-hidden="true" /> Edit
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn btn-outline-danger btn-sm ms-2"
+                                    onClick={() => handleRemoveField(String(field.id))}
+                                  >
+                                    <i className="bi bi-trash" aria-hidden="true" /> Remove
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
@@ -12463,10 +12608,10 @@ function BuilderPage({
   );
 }
 
-  function AppShell() {
-    const [forms, setForms] = useState<FormSummary[]>([]);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState<ApiError | null>(null);
+function AppShell() {
+  const [forms, setForms] = useState<FormSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<ApiError | null>(null);
   const [user, setUser] = useState<UserInfo | null>(null);
   const [routeKey, setRouteKey] = useState(0);
   const [toasts, setToasts] = useState<ToastNotice[]>([]);
@@ -12480,10 +12625,10 @@ function BuilderPage({
   const [appTimezone, setAppTimezoneState] = useState(getAppDefaultTimezone());
   const [appCanvasDeleteSyncEnabled, setAppCanvasDeleteSyncEnabled] = useState(true);
   const navigate = useNavigate();
-    const location = useLocation();
+  const location = useLocation();
 
-    useEffect(() => {
-      async function loadUser() {
+  useEffect(() => {
+    async function loadUser() {
       const response = await apiFetch(`${API_BASE}/auth/me`);
       const payload = await response.json().catch(() => null);
       if (payload?.authenticated) {
@@ -12494,7 +12639,7 @@ function BuilderPage({
     }
 
     loadUser();
-    }, [routeKey]);
+  }, [routeKey]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -12635,90 +12780,90 @@ function BuilderPage({
     window.location.assign(loginUrl);
   }
 
-    function handleLogout(silent: boolean = false) {
-      apiFetch(`${API_BASE}/auth/logout`).finally(() => {
-        clearToken();
-        setUser(null);
-        setRouteKey((prev) => prev + 1);
-        if (!silent) {
-          pushNotice("Logged out successfully.", "success");
-        }
-        navigate("/", { replace: true });
-      });
-    }
+  function handleLogout(silent: boolean = false) {
+    apiFetch(`${API_BASE}/auth/logout`).finally(() => {
+      clearToken();
+      setUser(null);
+      setRouteKey((prev) => prev + 1);
+      if (!silent) {
+        pushNotice("Logged out successfully.", "success");
+      }
+      navigate("/", { replace: true });
+    });
+  }
 
-    function toggleTheme() {
-      setTheme((prev) => (prev === "dark" ? "light" : "dark"));
-    }
+  function toggleTheme() {
+    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+  }
 
-    async function updateDefaultTimezone(nextTz: string) {
-      const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ timezoneDefault: nextTz })
-      });
-      const payload = await response.json().catch(() => null);
-      if (!response.ok) {
-        return false;
-      }
-      setAppDefaultTimezone(nextTz);
-      setAppTimezoneState(nextTz);
-      return true;
+  async function updateDefaultTimezone(nextTz: string) {
+    const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ timezoneDefault: nextTz })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      return false;
     }
+    setAppDefaultTimezone(nextTz);
+    setAppTimezoneState(nextTz);
+    return true;
+  }
 
-    async function updateCanvasDeleteSyncEnabled(nextValue: boolean) {
-      const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ canvasDeleteSyncEnabled: nextValue })
-      });
-      const payload = await response.json().catch(() => null);
-      if (!response.ok) {
-        return false;
-      }
-      if (typeof payload?.canvasDeleteSyncEnabled === "boolean") {
-        setAppCanvasDeleteSyncEnabled(payload.canvasDeleteSyncEnabled);
-      } else {
-        setAppCanvasDeleteSyncEnabled(nextValue);
-      }
-      return true;
+  async function updateCanvasDeleteSyncEnabled(nextValue: boolean) {
+    const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ canvasDeleteSyncEnabled: nextValue })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      return false;
     }
+    if (typeof payload?.canvasDeleteSyncEnabled === "boolean") {
+      setAppCanvasDeleteSyncEnabled(payload.canvasDeleteSyncEnabled);
+    } else {
+      setAppCanvasDeleteSyncEnabled(nextValue);
+    }
+    return true;
+  }
 
-    async function updateMarkdownEnabled(nextValue: boolean) {
-      const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ markdownEnabled: nextValue })
-      });
-      const payload = await response.json().catch(() => null);
-      if (!response.ok) {
-        return false;
-      }
-      if (typeof payload?.markdownEnabled === "boolean") {
-        setAppMarkdownEnabled(payload.markdownEnabled);
-      } else {
-        setAppMarkdownEnabled(nextValue);
-      }
-      return true;
+  async function updateMarkdownEnabled(nextValue: boolean) {
+    const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ markdownEnabled: nextValue })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      return false;
     }
+    if (typeof payload?.markdownEnabled === "boolean") {
+      setAppMarkdownEnabled(payload.markdownEnabled);
+    } else {
+      setAppMarkdownEnabled(nextValue);
+    }
+    return true;
+  }
 
-    async function updateMathjaxEnabled(nextValue: boolean) {
-      const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ mathjaxEnabled: nextValue })
-      });
-      const payload = await response.json().catch(() => null);
-      if (!response.ok) {
-        return false;
-      }
-      if (typeof payload?.mathjaxEnabled === "boolean") {
-        setAppMathjaxEnabled(payload.mathjaxEnabled);
-      } else {
-        setAppMathjaxEnabled(nextValue);
-      }
-      return true;
+  async function updateMathjaxEnabled(nextValue: boolean) {
+    const response = await apiFetch(`${API_BASE}/api/admin/settings`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ mathjaxEnabled: nextValue })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      return false;
     }
+    if (typeof payload?.mathjaxEnabled === "boolean") {
+      setAppMathjaxEnabled(payload.mathjaxEnabled);
+    } else {
+      setAppMathjaxEnabled(nextValue);
+    }
+    return true;
+  }
   const navLinks: Array<{ to: string; label: string; icon: string; show: boolean }> = [
     { to: "/", label: "Home", icon: "bi-house", show: true },
     { to: "/dashboard", label: "My Dashboard", icon: "bi-speedometer2", show: Boolean(user) },
@@ -12750,15 +12895,14 @@ function BuilderPage({
           {toasts.map((toast) => (
             <div
               key={toast.id}
-              className={`alert shadow ${
-                toast.type === "success"
-                  ? "alert-success"
-                  : toast.type === "error"
+              className={`alert shadow ${toast.type === "success"
+                ? "alert-success"
+                : toast.type === "error"
                   ? "alert-danger"
                   : toast.type === "warning"
-                  ? "alert-warning"
-                  : "alert-info"
-              }`}
+                    ? "alert-warning"
+                    : "alert-info"
+                }`}
               role="status"
             >
               {toast.message}
@@ -12884,19 +13028,19 @@ function BuilderPage({
       ) : null}
 
       <Routes>
-          <Route
-            path="/"
-            element={
-              <HomePage
-                forms={forms}
-                loading={loading}
-                error={error}
-                user={user}
-                markdownEnabled={appMarkdownEnabled}
-                mathjaxEnabled={appMathjaxEnabled}
-              />
-            }
-          />
+        <Route
+          path="/"
+          element={
+            <HomePage
+              forms={forms}
+              loading={loading}
+              error={error}
+              user={user}
+              markdownEnabled={appMarkdownEnabled}
+              mathjaxEnabled={appMathjaxEnabled}
+            />
+          }
+        />
         <Route
           path="/auth/callback"
           element={
@@ -12906,18 +13050,18 @@ function BuilderPage({
             />
           }
         />
-          <Route
-            path="/f/:slug"
-            element={
-              <FormRoute
-                user={user}
-                onLogin={handleLogin}
-                onNotice={pushNotice}
-                markdownEnabled={appMarkdownEnabled}
-                mathjaxEnabled={appMathjaxEnabled}
-              />
-            }
-          />
+        <Route
+          path="/f/:slug"
+          element={
+            <FormRoute
+              user={user}
+              onLogin={handleLogin}
+              onNotice={pushNotice}
+              markdownEnabled={appMarkdownEnabled}
+              mathjaxEnabled={appMathjaxEnabled}
+            />
+          }
+        />
         <Route
           path="/me"
           element={
@@ -13039,6 +13183,7 @@ function BuilderPage({
               <BuilderPage
                 user={user}
                 onLogin={handleLogin}
+                onNotice={pushNotice}
                 appDefaultTimezone={appTimezone}
                 markdownEnabled={appMarkdownEnabled}
                 mathjaxEnabled={appMathjaxEnabled}

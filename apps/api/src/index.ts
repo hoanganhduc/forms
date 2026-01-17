@@ -6,6 +6,7 @@ type CorsHeaders = Record<string, string>;
 interface Env {
   ALLOWED_ORIGIN?: string;
   GIT_SHA?: string;
+  GIT_COMMIT?: string;
   BASE_URL_API?: string;
   BASE_URL_WEB?: string;
   JWT_SECRET?: string;
@@ -13,8 +14,8 @@ interface Env {
   GOOGLE_CLIENT_SECRET?: string;
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
-  GMAIL_REFRESH_TOKEN?: string;
   GMAIL_SENDER_EMAIL?: string;
+  GMAIL_REFRESH_TOKEN?: string;
   ADMIN_GOOGLE_SUB?: string;
   ADMIN_EMAIL?: string;
   ADMIN_GITHUB?: string;
@@ -68,10 +69,14 @@ type FormDetailRow = {
   available_from?: string | null;
   available_until?: string | null;
   password_required?: number | null;
-  password_require_access?: string | number | null;
-  password_require_submit?: string | number | null;
+  password_require_access?: number | null;
+  password_require_submit?: number | null;
   password_salt?: string | null;
   password_hash?: string | null;
+  canvas_fields_position?: string | null;
+  reminder_enabled?: number;
+  reminder_frequency?: string | null;
+  reminder_until?: string | null;
 };
 
 type FormSubmissionRow = {
@@ -98,6 +103,10 @@ type AdminFormRow = {
   password_required?: number | null;
   password_require_access?: number | null;
   password_require_submit?: number | null;
+  canvas_fields_position?: string | null;
+  reminder_enabled?: number;
+  reminder_frequency?: string | null;
+  reminder_until?: string | null;
 };
 
 type TemplateRow = {
@@ -329,8 +338,8 @@ function toNumber(value: string | null, fallback: number): number {
 }
 
 async function hashSha256(buffer: ArrayBuffer) {
-  const digest = await crypto.subtle.digest("SHA-256", buffer);
-  const bytes = Array.from(new Uint8Array(digest));
+  const hash = await crypto.subtle.digest("SHA-256", buffer);
+  const bytes = Array.from(new Uint8Array(hash));
   return bytes.map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
@@ -354,7 +363,7 @@ function getFormAvailability(form: {
   available_until?: string | null;
   is_locked?: number | boolean;
 }) {
-  if (toBoolean(form.is_locked ?? false)) {
+  if (toBoolean(typeof form.is_locked === 'number' ? form.is_locked : (form.is_locked ? 1 : 0))) {
     return { open: false, reason: "locked" as const };
   }
   const now = Date.now();
@@ -366,13 +375,13 @@ function getFormAvailability(form: {
   if (end && now > end) {
     return { open: false, reason: "ended" as const };
   }
-  return { open: true, reason: null as const };
+  return { open: true as const, reason: null };
 }
 
 async function hashPasswordWithSalt(password: string, salt: string) {
   const encoder = new TextEncoder();
   const buffer = encoder.encode(`${salt}:${password}`);
-  return hashSha256(buffer.buffer);
+  return hashSha256(buffer.buffer as ArrayBuffer);
 }
 
 async function verifyFormPassword(
@@ -452,7 +461,7 @@ async function parseSubmissionRequest(request: Request): Promise<{
         dataFields[dataMatch[1]] = value;
         continue;
       }
-      if (value instanceof File) {
+      if (typeof value === 'object' && value !== null && 'size' in value && 'type' in value) {
         let fieldKey = "";
         if (key.startsWith("file:")) {
           fieldKey = key.slice("file:".length);
@@ -501,7 +510,7 @@ function extractFields(schema: unknown): Array<{
   if (!schema || typeof schema !== "object") return [];
   const fields = (schema as { fields?: unknown }).fields;
   if (!Array.isArray(fields)) return [];
-  return fields
+  const filtered = fields
     .map((field) => {
       if (!field || typeof field !== "object") return null;
       const record = field as Record<string, unknown>;
@@ -517,17 +526,8 @@ function extractFields(schema: unknown): Array<{
       if (!id) return null;
       return { id, label, type, required, rules, placeholder };
     })
-    .filter(
-      (field): field is {
-        id: string;
-        label: string;
-        type: string;
-        required: boolean;
-        rules?: Record<string, unknown>;
-        placeholder?: string;
-      } =>
-        Boolean(field)
-    );
+    .filter((field) => field !== null);
+  return filtered as Array<{ id: string; label: string; type: string; required: boolean; rules?: Record<string, unknown>; placeholder?: string; }>;
 }
 
 function normalizeRules(input: unknown): FileRules {
@@ -545,25 +545,25 @@ function normalizeRules(input: unknown): FileRules {
     typeof record.maxFileSizeBytes === "number"
       ? record.maxFileSizeBytes
       : typeof record.maxSizeBytes === "number"
-      ? record.maxSizeBytes
-      : fallback.maxFileSizeBytes!;
+        ? record.maxSizeBytes
+        : fallback.maxFileSizeBytes!;
   return {
     enabled:
       typeof record.enabled === "boolean"
         ? record.enabled
         : Boolean(
-            record.maxFiles ||
-              record.maxFileSizeBytes ||
-              record.maxSizeBytes ||
-              record.allowedExtensions
-          ) || fallback.enabled,
+          record.maxFiles ||
+          record.maxFileSizeBytes ||
+          record.maxSizeBytes ||
+          record.allowedExtensions
+        ) || fallback.enabled,
     maxFiles: typeof record.maxFiles === "number" ? record.maxFiles : fallback.maxFiles,
     maxSizeBytes: maxFileSizeBytes,
     maxFileSizeBytes,
     allowedExtensions: Array.isArray(record.allowedExtensions)
       ? record.allowedExtensions
-          .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
-          .filter((ext) => ext.length > 0)
+        .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
+        .filter((ext) => ext.length > 0)
       : fallback.allowedExtensions,
     required: Boolean(record.required)
   };
@@ -602,8 +602,8 @@ function parseFieldRules(raw: string | null): FieldFileRules {
         const record = value as Record<string, unknown>;
         const extensions = Array.isArray(record.extensions)
           ? record.extensions
-              .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
-              .filter((ext) => ext.length > 0)
+            .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
+            .filter((ext) => ext.length > 0)
           : [];
         const maxBytes =
           typeof record.maxBytes === "number" && Number.isFinite(record.maxBytes)
@@ -625,15 +625,15 @@ function parseFieldRules(raw: string | null): FieldFileRules {
       const record = parsed as Record<string, unknown>;
       const extensions = Array.isArray(record.allowedExtensions)
         ? record.allowedExtensions
-            .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
-            .filter((ext) => ext.length > 0)
+          .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
+          .filter((ext) => ext.length > 0)
         : [];
       const maxBytes =
         typeof record.maxFileSizeBytes === "number"
           ? record.maxFileSizeBytes
           : typeof record.maxSizeBytes === "number"
-          ? record.maxSizeBytes
-          : defaultRule.maxBytes;
+            ? record.maxSizeBytes
+            : defaultRule.maxBytes;
       const maxFiles = typeof record.maxFiles === "number" ? record.maxFiles : defaultRule.maxFiles;
       return {
         fields: {},
@@ -681,27 +681,27 @@ function extractFieldRulesFromSchema(schema: unknown): FieldFileRules {
     const ruleRecord = rules as Record<string, unknown>;
     const extensions = Array.isArray(ruleRecord.allowedExtensions)
       ? ruleRecord.allowedExtensions
-          .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
-          .filter((ext) => ext.length > 0)
+        .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
+        .filter((ext) => ext.length > 0)
       : Array.isArray(ruleRecord.extensions)
-      ? ruleRecord.extensions
+        ? ruleRecord.extensions
           .map((ext) => (typeof ext === "string" ? ext.toLowerCase().replace(/^\./, "") : ""))
           .filter((ext) => ext.length > 0)
-      : [];
+        : [];
     const maxBytes =
       typeof ruleRecord.maxFileSizeBytes === "number"
         ? ruleRecord.maxFileSizeBytes
         : typeof ruleRecord.maxBytes === "number"
-        ? ruleRecord.maxBytes
-        : typeof ruleRecord.maxSizeBytes === "number"
-        ? ruleRecord.maxSizeBytes
-        : defaultRule.maxBytes;
+          ? ruleRecord.maxBytes
+          : typeof ruleRecord.maxSizeBytes === "number"
+            ? ruleRecord.maxSizeBytes
+            : defaultRule.maxBytes;
     const maxFiles =
       typeof ruleRecord.maxFiles === "number"
         ? ruleRecord.maxFiles
         : typeof ruleRecord.maxCount === "number"
-        ? ruleRecord.maxCount
-        : defaultRule.maxFiles;
+          ? ruleRecord.maxCount
+          : defaultRule.maxFiles;
     fields[fieldId] = { extensions, maxBytes, maxFiles };
   });
   return { fields, defaultRule };
@@ -768,7 +768,7 @@ async function handleSubmissionUploadInit(
   env: Env,
   url: URL,
   requestId: string,
-  corsHeaders: HeadersInit,
+  corsHeaders: CorsHeaders,
   body: {
     formSlug?: string;
     fieldKey?: string;
@@ -812,7 +812,15 @@ async function handleSubmissionUploadInit(
     return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
   }
 
-  const passwordCheck = await verifyFormPassword(formRow, body.formPassword, "submit");
+  const passwordCheck = await verifyFormPassword(
+    {
+      ...formRow,
+      password_require_access: formRow.password_require_access as number | null,
+      password_require_submit: formRow.password_require_submit as number | null
+    },
+    body.formPassword,
+    "submit"
+  );
   if (!passwordCheck.ok) {
     return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
       field: "formPassword",
@@ -1042,7 +1050,7 @@ async function getGithubLoginForUser(env: Env, userId: string): Promise<string |
 
 async function getFormWithRules(env: Env, slug: string) {
   return env.DB.prepare(
-    "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,t.key as templateKey,fv.schema_json,t.file_rules_json as template_file_rules_json,f.file_rules_json as form_file_rules_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+    "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.reminder_enabled,f.reminder_frequency,t.key as templateKey,fv.schema_json,t.file_rules_json as template_file_rules_json,f.file_rules_json as form_file_rules_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
   )
     .bind(slug)
     .first<
@@ -1099,7 +1107,7 @@ async function buildFormDetailPayload(env: Env, row: FormDetailRow) {
     }
   }
   const canvasSections =
-    toBoolean(row.canvas_enabled) && row.canvas_course_id
+    toBoolean(row.canvas_enabled ?? 0) && row.canvas_course_id
       ? await getCanvasAllowedSections(env, row.canvas_course_id, allowedSectionIds)
       : [];
   let canvasCourseName: string | null = null;
@@ -1133,11 +1141,13 @@ async function buildFormDetailPayload(env: Env, row: FormDetailRow) {
       file_rules_json: row.form_file_rules_json ?? row.template_file_rules_json ?? null,
       fields,
       file_rules: fileRules,
-      canvas_enabled: toBoolean(row.canvas_enabled),
+      canvas_enabled: toBoolean(row.canvas_enabled ?? 0),
       canvas_course_id: row.canvas_course_id ?? null,
       canvas_course_name: canvasCourseName,
       canvas_allowed_sections: canvasSections,
-      canvas_fields_position: row.canvas_fields_position ?? "bottom"
+      canvas_fields_position: row.canvas_fields_position ?? "bottom",
+      reminder_enabled: toBoolean(row.reminder_enabled ?? 0),
+      reminder_frequency: row.reminder_frequency ?? "weekly"
     }
   };
 }
@@ -1460,7 +1470,7 @@ async function processCanvasRetryQueue(env: Env, limit = 10) {
       "SELECT id, slug, title, canvas_course_id, canvas_enabled FROM forms WHERE id=? AND deleted_at IS NULL"
     )
       .bind(row.form_id)
-      .first<FormRow>();
+      .first<{ id: string; slug: string; title: string; canvas_course_id: string | null; canvas_enabled: number | null }>();
     if (!form || !form.canvas_enabled || !form.canvas_course_id) {
       await env.DB.prepare("DELETE FROM canvas_enroll_queue WHERE id=?").bind(row.id).run();
       continue;
@@ -1522,7 +1532,135 @@ async function processCanvasRetryQueue(env: Env, limit = 10) {
   return { processed, failed, deadlettered };
 }
 
+async function runPeriodicReminders(env: Env) {
+  const { results: forms } = await env.DB.prepare(
+    "SELECT id, slug, title, reminder_frequency, reminder_until FROM forms WHERE reminder_enabled=1 AND deleted_at IS NULL"
+  ).all<{ id: string; slug: string; title: string; reminder_frequency: string; reminder_until: string | null }>();
+
+  if (!forms || forms.length === 0) return;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  for (const form of forms) {
+    if (form.reminder_until) {
+      const untilDate = new Date(form.reminder_until);
+      untilDate.setHours(23, 59, 59, 999);
+      if (today > untilDate) continue;
+    }
+    // Only support weekly/monthly for now to avoid spam
+    // Actually, user wants daily/weekly/monthly. Let's support what we have.
+    // 'daily', 'weekly', 'monthly'.
+    const frequency = form.reminder_frequency || "weekly";
+
+    // Get all submissions for this form
+    const { results: submissions } = await env.DB.prepare(
+      "SELECT user_id, submitter_email, created_at FROM submissions WHERE form_id=? AND deleted_at IS NULL ORDER BY created_at ASC"
+    ).bind(form.id).all<{ user_id: string | null; submitter_email: string | null; created_at: string }>();
+
+    // Group by user (email or user_id)
+    const userMap = new Map<string, { email: string; firstSubmission: Date }>();
+
+    for (const sub of submissions) {
+      const email = sub.submitter_email ? sub.submitter_email.trim().toLowerCase() : null;
+      // If we don't have an email, we can't email them.
+      // If user_id is present but no email in submission, we might need to look up identity?
+      // For now rely on submitter_email which is populated for auth users or if they fill email field (if we map it)
+      // Actually submitter_email is only populated if authenticated or logic sets it.
+      if (!email) continue;
+
+      if (!userMap.has(email)) {
+        userMap.set(email, { email, firstSubmission: new Date(sub.created_at) });
+      }
+    }
+
+    for (const user of userMap.values()) {
+      const firstSub = user.firstSubmission;
+      firstSub.setHours(0, 0, 0, 0);
+
+      const diffTime = Math.abs(today.getTime() - firstSub.getTime());
+      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+      let shouldSend = false;
+      const freq = frequency || "1:weeks";
+      let value = 1;
+      let unit = "weeks";
+
+      if (freq.includes(":")) {
+        const parts = freq.split(":");
+        value = parseInt(parts[0]) || 1;
+        unit = parts[1] || "weeks";
+      } else {
+        // Backward compatibility
+        if (freq === "daily") { value = 1; unit = "days"; }
+        else if (freq === "monthly") { value = 1; unit = "months"; }
+        else { value = 1; unit = "weeks"; }
+      }
+
+      if (unit === "days") {
+        if (diffDays > 0 && diffDays % value === 0) shouldSend = true;
+      } else if (unit === "weeks") {
+        if (diffDays > 0 && diffDays % (value * 7) === 0) shouldSend = true;
+      } else if (unit === "months") {
+        const monthDiff = (today.getFullYear() - firstSub.getFullYear()) * 12 + (today.getMonth() - firstSub.getMonth());
+        if (monthDiff > 0 && monthDiff % value === 0 && today.getDate() === firstSub.getDate()) {
+          shouldSend = true;
+        }
+      }
+
+      if (shouldSend) {
+        // Check if we already sent an email today to this user for this form
+        // We can check email_logs
+        // This is expensive per user. Optimally we'd do a batch check or have a reminders table.
+        // For MVP, we'll just check loosely or assume the cron runs once.
+        // But if we want to be safe:
+        const sentToday = await env.DB.prepare(
+          "SELECT id FROM email_logs WHERE to_address=? AND form_id=? AND trigger_source='periodic_reminder' AND created_at > datetime('now', '-20 hours')"
+        ).bind(user.email, form.id).first();
+
+        if (!sentToday) {
+          const subject = {
+            vi: `Nhắc nhở: ${form.title}`,
+            en: `Reminder: ${form.title}`
+          };
+          const body = {
+            vi: `Xin chào,\n\nĐây là email nhắc nhở bạn điền biểu mẫu "${form.title}".\n\nVui lòng truy cập liên kết dưới đây để điền biểu mẫu:\n${env.BASE_URL_WEB || ""}/#/f/${form.slug}\n\n---\n\nĐây là email tự động. Vui lòng không trả lời email này.`,
+            en: `Hello,\n\nThis is a reminder to fill out the form "${form.title}".\n\nPlease visit the link below to fill out the form:\n${env.BASE_URL_WEB || ""}/#/f/${form.slug}\n\n---\n\nThis is an automated message. Please do not reply to this email.`
+          };
+          // Simple bilingual content
+          const mailBody = `${body.vi}\n\n---\n\n${body.en}`;
+
+          await sendGmailMessage(env, {
+            to: user.email,
+            subject: `${subject.vi} / ${subject.en}`,
+            body: mailBody
+          });
+
+          await logEmailSend(env, {
+            to: user.email,
+            subject: `${subject.vi} / ${subject.en}`,
+            body: mailBody,
+            status: "sent",
+            formId: form.id,
+            formSlug: form.slug,
+            formTitle: form.title,
+            triggerSource: "periodic_reminder"
+          });
+        }
+      }
+    }
+  }
+}
+
 async function runRoutineTaskById(env: Env, taskId: string) {
+  if (taskId === "periodic_reminders") {
+    await runPeriodicReminders(env);
+    const message = "processed";
+    await updateRoutineStatus(env, taskId, "ok", message);
+    await recordRoutineRun(env, taskId, "ok", message);
+    await recordHealthStatus(env, "periodic_reminders", "ok", message);
+    return;
+  }
   if (taskId === "canvas_sync") {
     if (!env.CANVAS_API_TOKEN) {
       await updateRoutineStatus(env, taskId, "skipped", "canvas_token_missing");
@@ -1919,7 +2057,7 @@ async function canvasFindUserByEmail(
           return loginId === target || userEmail === target || sis === target;
         });
         if (match?.id !== undefined && match?.id !== null) {
-          return { id: String(match.id), name: match?.name ?? null, loginId: match?.login_id ?? null };
+          return { id: String(match.id), name: (match as any)?.name ?? null, loginId: match?.login_id ?? null };
         }
         if (users.length === 1 && users[0]?.id !== undefined && users[0]?.id !== null) {
           return {
@@ -1953,7 +2091,7 @@ async function canvasFindUserByEmailInCourse(
   if (match?.id) {
     return match;
   }
-  return { id: null, error: "not_found" };
+  return { id: null as unknown as string, error: "not_found" };
 }
 
 async function canvasSearchUsersInCourse(
@@ -1992,13 +2130,13 @@ async function canvasSearchUsersInCourse(
         email: user?.email ?? null,
         roles: Array.isArray(user?.enrollments)
           ? Array.from(
-              new Set(
-                user.enrollments
-                  .map((enrollment) => enrollment?.type || "")
-                  .filter((value) => value.length > 0)
-                  .map((value) => value.replace("Enrollment", ""))
-              )
+            new Set(
+              user.enrollments
+                .map((enrollment) => enrollment?.type || "")
+                .filter((value) => value.length > 0)
+                .map((value) => value.replace("Enrollment", ""))
             )
+          )
           : []
       }));
   } catch (error) {
@@ -2014,11 +2152,11 @@ async function canvasSearchUsersGlobal(
   const accountId = getCanvasAccountId(env);
   const url = accountId
     ? `${base}/api/v1/accounts/${encodeURIComponent(
-        accountId
-      )}/users?search_term=${encodeURIComponent(query)}&per_page=100&include[]=email&include[]=sis_user_id`
+      accountId
+    )}/users?search_term=${encodeURIComponent(query)}&per_page=100&include[]=email&include[]=sis_user_id`
     : `${base}/api/v1/accounts/self/users?search_term=${encodeURIComponent(
-        query
-      )}&per_page=100&include[]=email&include[]=sis_user_id`;
+      query
+    )}&per_page=100&include[]=email&include[]=sis_user_id`;
   try {
     const users = await canvasFetchAll<{
       id?: string | number;
@@ -2572,8 +2710,8 @@ function formatDateValueForMessage(
     mode === "time"
       ? { hour: "2-digit", minute: "2-digit" }
       : mode === "date"
-      ? { year: "numeric", month: "2-digit", day: "2-digit" }
-      : {
+        ? { year: "numeric", month: "2-digit", day: "2-digit" }
+        : {
           year: "numeric",
           month: "2-digit",
           day: "2-digit",
@@ -2905,7 +3043,7 @@ async function logEmailSend(
     canvasCourseId?: string | null;
     canvasSectionId?: string | null;
     triggeredBy?: string | null;
-    triggerSource?: "manual" | "auto";
+    triggerSource?: string;
   }
 ): Promise<void> {
   try {
@@ -3192,7 +3330,7 @@ async function handleCanvasEnrollment(
   canvasUserId: string | null;
   canvasUserName: string | null;
 }> {
-  if (!toBoolean(form.canvas_enabled) || !form.canvas_course_id) {
+  if (!toBoolean(form.canvas_enabled ?? 0) || !form.canvas_course_id) {
     return {
       status: "skipped",
       error: null,
@@ -3666,7 +3804,7 @@ async function softDeleteTemplate(
   )
     .bind(deletedBy, reason, key)
     .run();
-  return result.success !== false;
+  return result.success === true;
 }
 
 async function softDeleteUser(
@@ -3703,7 +3841,7 @@ async function softDeleteUser(
     deletedBy,
     reason
   );
-  return { ok: result.success !== false, canvas: canvasResult };
+  return { ok: result.success === true, canvas: canvasResult };
 }
 
 async function softDeleteSubmissionForUser(
@@ -3820,7 +3958,7 @@ async function restoreTemplate(env: Env, key: string) {
   )
     .bind(key)
     .run();
-  return result.success !== false;
+  return result.success === true;
 }
 
 async function restoreUser(env: Env, userId: string) {
@@ -3847,7 +3985,7 @@ async function restoreUser(env: Env, userId: string) {
   if (canvasDeleteSyncEnabled) {
     await canvasApplyTaskForUserCourses(env, userId, "reactivate");
   }
-  return result.success !== false;
+  return result.success === true;
 }
 
 async function restoreSubmission(
@@ -3877,7 +4015,7 @@ async function restoreFileItem(env: Env, fileId: string) {
   )
     .bind(fileId)
     .run();
-  return result.success !== false;
+  return result.success === true;
 }
 
 async function hardDeleteForm(env: Env, slug: string) {
@@ -4768,7 +4906,7 @@ async function finalizeFileItemForUser(
     contentType,
     new Uint8Array(buffer)
   );
-  if (!uploaded.id) {
+  if (!uploaded || !uploaded.id) {
     return { ok: false as const, error: "drive_error" };
   }
   await env.DB.prepare(
@@ -4865,7 +5003,7 @@ async function finalizeSubmissionFileItemsForUser(
       contentType,
       new Uint8Array(buffer)
     );
-    if (uploaded.id) {
+    if (uploaded && uploaded.id) {
       await env.DB.prepare(
         "UPDATE submission_file_items SET final_drive_file_id=?, finalized_at=datetime('now'), drive_web_view_link=? WHERE id=?"
       )
@@ -5595,9 +5733,9 @@ async function ensureIdentityFromAuthPayload(env: Env, authPayload: JwtPayload) 
       return;
     }
     await env.DB.prepare(
-      "INSERT INTO user_identities (id, user_id, provider, provider_sub, provider_login, email) VALUES (?, ?, 'github', NULL, ?, ?)"
+      "INSERT INTO user_identities (id, user_id, provider, provider_sub, provider_login, email) VALUES (?, ?, 'github', ?, ?, ?)"
     )
-      .bind(crypto.randomUUID(), userId, authPayload.sub, authPayload.email ?? null)
+      .bind(crypto.randomUUID(), userId, authPayload.sub, authPayload.sub, authPayload.email ?? null)
       .run();
   }
 }
@@ -6063,7 +6201,6 @@ export default {
         const redirectUri = new URL("/auth/callback/github", ensureEnv(env.BASE_URL_API, "BASE_URL_API")).toString();
         const authUrl = new URL("https://github.com/login/oauth/authorize");
         authUrl.searchParams.set("client_id", clientId);
-        authUrl.searchParams.set("redirect_uri", redirectUri);
         authUrl.searchParams.set("scope", "read:user user:email");
         authUrl.searchParams.set("state", state);
         return createRedirectResponse(authUrl.toString(), requestId);
@@ -6314,7 +6451,7 @@ export default {
         {
           timezoneDefault,
           canvasCourseSyncMode: normalizeCanvasCourseSyncMode(canvasCourseSyncMode),
-          canvasDeleteSyncEnabled: normalizeCanvasDeleteSyncEnabled(canvasDeleteSync),
+          canvasDeleteSyncEnabled: normalizeAppToggle(canvasDeleteSync, true),
           markdownEnabled: normalizeAppToggle(markdownEnabled, true),
           mathjaxEnabled: normalizeAppToggle(mathjaxEnabled, true),
           requestId
@@ -6520,7 +6657,7 @@ export default {
           const email = dataEmail || row.submitter_email;
           const status = row.canvas_enroll_status || "not_invited";
           const sectionName =
-            sectionId && sectionNameMap.get(courseId)
+            sectionId && sectionNameMap.has(courseId)
               ? sectionNameMap.get(courseId)!.get(sectionId) || null
               : null;
           let canvasFullName: string | null = null;
@@ -7068,13 +7205,13 @@ export default {
           });
         }
         if (task === "reactivate") {
-          const enrollment = await canvasFindEnrollmentByEmail(env, courseId, email);
+          const enrollment = await canvasFindEnrollmentByEmail(env, courseId ?? "", email);
           if (!enrollment.id) {
             return errorResponse(500, "canvas_update_failed", requestId, corsHeaders, {
               message: enrollment.error || "enrollment_not_found"
             });
           }
-          const result = await canvasReactivateEnrollment(env, courseId, enrollment.id);
+          const result = await canvasReactivateEnrollment(env, courseId ?? "", enrollment.id);
           if (!result.ok) {
             return errorResponse(500, "canvas_update_failed", requestId, corsHeaders, {
               message: result.error || "canvas_update_failed"
@@ -7093,7 +7230,8 @@ export default {
           );
         }
         if (task === "delete" && !courseId) {
-          await updateSubmissionsSoftDelete(env, "id=?", [submissionId], authPayload?.userId ?? null, "user_deleted");
+          const ap = await getAuthPayload(request, env);
+          await updateSubmissionsSoftDelete(env, "id=?", [submissionId], ap?.userId ?? null, "user_deleted");
           return jsonResponse(
             200,
             { ok: true, status: "deleted", requestId },
@@ -7101,7 +7239,7 @@ export default {
             corsHeaders
           );
         }
-        const result = await canvasApplyEnrollmentTaskByEmail(env, courseId, email, task);
+        const result = await canvasApplyEnrollmentTaskByEmail(env, courseId ?? "", email, task);
         if (!result.ok) {
           return errorResponse(500, "canvas_update_failed", requestId, corsHeaders, {
             message: result.error || "canvas_update_failed"
@@ -7328,13 +7466,13 @@ export default {
         const courseLabel = courseTitle
           ? `${courseTitle}${courseCode ? ` (${courseCode})` : ""}`
           : submission.canvas_course_id
-          ? `Course ${submission.canvas_course_id}`
-          : null;
+            ? `Course ${submission.canvas_course_id}`
+            : null;
         const sectionLabel = sectionName
           ? sectionName
           : submission.canvas_section_id
-          ? `Section ${submission.canvas_section_id}`
-          : null;
+            ? `Section ${submission.canvas_section_id}`
+            : null;
         const baseWeb = env.BASE_URL_WEB ? String(env.BASE_URL_WEB).replace(/\/$/, "") : "";
         const formLink =
           baseWeb && submission.form_slug ? `${baseWeb}/#/f/${submission.form_slug}` : null;
@@ -7487,6 +7625,16 @@ export default {
           formLink: sampleFormLink
         });
         const goodbyeMessage = buildAccountGoodbyeMessage();
+        const sampleFormTitle = "HUS Demo 1";
+        const sampleFormSlug = "hus-demo-1";
+        const reminderSubject = {
+          vi: `Nhắc nhở: ${sampleFormTitle}`,
+          en: `Reminder: ${sampleFormTitle}`
+        };
+        const reminderBody = {
+          vi: `Xin chào,\n\nĐây là email nhắc nhở bạn điền biểu mẫu "${sampleFormTitle}".\n\nVui lòng truy cập liên kết dưới đây để điền biểu mẫu:\n${env.BASE_URL_WEB || ""}/#/f/${sampleFormSlug}\n\n---\n\nĐây là email tự động. Vui lòng không trả lời email này.`,
+          en: `Hello,\n\nThis is a reminder to fill out the form "${sampleFormTitle}".\n\nPlease visit the link below to fill out the form:\n${env.BASE_URL_WEB || ""}/#/f/${sampleFormSlug}\n\n---\n\nThis is an automated message. Please do not reply to this email.`
+        };
         const data = [
           {
             key: "welcome",
@@ -7511,6 +7659,12 @@ export default {
             label: "Goodbye message",
             subject: goodbyeMessage.subject,
             body: goodbyeMessage.body
+          },
+          {
+            key: "reminder",
+            label: "Periodic reminder",
+            subject: `${reminderSubject.vi} / ${reminderSubject.en}`,
+            body: `${reminderBody.vi}\n\n---\n\n${reminderBody.en}`
           }
         ];
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -7642,7 +7796,7 @@ export default {
             const { results } = await env.DB.prepare(
               "SELECT DISTINCT canvas_course_id as course_id FROM forms WHERE canvas_enabled=1 AND canvas_course_id IS NOT NULL AND deleted_at IS NULL"
             ).all<{ course_id: string | null }>();
-            const courseIds = results.map((row) => row.course_id).filter(Boolean) as string[];
+            const courseIds = results.filter((row): row is { course_id: string } => row.course_id !== null).map((row) => row.course_id);
             for (const id of courseIds) {
               sectionsSynced += await syncCanvasSections(env, id);
             }
@@ -7682,7 +7836,7 @@ export default {
           submission_count: Number(row.submission_count ?? 0),
           updated_at: row.updated_at ?? null,
           created_at: row.created_at ?? null,
-          canvas_enabled: toBoolean(row.canvas_enabled),
+          canvas_enabled: toBoolean(row.canvas_enabled ?? 0),
           canvas_course_id: row.canvas_course_id ?? null,
           canvas_allowed_section_ids_json: row.canvas_allowed_section_ids_json ?? null,
           canvas_fields_position: row.canvas_fields_position ?? "bottom",
@@ -7700,7 +7854,7 @@ export default {
       if (request.method === "GET" && formBackupMatch) {
         const slug = decodeURIComponent(formBackupMatch[1]);
         const formRow = await env.DB.prepare(
-          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.reminder_enabled,f.reminder_frequency,t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
         )
           .bind(slug)
           .first<{
@@ -7723,6 +7877,8 @@ export default {
             password_salt: string | null;
             password_hash: string | null;
             file_rules_json: string | null;
+            reminder_enabled: number;
+            reminder_frequency: string | null;
             template_key: string | null;
             template_name: string | null;
             template_schema_json: string | null;
@@ -7744,6 +7900,8 @@ export default {
           type: "form",
           form: {
             slug: formRow.slug,
+            reminder_enabled: toBoolean(formRow.reminder_enabled),
+            reminder_frequency: formRow.reminder_frequency,
             title: formRow.title,
             description: formRow.description ?? null,
             is_locked: toBoolean(formRow.is_locked),
@@ -7935,51 +8093,51 @@ export default {
         const templateMatch = url.pathname.match(/^\/api\/admin\/templates\/([^/]+)$/);
         if (templateMatch) {
           const key = decodeURIComponent(templateMatch[1]);
-            let body: {
-              newKey?: string;
-              name?: string;
-              schema_json?: string;
-            } | null = null;
+          let body: {
+            newKey?: string;
+            name?: string;
+            schema_json?: string;
+          } | null = null;
           try {
             body = await parseJsonBody(request);
           } catch (error) {
             return errorResponse(400, "invalid_json", requestId, corsHeaders);
           }
 
-            const updates: string[] = [];
-            const params: Array<string | number | null> = [];
-            let canvasWarning: string | null = null;
-            if (body?.newKey !== undefined) {
-              if (typeof body.newKey !== "string" || !body.newKey.trim()) {
-                return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-                  field: "newKey",
-                  message: "expected_string"
+          const updates: string[] = [];
+          const params: Array<string | number | null> = [];
+          let canvasWarning: string | null = null;
+          if (body?.newKey !== undefined) {
+            if (typeof body.newKey !== "string" || !body.newKey.trim()) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "newKey",
+                message: "expected_string"
+              });
+            }
+            const nextKey = body.newKey.trim();
+            if (nextKey !== key) {
+              const existing = await env.DB.prepare(
+                "SELECT id FROM templates WHERE key=? AND deleted_at IS NULL"
+              )
+                .bind(nextKey)
+                .first<{ id: string }>();
+              if (existing?.id) {
+                return errorResponse(409, "conflict", requestId, corsHeaders, {
+                  message: "key_exists"
                 });
               }
-              const nextKey = body.newKey.trim();
-              if (nextKey !== key) {
-                const existing = await env.DB.prepare(
-                  "SELECT id FROM templates WHERE key=? AND deleted_at IS NULL"
-                )
-                  .bind(nextKey)
-                  .first<{ id: string }>();
-                if (existing?.id) {
-                  return errorResponse(409, "conflict", requestId, corsHeaders, {
-                    message: "key_exists"
-                  });
-                }
-                updates.push("key=?");
-                params.push(nextKey);
-              }
+              updates.push("key=?");
+              params.push(nextKey);
             }
+          }
           if (body?.name && typeof body.name === "string") {
             updates.push("name=?");
             params.push(body.name.trim());
           }
-            if (body?.schema_json && typeof body.schema_json === "string") {
-              let parsedSchema: unknown = null;
-              try {
-                parsedSchema = JSON.parse(body.schema_json);
+          if (body?.schema_json && typeof body.schema_json === "string") {
+            let parsedSchema: unknown = null;
+            try {
+              parsedSchema = JSON.parse(body.schema_json);
             } catch (error) {
               return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
                 field: "schema_json",
@@ -8012,7 +8170,7 @@ export default {
           )
             .bind(...params)
             .run();
-          if (result.success === false) {
+          if (result.success !== true) {
             return errorResponse(500, "template_update_failed", requestId, corsHeaders);
           }
           return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
@@ -8246,7 +8404,7 @@ export default {
       }
 
       if (request.method === "POST" && url.pathname === "/api/admin/templates/restore") {
-        let body: { type?: string; template?: any } | null = null;
+        let body: { type?: string; template?: any; restoreTrash?: boolean } | null = null;
         try {
           body = await parseJsonBody(request);
         } catch (error) {
@@ -8287,7 +8445,7 @@ export default {
         )
           .bind(tpl.key)
           .first<{ id: string; deleted_at: string | null }>();
-        if (existing?.id && existing.deleted_at && !body?.restoreTrash) {
+        if (existing?.id && existing.deleted_at !== null && body?.restoreTrash !== true) {
           return errorResponse(409, "conflict", requestId, corsHeaders, {
             message: "slug_in_trash"
           });
@@ -8300,7 +8458,7 @@ export default {
             .run();
           return jsonResponse(
             200,
-            { ok: true, updated: true, restored: Boolean(existing.deleted_at), requestId },
+            { ok: true, updated: true, restored: existing.deleted_at !== null, requestId },
             requestId,
             corsHeaders
           );
@@ -8460,7 +8618,7 @@ export default {
         return jsonResponse(200, { ok: true, canvasSummary, requestId }, requestId, corsHeaders);
       }
       if (request.method === "POST" && url.pathname === "/api/admin/forms/restore") {
-        let body: { type?: string; form?: any; template?: any } | null = null;
+        let body: { type?: string; form?: any; template?: any; restoreTrash?: boolean; reminderEnabled?: boolean; reminderFrequency?: string; reminderUntil?: string | null } | null = null;
         try {
           body = await parseJsonBody(request);
         } catch (error) {
@@ -8602,6 +8760,16 @@ export default {
         const isLocked = Boolean(form.is_locked);
         const availableFrom = normalizeDateTimeInput(form.available_from ?? null);
         const availableUntil = normalizeDateTimeInput(form.available_until ?? null);
+        if (availableFrom && availableUntil) {
+          const start = parseIsoTime(availableFrom);
+          const end = parseIsoTime(availableUntil);
+          if (start && end && start >= end) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "availableUntil",
+              message: "must_be_after_start"
+            });
+          }
+        }
         const passwordRequired = Boolean(form.password_required);
         let passwordRequireAccess = Boolean(form.password_require_access);
         let passwordRequireSubmit = Boolean(form.password_require_submit);
@@ -8627,18 +8795,18 @@ export default {
           Array.isArray(form.canvas_allowed_section_ids_json)
             ? JSON.stringify(form.canvas_allowed_section_ids_json)
             : typeof form.canvas_allowed_section_ids_json === "string"
-            ? form.canvas_allowed_section_ids_json
-            : null;
+              ? form.canvas_allowed_section_ids_json
+              : null;
         const fileRulesJson = formSchemaJson
           ? buildFileRulesJsonFromSchema(formSchemaJson)
           : typeof form.file_rules_json === "string"
-          ? form.file_rules_json
-          : form.file_rules_json
-          ? JSON.stringify(form.file_rules_json)
-          : null;
+            ? form.file_rules_json
+            : form.file_rules_json
+              ? JSON.stringify(form.file_rules_json)
+              : null;
         const formVersionSchema = formSchemaJson || templateSchemaJson;
 
-        if (existingForm?.id && existingForm.deleted_at && !body?.restoreTrash) {
+        if (existingForm?.id && existingForm.deleted_at !== null && body?.restoreTrash !== true) {
           return errorResponse(409, "conflict", requestId, corsHeaders, {
             message: "slug_in_trash"
           });
@@ -8689,7 +8857,7 @@ export default {
           }
           return jsonResponse(
             200,
-            { ok: true, updated: true, restored: Boolean(existingForm.deleted_at), requestId },
+            { ok: true, updated: true, restored: existingForm.deleted_at !== null, requestId },
             requestId,
             corsHeaders
           );
@@ -8697,7 +8865,7 @@ export default {
 
         const formId = crypto.randomUUID();
         await env.DB.prepare(
-          "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO forms (id, slug, title, description, template_id, is_public, is_locked, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, reminder_enabled, reminder_frequency, reminder_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
           .bind(
             formId,
@@ -8706,6 +8874,7 @@ export default {
             form.description ?? null,
             templateId,
             isPublic ? 1 : 0,
+            isLocked ? 1 : 0,
             authPolicy,
             fileRulesJson,
             canvasEnabled ? 1 : 0,
@@ -8718,9 +8887,13 @@ export default {
             passwordRequireAccess ? 1 : 0,
             passwordRequireSubmit ? 1 : 0,
             passwordRequired ? passwordSalt : null,
-            passwordRequired ? passwordHash : null
+            passwordRequired ? passwordHash : null,
+            body.reminderEnabled ? 1 : 0,
+            body.reminderFrequency || "weekly",
+            body.reminderUntil || null
           )
           .run();
+
         if (formVersionSchema) {
           await env.DB.prepare(
             "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
@@ -8732,7 +8905,7 @@ export default {
         return jsonResponse(201, { ok: true, created: true, requestId }, requestId, corsHeaders);
       }
       if (request.method === "POST" && url.pathname === "/api/admin/templates/from-form") {
-        let body: { type?: string; form?: any } | null = null;
+        let body: { type?: string; form?: any; restoreTrash?: boolean } | null = null;
         try {
           body = await parseJsonBody(request);
         } catch (error) {
@@ -8748,8 +8921,8 @@ export default {
           typeof form.templateKey === "string" && form.templateKey.trim()
             ? form.templateKey.trim()
             : typeof form.slug === "string" && form.slug.trim()
-            ? form.slug.trim()
-            : "";
+              ? form.slug.trim()
+              : "";
         if (!templateKey || form.schema_json === undefined || form.schema_json === null) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             message: "missing_form_schema"
@@ -8779,7 +8952,7 @@ export default {
         )
           .bind(templateKey)
           .first<{ id: string; deleted_at: string | null }>();
-        if (existing?.id && existing.deleted_at && !body?.restoreTrash) {
+        if (existing?.id && existing.deleted_at !== null && body?.restoreTrash !== true) {
           return errorResponse(409, "conflict", requestId, corsHeaders, {
             message: "slug_in_trash"
           });
@@ -8797,7 +8970,7 @@ export default {
             .run();
           return jsonResponse(
             200,
-            { ok: true, updated: true, restored: Boolean(existing.deleted_at), requestId },
+            { ok: true, updated: true, restored: existing.deleted_at !== null, requestId },
             requestId,
             corsHeaders
           );
@@ -8836,6 +9009,9 @@ export default {
           passwordRequireAccess?: boolean;
           passwordRequireSubmit?: boolean;
           formPassword?: string | null;
+          reminderEnabled?: boolean;
+          reminderFrequency?: string;
+          reminderUntil?: string | null;
         } | null = null;
         try {
           body = await parseJsonBody(request);
@@ -8889,9 +9065,9 @@ export default {
             : null;
         const canvasAllowedSectionIds = Array.isArray(body.canvasAllowedSectionIds)
           ? body.canvasAllowedSectionIds
-              .filter((id) => typeof id === "string")
-              .map((id) => id.trim())
-              .filter((id) => id.length > 0)
+            .filter((id): id is string => typeof id === "string")
+            .map((id) => id.trim())
+            .filter((id) => id.length > 0)
           : null;
         if (body.canvasAllowedSectionIds !== undefined && !Array.isArray(body.canvasAllowedSectionIds)) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
@@ -8982,6 +9158,22 @@ export default {
         const formId = crypto.randomUUID();
         const versionId = crypto.randomUUID();
         const isPublic = body.is_public === undefined ? 1 : body.is_public ? 1 : 0;
+
+        if (body.reminderEnabled !== undefined && typeof body.reminderEnabled !== "boolean") {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "reminderEnabled",
+            message: "expected_boolean"
+          });
+        }
+
+        if (body.reminderFrequency !== undefined && body.reminderFrequency !== null) {
+          if (!["daily", "weekly", "monthly"].includes(body.reminderFrequency) && !/^\d+:(days|weeks|months)$/.test(body.reminderFrequency)) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "reminderFrequency",
+              message: "invalid_value"
+            });
+          }
+        }
         const description = body.description ?? null;
         const mirroredRules = buildFileRulesJsonFromSchema(template.schema_json);
         const availableFrom = normalizeDateTimeInput(body.availableFrom ?? null);
@@ -9051,7 +9243,7 @@ export default {
             : null;
         const statements = [
           env.DB.prepare(
-            "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, created_by, reminder_enabled, reminder_frequency, reminder_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
           ).bind(
             formId,
             body.slug.trim(),
@@ -9073,7 +9265,10 @@ export default {
             passwordRequireSubmit ? 1 : 0,
             passwordSalt,
             passwordHash,
-            authPayload?.userId ?? null
+            authPayload?.userId ?? null,
+            body.reminderEnabled ? 1 : 0,
+            body.reminderFrequency || "weekly",
+            body.reminderUntil || null
           ),
           env.DB.prepare(
             "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
@@ -9107,7 +9302,7 @@ export default {
               canvas_fields_position: canvasFieldsPosition,
               available_from: availableFrom,
               available_until: availableUntil,
-              password_required: passwordRequired === true,
+              password_required: passwordRequired,
               password_require_access: passwordRequireAccess,
               password_require_submit: passwordRequireSubmit
             },
@@ -9120,16 +9315,16 @@ export default {
       }
 
       if (request.method === "PATCH") {
-          const formMatch = url.pathname.match(/^\/api\/admin\/forms\/([^/]+)$/);
+        const formMatch = url.pathname.match(/^\/api\/admin\/forms\/([^/]+)$/);
         if (formMatch) {
           const slug = decodeURIComponent(formMatch[1]);
-            let body: {
-              newSlug?: string;
-              title?: string;
-              description?: string | null;
-              is_public?: boolean;
-              is_locked?: boolean;
-              auth_policy?: string;
+          let body: {
+            newSlug?: string;
+            title?: string;
+            description?: string | null;
+            is_public?: boolean;
+            is_locked?: boolean;
+            auth_policy?: string;
             templateKey?: string;
             schema_json?: string;
             canvasEnabled?: boolean;
@@ -9139,7 +9334,12 @@ export default {
             availableFrom?: string | null;
             availableUntil?: string | null;
             passwordRequired?: boolean;
+            passwordRequireAccess?: boolean;
+            passwordRequireSubmit?: boolean;
             formPassword?: string | null;
+            reminderEnabled?: boolean;
+            reminderFrequency?: string;
+            reminderUntil?: string | null;
           } | null = null;
           try {
             body = await parseJsonBody(request);
@@ -9147,65 +9347,66 @@ export default {
             return errorResponse(400, "invalid_json", requestId, corsHeaders);
           }
 
-            const updates: string[] = [];
-            const params: Array<string | number | null> = [];
-            let canvasWarning: string | null = null;
-            const formRow = await env.DB.prepare(
-              "SELECT id, slug, password_required, password_require_access, password_require_submit, password_salt, password_hash, available_from, available_until FROM forms WHERE slug=? AND deleted_at IS NULL"
-            )
-              .bind(slug)
-              .first<{
-                id: string;
-                slug: string;
-                password_required: number;
-                password_require_access: number | null;
-                password_require_submit: number | null;
-                password_salt: string | null;
-                password_hash: string | null;
-                available_from: string | null;
-                available_until: string | null;
-              }>();
-            if (!formRow) {
-              return errorResponse(404, "not_found", requestId, corsHeaders);
-            }
-            if (
-              body?.passwordRequired === true &&
-              (!formRow.password_hash || !formRow.password_salt) &&
-              (!body.formPassword || (typeof body.formPassword === "string" && !body.formPassword.trim()))
-            ) {
+          const updates: string[] = [];
+          const params: Array<string | number | null> = [];
+          let canvasWarning: string | null = null;
+          const formRow = await env.DB.prepare(
+            "SELECT id, slug, password_required, password_require_access, password_require_submit, password_salt, password_hash, available_from, available_until, reminder_until FROM forms WHERE slug=? AND deleted_at IS NULL"
+          )
+            .bind(slug)
+            .first<{
+              id: string;
+              slug: string;
+              password_required: number;
+              password_require_access: number | null;
+              password_require_submit: number | null;
+              password_salt: string | null;
+              password_hash: string | null;
+              available_from: string | null;
+              available_until: string | null;
+              reminder_until: string | null;
+            }>();
+          if (!formRow) {
+            return errorResponse(404, "not_found", requestId, corsHeaders);
+          }
+          if (
+            body?.passwordRequired === true &&
+            (formRow.password_hash === null || formRow.password_salt === null) &&
+            (body.formPassword === undefined || (typeof body.formPassword === "string" && !body.formPassword.trim()))
+          ) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "formPassword",
+              message: "required"
+            });
+          }
+          let newSlug: string | null = null;
+          if (body?.newSlug !== undefined) {
+            if (typeof body.newSlug !== "string" || !body.newSlug.trim()) {
               return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-                field: "formPassword",
-                message: "required"
+                field: "newSlug",
+                message: "expected_string"
               });
             }
-            let newSlug: string | null = null;
-            if (body?.newSlug !== undefined) {
-              if (typeof body.newSlug !== "string" || !body.newSlug.trim()) {
-                return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-                  field: "newSlug",
-                  message: "expected_string"
+            const candidate = body.newSlug.trim();
+            if (candidate !== slug) {
+              const existing = await env.DB.prepare(
+                "SELECT id, deleted_at FROM forms WHERE slug=?"
+              )
+                .bind(candidate)
+                .first<{ id: string; deleted_at: string | null }>();
+              if (existing?.id && existing.id !== formRow.id) {
+                return errorResponse(409, "conflict", requestId, corsHeaders, {
+                  message: existing.deleted_at !== null ? "slug_in_trash" : "slug_exists"
                 });
               }
-              const candidate = body.newSlug.trim();
-              if (candidate !== slug) {
-                const existing = await env.DB.prepare(
-                  "SELECT id, deleted_at FROM forms WHERE slug=?"
-                )
-                  .bind(candidate)
-                  .first<{ id: string; deleted_at: string | null }>();
-                if (existing?.id && existing.id !== formRow.id) {
-                  return errorResponse(409, "conflict", requestId, corsHeaders, {
-                    message: existing.deleted_at ? "slug_in_trash" : "slug_exists"
-                  });
-                }
-                newSlug = candidate;
-              }
+              newSlug = candidate;
             }
+          }
 
-            if (body?.title && typeof body.title === "string") {
-              updates.push("title=?");
-              params.push(body.title.trim());
-            }
+          if (body?.title && typeof body.title === "string") {
+            updates.push("title=?");
+            params.push(body.title.trim());
+          }
           if (body?.description !== undefined) {
             updates.push("description=?");
             params.push(body.description ?? null);
@@ -9359,7 +9560,7 @@ export default {
               )
                 .bind(slug)
                 .first<{ canvas_course_id: string | null }>();
-              if (!formRow?.canvas_course_id) {
+              if (formRow?.canvas_course_id === null) {
                 return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
                   field: "canvasCourseId",
                   message: "required"
@@ -9387,17 +9588,17 @@ export default {
               });
             }
             const filtered = body.canvasAllowedSectionIds
-              .filter((id) => typeof id === "string")
+              .filter((id): id is string => typeof id === "string")
               .map((id) => id.trim())
               .filter((id) => id.length > 0);
             const courseId =
               body.canvasCourseId !== undefined
                 ? body.canvasCourseId?.trim() || null
                 : (await env.DB.prepare(
-                    "SELECT canvas_course_id FROM forms WHERE slug=? AND deleted_at IS NULL"
-                  )
-                    .bind(slug)
-                    .first<{ canvas_course_id: string | null }>())?.canvas_course_id ?? null;
+                  "SELECT canvas_course_id FROM forms WHERE slug=? AND deleted_at IS NULL"
+                )
+                  .bind(slug)
+                  .first<{ canvas_course_id: string | null }>())?.canvas_course_id ?? null;
             if (courseId && filtered.length > 0) {
               const { results } = await env.DB.prepare(
                 "SELECT id FROM canvas_sections_cache WHERE course_id=?"
@@ -9440,6 +9641,33 @@ export default {
             }
             updates.push("canvas_fields_position=?");
             params.push(value);
+          }
+
+          if (body?.reminderEnabled !== undefined) {
+            if (typeof body.reminderEnabled !== "boolean") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "reminderEnabled",
+                message: "expected_boolean"
+              });
+            }
+            updates.push("reminder_enabled=?");
+            params.push(body.reminderEnabled ? 1 : 0);
+          }
+
+          if (body?.reminderFrequency !== undefined) {
+            if (body.reminderFrequency !== null && !["daily", "weekly", "monthly"].includes(body.reminderFrequency) && !/^\d+:(days|weeks|months)$/.test(body.reminderFrequency)) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "reminderFrequency",
+                message: "invalid_value"
+              });
+            }
+            updates.push("reminder_frequency=?");
+            params.push(body.reminderFrequency || "weekly");
+          }
+
+          if (body?.reminderUntil !== undefined) {
+            updates.push("reminder_until=?");
+            params.push(normalizeDateTimeInput(body.reminderUntil ?? null));
           }
 
           let formId: string | null = null;
@@ -9521,100 +9749,100 @@ export default {
             )
               .bind(JSON.stringify(parsedSchema), formId)
               .run();
-              const mirroredRules = buildFileRulesJsonFromSchema(body.schema_json);
-              updates.push("file_rules_json=?");
-              params.push(mirroredRules);
-            }
-            if (newSlug) {
-              updates.push("slug=?");
-              params.push(newSlug);
-            }
+            const mirroredRules = buildFileRulesJsonFromSchema(body.schema_json);
+            updates.push("file_rules_json=?");
+            params.push(mirroredRules);
+          }
+          if (newSlug) {
+            updates.push("slug=?");
+            params.push(newSlug);
+          }
 
-            if (updates.length === 0) {
-              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-                message: "no_fields_to_update"
-              });
+          if (updates.length === 0) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              message: "no_fields_to_update"
+            });
           }
 
           params.push(slug);
-            await env.DB.prepare(
-              `UPDATE forms SET ${updates.join(", ")}, updated_at=datetime('now') WHERE slug=? AND deleted_at IS NULL`
-            )
-              .bind(...params)
-              .run();
-            if (newSlug) {
-              if (await hasColumn(env, "submissions", "form_slug")) {
-                try {
-                  await env.DB.prepare("UPDATE submissions SET form_slug=? WHERE form_id=?")
-                    .bind(newSlug, formRow.id)
-                    .run();
-                } catch (error) {
-                  if (!isMissingColumn(error, "form_slug")) {
-                    throw error;
-                  }
-                }
-              }
-              if (await hasColumn(env, "submission_file_items", "form_slug")) {
-                try {
-                  await env.DB.prepare("UPDATE submission_file_items SET form_slug=? WHERE form_id=?")
-                    .bind(newSlug, formRow.id)
-                    .run();
-                } catch (error) {
-                  if (!isMissingColumn(error, "form_slug")) {
-                    throw error;
-                  }
-                }
-              }
-              if (await hasColumn(env, "submission_upload_sessions", "form_slug")) {
-                try {
-                  await env.DB.prepare("UPDATE submission_upload_sessions SET form_slug=? WHERE form_id=?")
-                    .bind(newSlug, formRow.id)
-                    .run();
-                } catch (error) {
-                  if (!isMissingColumn(error, "form_slug")) {
-                    throw error;
-                  }
-                }
-              }
-              if (await hasColumn(env, "drive_folders", "form_slug")) {
-                try {
-                  await env.DB.prepare("UPDATE drive_folders SET form_slug=? WHERE form_slug=?")
-                    .bind(newSlug, slug)
-                    .run();
-                } catch (error) {
-                  if (!isMissingColumn(error, "form_slug")) {
-                    throw error;
-                  }
-                }
-              }
-              if (await hasColumn(env, "drive_user_folders", "form_slug")) {
-                try {
-                  await env.DB.prepare("UPDATE drive_user_folders SET form_slug=? WHERE form_slug=?")
-                    .bind(newSlug, slug)
-                    .run();
-                } catch (error) {
-                  if (!isMissingColumn(error, "form_slug")) {
-                    throw error;
-                  }
-                }
-              }
-              if (await hasColumn(env, "email_logs", "form_slug")) {
-                try {
-                  await env.DB.prepare("UPDATE email_logs SET form_slug=? WHERE form_slug=?")
-                    .bind(newSlug, slug)
-                    .run();
-                } catch (error) {
-                  if (!isMissingColumn(error, "form_slug")) {
-                    throw error;
-                  }
+          await env.DB.prepare(
+            `UPDATE forms SET ${updates.join(", ")}, updated_at=datetime('now') WHERE slug=? AND deleted_at IS NULL`
+          )
+            .bind(...params)
+            .run();
+          if (newSlug) {
+            if (await hasColumn(env, "submissions", "form_slug")) {
+              try {
+                await env.DB.prepare("UPDATE submissions SET form_slug=? WHERE form_id=?")
+                  .bind(newSlug, formRow.id)
+                  .run();
+              } catch (error) {
+                if (!isMissingColumn(error, "form_slug")) {
+                  throw error;
                 }
               }
             }
+            if (await hasColumn(env, "submission_file_items", "form_slug")) {
+              try {
+                await env.DB.prepare("UPDATE submission_file_items SET form_slug=? WHERE form_id=?")
+                  .bind(newSlug, formRow.id)
+                  .run();
+              } catch (error) {
+                if (!isMissingColumn(error, "form_slug")) {
+                  throw error;
+                }
+              }
+            }
+            if (await hasColumn(env, "submission_upload_sessions", "form_slug")) {
+              try {
+                await env.DB.prepare("UPDATE submission_upload_sessions SET form_slug=? WHERE form_id=?")
+                  .bind(newSlug, formRow.id)
+                  .run();
+              } catch (error) {
+                if (!isMissingColumn(error, "form_slug")) {
+                  throw error;
+                }
+              }
+            }
+            if (await hasColumn(env, "drive_folders", "form_slug")) {
+              try {
+                await env.DB.prepare("UPDATE drive_folders SET form_slug=? WHERE form_slug=?")
+                  .bind(newSlug, slug)
+                  .run();
+              } catch (error) {
+                if (!isMissingColumn(error, "form_slug")) {
+                  throw error;
+                }
+              }
+            }
+            if (await hasColumn(env, "drive_user_folders", "form_slug")) {
+              try {
+                await env.DB.prepare("UPDATE drive_user_folders SET form_slug=? WHERE form_slug=?")
+                  .bind(newSlug, slug)
+                  .run();
+              } catch (error) {
+                if (!isMissingColumn(error, "form_slug")) {
+                  throw error;
+                }
+              }
+            }
+            if (await hasColumn(env, "email_logs", "form_slug")) {
+              try {
+                await env.DB.prepare("UPDATE email_logs SET form_slug=? WHERE form_slug=?")
+                  .bind(newSlug, slug)
+                  .run();
+              } catch (error) {
+                if (!isMissingColumn(error, "form_slug")) {
+                  throw error;
+                }
+              }
+            }
+          }
 
-            return jsonResponse(
-              200,
-              { ok: true, warning: canvasWarning ? { code: canvasWarning } : null, requestId },
-              requestId,
+          return jsonResponse(
+            200,
+            { ok: true, warning: canvasWarning ? { code: canvasWarning } : null, requestId },
+            requestId,
             corsHeaders
           );
         }
@@ -9653,8 +9881,7 @@ export default {
         params.push(limit, offset);
 
         const totalResult = await env.DB.prepare(
-          `SELECT COUNT(1) as total FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.deleted_at IS NULL AND f.deleted_at IS NULL${
-            formSlug ? " AND f.slug=?" : ""
+          `SELECT COUNT(1) as total FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.deleted_at IS NULL AND f.deleted_at IS NULL${formSlug ? " AND f.slug=?" : ""
           }`
         )
           .bind(...(formSlug ? [formSlug] : []))
@@ -9733,9 +9960,9 @@ export default {
           const fieldsParam = url.searchParams.get("fields");
           const requestedFields = fieldsParam
             ? fieldsParam
-                .split(",")
-                .map((item) => item.trim())
-                .filter((item) => item.length > 0)
+              .split(",")
+              .map((item) => item.trim())
+              .filter((item) => item.length > 0)
             : [];
           if (fieldsParam && requestedFields.length === 0) {
             return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
@@ -9916,9 +10143,9 @@ export default {
         const fieldsParam = url.searchParams.get("fields");
         const requestedFields = fieldsParam
           ? fieldsParam
-              .split(",")
-              .map((item) => item.trim())
-              .filter((item) => item.length > 0)
+            .split(",")
+            .map((item) => item.trim())
+            .filter((item) => item.length > 0)
           : [];
         if (fieldsParam && requestedFields.length === 0) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
@@ -10006,14 +10233,14 @@ export default {
           rows.forEach((row) => {
             const metaValues = includeMetaEffective
               ? [
-                  row.submission_id,
-                  row.created_at,
-                  row.updated_at ?? "",
-                  row.user_id ?? "",
-                  row.provider ?? "",
-                  row.email ?? "",
-                  row.github_username ?? ""
-                ]
+                row.submission_id,
+                row.created_at,
+                row.updated_at ?? "",
+                row.user_id ?? "",
+                row.provider ?? "",
+                row.email ?? "",
+                row.github_username ?? ""
+              ]
               : [];
             const dataValues =
               mode === "json"
@@ -10073,14 +10300,14 @@ export default {
         rows.forEach((row) => {
           const metaValues = includeMetaEffective
             ? [
-                row.submission_id,
-                row.created_at,
-                row.updated_at ?? "",
-                row.user_id ?? "",
-                row.provider ?? "",
-                row.email ?? "",
-                row.github_username ?? ""
-              ]
+              row.submission_id,
+              row.created_at,
+              row.updated_at ?? "",
+              row.user_id ?? "",
+              row.provider ?? "",
+              row.email ?? "",
+              row.github_username ?? ""
+            ]
             : [];
           const dataValues = dataKeys.map((key) => stringifyCsvValue(row.data?.[key]));
           const values = [...metaValues, ...dataValues].map((value) =>
@@ -10373,7 +10600,7 @@ export default {
         is_locked: toBoolean(row.is_locked),
         is_public: toBoolean(row.is_public),
         auth_policy: row.auth_policy,
-        canvas_enabled: toBoolean(row.canvas_enabled),
+        canvas_enabled: toBoolean(row.canvas_enabled ?? 0),
         canvas_course_id: row.canvas_course_id ?? null,
         available_from: row.available_from ?? null,
         available_until: row.available_until ?? null,
@@ -10407,7 +10634,7 @@ export default {
 
         const detail = await buildFormDetailPayload(env, row);
         if ("error" in detail) {
-          return errorResponse(500, detail.error, requestId, corsHeaders);
+          return errorResponse(500, detail.error ?? "unknown_error", requestId, corsHeaders);
         }
         return jsonResponse(200, { data: detail.data, requestId }, requestId, corsHeaders);
       }
@@ -10434,11 +10661,11 @@ export default {
             message: accessCheck.message
           });
         }
-        const detail = await buildFormDetailPayload(env, row);
-        if ("error" in detail) {
-          return errorResponse(500, detail.error, requestId, corsHeaders);
+        const updateDetail = await buildFormDetailPayload(env, row);
+        if ("error" in updateDetail) {
+          return errorResponse(500, updateDetail.error ?? "unknown_error", requestId, corsHeaders);
         }
-        return jsonResponse(200, { data: detail.data, requestId }, requestId, corsHeaders);
+        return jsonResponse(200, { data: updateDetail.data, requestId }, requestId, corsHeaders);
       }
 
       if (url.pathname === "/api/submissions/upload/init") {
@@ -10449,6 +10676,7 @@ export default {
           contentType?: string;
           sizeBytes?: number;
           sha256?: string;
+          formPassword?: string;
         } | null = null;
         try {
           body = await parseJsonBody(request);
@@ -10474,12 +10702,13 @@ export default {
           });
         }
         const fileValue = formData.get("file");
-        if (!(fileValue instanceof File)) {
+        if (!fileValue || typeof fileValue !== 'object' || !('size' in fileValue) || !('type' in fileValue)) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             field: "file",
             message: "required"
           });
         }
+        const file = fileValue as File;
         const session = await env.DB.prepare(
           "SELECT id, form_slug, submission_id, user_id, original_name, content_type, size_bytes, sha256, r2_key, status FROM submission_upload_sessions WHERE id=?"
         )
@@ -10492,7 +10721,7 @@ export default {
         if (session.user_id && authPayload?.userId && session.user_id !== authPayload.userId) {
           return errorResponse(403, "forbidden", requestId, corsHeaders);
         }
-        if (session.size_bytes !== fileValue.size) {
+        if (session.size_bytes !== file.size) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             message: "size_mismatch"
           });
@@ -10509,7 +10738,7 @@ export default {
           return errorResponse(423, "form_locked", requestId, corsHeaders);
         }
 
-        const buffer = await fileValue.arrayBuffer();
+        const buffer = await file.arrayBuffer();
         const sha256 = await hashSha256(buffer);
         if (session.sha256 && session.sha256 !== sha256) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
@@ -10518,7 +10747,7 @@ export default {
         }
         await env.form_app_files.put(session.r2_key, buffer, {
           httpMetadata: {
-            contentType: fileValue.type || session.content_type || "application/octet-stream"
+            contentType: file.type || session.content_type || "application/octet-stream"
           }
         });
         await env.DB.prepare(
@@ -10731,7 +10960,7 @@ export default {
         );
       }
 
-      
+
 
       const uploadMatch = url.pathname.match(/^\/api\/forms\/([^/]+)\/upload$/);
       if (uploadMatch) {
@@ -10768,10 +10997,12 @@ export default {
             ? submissionIdValue.trim()
             : null;
 
-        const files: File[] = [];
-        for (const [key, value] of formData.entries()) {
-          if ((key === "files" || key === "files[]") && value instanceof File) {
-            files.push(value);
+        const files: Array<{ fieldKey: string; file: File }> = [];
+        for (const entry of formData.entries()) {
+          const key = entry[0];
+          const value = entry[1];
+          if ((key === "files" || key === "files[]") && (value as any) instanceof File) {
+            files.push({ fieldKey: "unknown", file: value as any });
           }
         }
 
@@ -10780,7 +11011,15 @@ export default {
             message: "fieldId and files are required"
           });
         }
-        const passwordCheck = await verifyFormPassword(formRow, formPassword, "submit");
+        const passwordCheck = await verifyFormPassword(
+          {
+            ...formRow,
+            password_require_access: formRow.password_require_access as number | null,
+            password_require_submit: formRow.password_require_submit as number | null
+          },
+          formPassword,
+          "submit"
+        );
         if (!passwordCheck.ok) {
           return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
             field: "formPassword",
@@ -10809,7 +11048,8 @@ export default {
         const rules = parseFieldRules(rulesSource);
         const rule = getFieldRule(rules, fieldId);
 
-        for (const file of files) {
+        for (const fileItem of files) {
+          const file = fileItem.file;
           if (rule.maxBytes && file.size > rule.maxBytes) {
             return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
               message: "file_too_large",
@@ -10902,7 +11142,8 @@ export default {
         }
 
         const uploaded: Array<{ id: string; original_name: string; size_bytes: number; vt_status: string }> = [];
-        for (const file of files) {
+        for (const fileItem of files) {
+          const file = fileItem.file;
           const buffer = await file.arrayBuffer();
           const sha256 = await hashSha256(buffer);
           const safeName = sanitizeFilename(file.name);
@@ -11177,7 +11418,7 @@ export default {
                 contentType,
                 new Uint8Array(buffer)
               );
-              if (uploaded.id) {
+              if (uploaded && uploaded.id) {
                 await env.DB.prepare(
                   "UPDATE submission_file_items SET final_drive_file_id=?, finalized_at=datetime('now'), drive_web_view_link=? WHERE id=?"
                 )
@@ -11338,12 +11579,14 @@ export default {
             contentType,
             new Uint8Array(buffer)
           );
-          if (uploaded.id) {
+          if (uploaded && uploaded.id) {
             await env.DB.prepare(
               "UPDATE submission_file_items SET final_drive_file_id=?, finalized_at=datetime('now'), drive_web_view_link=? WHERE id=?"
             )
               .bind(uploaded.id, uploaded.webViewLink ?? null, item.id)
               .run();
+          }
+          if (uploaded && uploaded.id) {
             finalized.push({ id: item.id, status: "finalized", driveFileId: uploaded.id });
           } else {
             finalized.push({ id: item.id, status: "drive_error" });
@@ -12239,7 +12482,15 @@ export default {
         if (!authCheck.ok) {
           return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
         }
-        const passwordCheck = await verifyFormPassword(form, body?.formPassword, "submit");
+        const passwordCheck = await verifyFormPassword(
+          {
+            ...form,
+            password_require_access: form.password_require_access as number | null,
+            password_require_submit: form.password_require_submit as number | null
+          },
+          (body as any)?.formPassword,
+          "submit"
+        );
         if (!passwordCheck.ok) {
           return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
             field: "formPassword",
@@ -12411,16 +12662,16 @@ export default {
     if (request.method === "POST" && url.pathname === "/api/uploads/init") {
       let body:
         | {
-            formSlug?: string;
-            files?: UploadInitFile[];
-            uploadSessionId?: string;
-            fieldKey?: string;
-            filename?: string;
-            contentType?: string;
-            sizeBytes?: number;
-            sha256?: string;
-            formPassword?: string;
-          }
+          formSlug?: string;
+          files?: UploadInitFile[];
+          uploadSessionId?: string;
+          fieldKey?: string;
+          filename?: string;
+          contentType?: string;
+          sizeBytes?: number;
+          sha256?: string;
+          formPassword?: string;
+        }
         | null = null;
       try {
         body = await parseJsonBody(request);
@@ -12462,7 +12713,15 @@ export default {
       if (!authCheck.ok) {
         return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
       }
-      const passwordCheck = await verifyFormPassword(formRow, body.formPassword, "submit");
+      const passwordCheck = await verifyFormPassword(
+        {
+          ...formRow,
+          password_require_access: formRow.password_require_access as number | null,
+          password_require_submit: formRow.password_require_submit as number | null
+        },
+        body.formPassword,
+        "submit"
+      );
       if (!passwordCheck.ok) {
         return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
           field: "formPassword",
@@ -12634,11 +12893,11 @@ export default {
     if (request.method === "POST" && url.pathname === "/api/uploads/complete") {
       let body:
         | {
-            formSlug?: string;
-            submissionId?: string;
-            uploadSessionId?: string;
-            files?: UploadCompleteFile[];
-          }
+          formSlug?: string;
+          submissionId?: string;
+          uploadSessionId?: string;
+          files?: UploadCompleteFile[];
+        }
         | null = null;
       try {
         body = await parseJsonBody(request);
@@ -12738,7 +12997,7 @@ export default {
             fieldKey: file.fieldKey
           });
         }
-        const rule = getFieldRule(fieldRules, file.fieldKey);
+        const rule = getFieldRule(fileRules as any, file.fieldKey);
         if (rule.maxBytes && file.size > rule.maxBytes) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             message: "file_too_large",
@@ -12972,7 +13231,15 @@ export default {
       if (!authCheck.ok) {
         return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
       }
-      const passwordCheck = await verifyFormPassword(form, parsed?.formPassword, "submit");
+      const passwordCheck = await verifyFormPassword(
+        {
+          ...form,
+          password_require_access: form.password_require_access as number | null,
+          password_require_submit: form.password_require_submit as number | null
+        },
+        (parsed as any)?.formPassword,
+        "submit"
+      );
       if (!passwordCheck.ok) {
         return errorResponse(403, "invalid_payload", requestId, corsHeaders, {
           field: "formPassword",
@@ -13098,7 +13365,7 @@ export default {
         }
       }
 
-      const canvasEnabled = toBoolean(form.canvas_enabled) && Boolean(form.canvas_course_id);
+      const canvasEnabled = toBoolean(form.canvas_enabled ?? 0) && Boolean(form.canvas_course_id);
       let canvasAllowedSectionIds: string[] | null = null;
       if (form.canvas_allowed_section_ids_json) {
         try {
@@ -13146,24 +13413,26 @@ export default {
             message: "canvas_missing_fields"
           });
         }
-        const nameValue =
-          typeof dataObj[nameField.id] === "string" ? dataObj[nameField.id].trim() : "";
-        const emailValue =
-          typeof dataObj[emailField.id] === "string" ? dataObj[emailField.id].trim() : "";
-        if (!nameValue) {
+        const nameVal = nameField
+          ? typeof (dataObj as any)[nameField.id] === "string" ? (dataObj as any)[nameField.id].trim() : ""
+          : "";
+        const emailVal = emailField
+          ? typeof (dataObj as any)[emailField.id] === "string" ? (dataObj as any)[emailField.id].trim() : ""
+          : "";
+        if (!nameVal) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             field: nameField.id,
             message: "required"
           });
         }
-        if (!emailValue) {
+        if (!emailVal) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             field: emailField.id,
             message: "required"
           });
         }
-        canvasName = nameValue;
-        canvasEmail = emailValue;
+        canvasName = nameVal;
+        canvasEmail = emailVal;
       }
 
       const userId = await resolveUserId(env, authPayload);
@@ -13179,7 +13448,7 @@ export default {
 
       const files = parsed.files || [];
       const uploads = parsed.uploads || [];
-      const fileRefs = Array.isArray(parsed.fileRefs) ? parsed.fileRefs : [];
+      const fileRefs = Array.isArray((parsed as any).fileRefs) ? (parsed as any).fileRefs : [];
       if (files.length > 0 && uploads.length > 0) {
         return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
           message: "mixed_uploads_not_supported"
@@ -13479,7 +13748,6 @@ export default {
               suspicious: stats.suspicious,
               undetected: stats.undetected,
               timeout: stats.timeout,
-              reportUrl: `https://www.virustotal.com/gui/file/${sha256}`,
               error: vtError
             });
 
@@ -13628,13 +13896,13 @@ export default {
             const courseLabel = courseTitle
               ? `${courseTitle}${courseCode ? ` (${courseCode})` : ""}`
               : form.canvas_course_id
-              ? `Course ${form.canvas_course_id}`
-              : null;
+                ? `Course ${form.canvas_course_id}`
+                : null;
             const sectionLabel = sectionName
               ? sectionName
               : canvasSectionId
-              ? `Section ${canvasSectionId}`
-              : null;
+                ? `Section ${canvasSectionId}`
+                : null;
             const baseWeb = env.BASE_URL_WEB ? String(env.BASE_URL_WEB).replace(/\/$/, "") : "";
             const formLink = baseWeb ? `${baseWeb}/#/f/${form.slug}` : null;
             const submittedName =
@@ -13755,8 +14023,8 @@ export default {
     }
 
     return errorResponse(404, "not_found", requestId, corsHeaders);
-  }
-  ,
+  },
+
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(
       (async () => {

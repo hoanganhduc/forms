@@ -15,3 +15,5 @@ apps/web/.env.local
 .DS_Store
 Thumbs.db
 coverage/
+AGENTS.md
+CONTINUITY.md
