@@ -9892,6 +9892,7 @@ function BuilderPage({
   const [formCreateTitle, setFormCreateTitle] = useState("");
   const [formCreateDescription, setFormCreateDescription] = useState("");
   const [formCreateTemplateKey, setFormCreateTemplateKey] = useState("");
+  const [formCreateSchema, setFormCreateSchema] = useState('{"fields": []}');
   const [formCreateAuthPolicy, setFormCreateAuthPolicy] = useState("optional");
   const [formCreatePublic, setFormCreatePublic] = useState(true);
   const [formCreateLocked, setFormCreateLocked] = useState(false);
@@ -10678,6 +10679,36 @@ function BuilderPage({
     await loadBuilder();
   }
 
+  async function handleRefreshFormFromTemplate() {
+    setFormBuilderStatus(null);
+    if (!formBuilderSlug) {
+      setFormBuilderStatus("Select a form to update.");
+      return;
+    }
+    const selected = safeForms.find((form) => form.slug === formBuilderSlug);
+    const templateKey = selected?.templateKey;
+    if (!templateKey) {
+      setFormBuilderStatus("This form has no template to refresh from.");
+      return;
+    }
+    if (!window.confirm("Refresh form schema from the latest template? This will overwrite form schema.")) {
+      return;
+    }
+    const response = await apiFetch(`${API_BASE}/api/admin/forms/${encodeURIComponent(formBuilderSlug)}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ templateKey })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setFormBuilderStatus(payload?.error || "Failed to refresh form from template.");
+      return;
+    }
+    await loadBuilder();
+    await handleLoadFormSchema(formBuilderSlug);
+    setFormBuilderStatus("Form refreshed from template.");
+  }
+
   function generatePassword(length: number = 12) {
     const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%";
     const array = new Uint32Array(length);
@@ -11089,9 +11120,23 @@ function BuilderPage({
 
   async function handleCreateForm() {
     setFormCreateStatus(null);
-    if (!formCreateSlug || !formCreateTitle || !formCreateTemplateKey) {
-      setFormCreateStatus("Slug, title, and template are required.");
+    if (!formCreateSlug || !formCreateTitle) {
+      setFormCreateStatus("Slug and title are required.");
       return;
+    }
+    const hasTemplate = Boolean(formCreateTemplateKey);
+    const schemaSource = formCreateSchema.trim() ? formCreateSchema : '{"fields": []}';
+    if (!hasTemplate) {
+      const parsed = parseSchemaText(schemaSource);
+      if ((parsed as any).error) {
+        setFormCreateStatus((parsed as any).error);
+        return;
+      }
+      const rulesError = validateFileRulesInSchema(parsed.schema);
+      if (rulesError) {
+        setFormCreateStatus(rulesError);
+        return;
+      }
     }
     if (formCreateCanvasEnabled && !formCreateCanvasCourseId) {
       setFormCreateStatus("Select a Canvas course or disable Canvas enrollment.");
@@ -11126,7 +11171,8 @@ function BuilderPage({
       body: JSON.stringify({
         slug: formCreateSlug,
         title: formCreateTitle,
-        templateKey: formCreateTemplateKey,
+        templateKey: hasTemplate ? formCreateTemplateKey : undefined,
+        schema_json: !hasTemplate ? schemaSource : undefined,
         description: formCreateDescription || null,
         is_public: formCreatePublic,
         is_locked: formCreateLocked,
@@ -11165,6 +11211,7 @@ function BuilderPage({
     setFormCreateTitle("");
     setFormCreateDescription("");
     setFormCreateLocked(false);
+    setFormCreateSchema('{"fields": []}');
     setFormCreateAvailableFrom("");
     setFormCreateAvailableUntil("");
     setFormCreateAvailabilityTimezone(getAppDefaultTimezone());
@@ -11364,6 +11411,7 @@ function BuilderPage({
   const safeTemplates = Array.isArray(templates)
     ? templates.filter((tpl) => tpl && typeof tpl === "object")
     : [];
+  const selectedBuilderForm = safeForms.find((form) => form.slug === formBuilderSlug);
   const parsedTemplateSchema = parseSchemaText(templateEditorSchema);
   const schemaFields = Array.isArray(parsedTemplateSchema.fields)
     ? (parsedTemplateSchema.fields as Array<Record<string, unknown>>)
@@ -11465,7 +11513,7 @@ function BuilderPage({
                   ) : null}
                 </div>
                 <div className="col-md-4">
-                  <label className="form-label">Template</label>
+                  <label className="form-label">Template (optional)</label>
                   <select
                     className="form-select"
                     value={formCreateTemplateKey}
@@ -11480,7 +11528,26 @@ function BuilderPage({
                         </option>
                       ))}
                   </select>
+                  {!formCreateTemplateKey ? (
+                    <div className="muted mt-2">
+                      No template selected. Provide schema JSON to create from scratch.
+                    </div>
+                  ) : null}
                 </div>
+                {!formCreateTemplateKey ? (
+                  <div className="col-md-8">
+                    <label className="form-label">Schema JSON</label>
+                    <textarea
+                      className="form-control"
+                      rows={4}
+                      value={formCreateSchema}
+                      onChange={(event) => setFormCreateSchema(event.target.value)}
+                    />
+                    <div className="muted mt-1">
+                      Leave empty fields array to start with a blank form.
+                    </div>
+                  </div>
+                ) : null}
                 <div className="col-md-6">
                   <label className="form-label">Description</label>
                   <input
@@ -12328,6 +12395,14 @@ function BuilderPage({
                     disabled={!formBuilderSlug}
                   >
                     <i className="bi bi-link-45deg" aria-hidden="true" /> Copy form link
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-primary"
+                    onClick={handleRefreshFormFromTemplate}
+                    disabled={!formBuilderSlug || !selectedBuilderForm?.templateKey}
+                  >
+                    <i className="bi bi-arrow-repeat" aria-hidden="true" /> Refresh from template
                   </button>
                   <button
                     type="button"

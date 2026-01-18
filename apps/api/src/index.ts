@@ -9063,6 +9063,7 @@ export default {
           slug?: string;
           title?: string;
           templateKey?: string;
+          schema_json?: string | null;
           description?: string | null;
           is_public?: boolean;
           auth_policy?: string;
@@ -9092,14 +9093,21 @@ export default {
           typeof body.slug !== "string" ||
           body.slug.trim() === "" ||
           typeof body.title !== "string" ||
-          body.title.trim() === "" ||
-          typeof body.templateKey !== "string" ||
-          body.templateKey.trim() === ""
+          body.title.trim() === ""
         ) {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-            missing: ["slug", "title", "templateKey"].filter(
+            missing: ["slug", "title"].filter(
               (key) => !body || typeof (body as Record<string, unknown>)[key] !== "string"
             )
+          });
+        }
+        const hasTemplateKey =
+          typeof body.templateKey === "string" && body.templateKey.trim().length > 0;
+        const hasSchemaJson =
+          typeof body.schema_json === "string" && body.schema_json.trim().length > 0;
+        if (!hasTemplateKey && !hasSchemaJson) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            missing: ["templateKey", "schema_json"]
           });
         }
 
@@ -9180,38 +9188,62 @@ export default {
           });
         }
 
-        const template = await env.DB.prepare(
-          "SELECT id, key, schema_json FROM templates WHERE key=? AND deleted_at IS NULL"
-        )
-          .bind(body.templateKey)
-          .first<TemplateRow>();
+        let template: TemplateRow | null = null;
+        let schemaJsonSource = "";
+        if (hasTemplateKey) {
+          template = await env.DB.prepare(
+            "SELECT id, key, schema_json FROM templates WHERE key=? AND deleted_at IS NULL"
+          )
+            .bind(body.templateKey)
+            .first<TemplateRow>();
 
-        if (!template) {
-          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-            field: "templateKey",
-            message: "template_not_found"
-          });
+          if (!template) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "templateKey",
+              message: "template_not_found"
+            });
+          }
+
+          let parsedTemplateSchema: unknown = null;
+          try {
+            parsedTemplateSchema = JSON.parse(template.schema_json);
+          } catch (error) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "templateKey",
+              message: "invalid_template_schema"
+            });
+          }
+          const templateRuleError = validateFileRulesFromSchema(parsedTemplateSchema);
+          if (templateRuleError) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "templateKey",
+              message: "invalid_file_rules",
+              detail: templateRuleError
+            });
+          }
+          schemaJsonSource = template.schema_json;
+        } else {
+          let parsedSchema: unknown = null;
+          try {
+            parsedSchema = JSON.parse(body.schema_json as string);
+          } catch (error) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "schema_json",
+              message: "invalid_json"
+            });
+          }
+          const schemaRuleError = validateFileRulesFromSchema(parsedSchema);
+          if (schemaRuleError) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "schema_json",
+              message: "invalid_file_rules",
+              detail: schemaRuleError
+            });
+          }
+          schemaJsonSource = JSON.stringify(parsedSchema);
         }
 
-        let parsedTemplateSchema: unknown = null;
-        try {
-          parsedTemplateSchema = JSON.parse(template.schema_json);
-        } catch (error) {
-          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-            field: "templateKey",
-            message: "invalid_template_schema"
-          });
-        }
-        const templateRuleError = validateFileRulesFromSchema(parsedTemplateSchema);
-        if (templateRuleError) {
-          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-            field: "templateKey",
-            message: "invalid_file_rules",
-            detail: templateRuleError
-          });
-        }
-
-        const needsDrive = hasFileFields(template.schema_json);
+        const needsDrive = hasFileFields(schemaJsonSource);
         if (needsDrive && (!env.DRIVE_PARENT_FOLDER_ID || !getDriveCredentials(env))) {
           return errorResponse(500, "drive_not_configured", requestId, corsHeaders);
         }
@@ -9243,7 +9275,7 @@ export default {
           }
         }
         const description = body.description ?? null;
-        const mirroredRules = buildFileRulesJsonFromSchema(template.schema_json);
+        const mirroredRules = buildFileRulesJsonFromSchema(schemaJsonSource);
         const availableFrom = normalizeDateTimeInput(body.availableFrom ?? null);
         const availableUntil = normalizeDateTimeInput(body.availableUntil ?? null);
         if (availableFrom && availableUntil) {
@@ -9314,7 +9346,7 @@ export default {
           { name: "slug", value: body.slug.trim() },
           { name: "title", value: body.title.trim() },
           { name: "description", value: description },
-          { name: "template_id", value: template.id },
+          { name: "template_id", value: template?.id ?? null },
           { name: "is_public", value: isPublic },
           { name: "auth_policy", value: authPolicy },
           { name: "created_by", value: authPayload?.userId ?? null }
@@ -9357,7 +9389,7 @@ export default {
               env.DB.prepare(formInsertSql).bind(...formInsertValues),
               env.DB.prepare(
                 "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
-              ).bind(versionId, formId, template.schema_json)
+              ).bind(versionId, formId, schemaJsonSource)
             ];
 
             await env.DB.batch(statements);
@@ -9412,7 +9444,7 @@ export default {
               description,
               is_public: isPublic === 1,
               auth_policy: authPolicy,
-              templateKey: template.key,
+              templateKey: template?.key ?? null,
               driveFolderId,
               canvas_enabled: canvasEnabled,
               canvas_course_id: canvasCourseId,
