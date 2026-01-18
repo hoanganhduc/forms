@@ -2921,20 +2921,6 @@ function FormPage({
       </>
     );
   };
-  const renderPlaceholderHelp = (field: FormField) => {
-    const placeholder =
-      typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
-        ? String((field as any).placeholder)
-        : "";
-    if (!placeholder || (!markdownEnabled && !mathjaxEnabled)) {
-      return null;
-    }
-    return (
-      <span className="field-help">
-        <RichText text={placeholder} markdownEnabled={markdownEnabled} mathjaxEnabled={mathjaxEnabled} />
-      </span>
-    );
-  };
   const fieldNodes = (form?.fields || []).map((field) => {
     if (field.type === "file") {
       const rules = getFieldRule(fileRules, field.id);
@@ -3121,6 +3107,7 @@ function FormPage({
         typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
           ? String((field as any).placeholder)
           : field.label;
+      const activePlaceholder = inputValue ? "" : placeholder;
       const domain = field.type === "email" ? getEmailDomain(field) : "";
       return (
         <label key={field.id} className="field">
@@ -3130,7 +3117,7 @@ function FormPage({
             className="form-control"
             value={inputValue}
             disabled={locked || !canSubmit || isAutofilled}
-            placeholder={placeholder}
+            placeholder={activePlaceholder}
             onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
             onBlur={(event) => {
               updateFieldError(field, event.target.value);
@@ -3139,7 +3126,6 @@ function FormPage({
               }
             }}
           />
-          {renderPlaceholderHelp(field)}
           {field.type === "email" && domain ? (
             <span className="field-help">Email must end with @{domain}.</span>
           ) : null}
@@ -3158,6 +3144,7 @@ function FormPage({
         typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
           ? String((field as any).placeholder)
           : field.label;
+      const activePlaceholder = inputValue ? "" : placeholder;
       return (
         <label key={field.id} className="field">
           {renderFieldLabel(field)}
@@ -3166,10 +3153,9 @@ function FormPage({
             className="form-control"
             value={inputValue}
             disabled={locked || !canSubmit || isAutofilled}
-            placeholder={placeholder}
+            placeholder={activePlaceholder}
             onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
           />
-          {renderPlaceholderHelp(field)}
         </label>
       );
     }
@@ -3184,6 +3170,9 @@ function FormPage({
           ? String((field as any).placeholder)
           : field.label;
       const value = values[field.id] || "";
+      const activePlaceholder = value ? "" : placeholder;
+      const placeholderLines = placeholder ? placeholder.split(/\r?\n/).length : 0;
+      const textareaRows = Math.max(3, placeholderLines || 3);
       return (
         <label key={field.id} className="field">
           {renderFieldLabel(field)}
@@ -3191,10 +3180,10 @@ function FormPage({
             className="form-control"
             value={value}
             disabled={locked || !canSubmit}
-            placeholder={placeholder}
+            placeholder={activePlaceholder}
+            rows={textareaRows}
             onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
           />
-          {renderPlaceholderHelp(field)}
           {showRichNotice ? (
             <span className="field-help">
               {markdownActive
@@ -3220,6 +3209,7 @@ function FormPage({
         typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
           ? String((field as any).placeholder)
           : field.label;
+      const activePlaceholder = values[field.id] ? "" : placeholder;
       return (
         <label key={field.id} className="field">
           {renderFieldLabel(field)}
@@ -3228,7 +3218,7 @@ function FormPage({
             className="form-control"
             value={values[field.id] || ""}
             disabled={locked || !canSubmit}
-            placeholder={placeholder}
+            placeholder={activePlaceholder}
             onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
             onBlur={(event) => {
               const next = ensureUrlWithScheme(event.target.value);
@@ -3238,7 +3228,6 @@ function FormPage({
               updateFieldError(field, next.value);
             }}
           />
-          {renderPlaceholderHelp(field)}
           {fieldErrors[field.id] ? (
             <span className="field-error">{fieldErrors[field.id]}</span>
           ) : null}
@@ -3260,6 +3249,7 @@ function FormPage({
         typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
           ? String((field as any).placeholder)
           : field.label;
+      const activePlaceholder = values[field.id] ? "" : placeholder;
       return (
         <label key={field.id} className="field">
           {renderFieldLabel(field)}
@@ -3268,7 +3258,7 @@ function FormPage({
             className="form-control"
             value={values[field.id] || ""}
             disabled={locked || !canSubmit}
-            placeholder={placeholder}
+            placeholder={activePlaceholder}
             onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
             onBlur={(event) => updateFieldError(field, event.target.value)}
           />
@@ -3292,6 +3282,7 @@ function FormPage({
         typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
           ? String((field as any).placeholder)
           : field.label;
+      const activePlaceholder = values[field.id] ? "" : placeholder;
       return (
         <label key={field.id} className="field">
           {renderFieldLabel(field)}
@@ -3300,10 +3291,9 @@ function FormPage({
             className="form-control"
             value={values[field.id] || ""}
             disabled={locked || !canSubmit}
-            placeholder={placeholder}
+            placeholder={activePlaceholder}
             onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
           />
-          {renderPlaceholderHelp(field)}
         </label>
       );
     }
@@ -3375,6 +3365,7 @@ function FormPage({
       typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
         ? String((field as any).placeholder)
         : field.label;
+    const activePlaceholder = values[field.id] ? "" : placeholder;
     return (
       <label key={field.id} className="field">
         {renderFieldLabel(field)}
@@ -3383,10 +3374,9 @@ function FormPage({
           className="form-control"
           value={values[field.id] || ""}
           disabled={locked || !canSubmit}
-          placeholder={placeholder}
+          placeholder={activePlaceholder}
           onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
         />
-        {renderPlaceholderHelp(field)}
       </label>
     );
   });
