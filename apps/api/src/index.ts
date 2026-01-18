@@ -9267,9 +9267,17 @@ export default {
               message: "slug_exists"
             });
           }
-          // Form exists but is in trash. Hard delete it using helper to clear dependencies.
-          // Use the ACTUAL slug from the database to ensure we delete the correct row if case differs.
-          await hardDeleteForm(env, existingSlugForm.slug);
+          // Form exists but is in trash. Hard delete it manually to ensure it is gone.
+          // We bypass hardDeleteForm helper to avoid potential issues with argument mismatches or logic failures.
+          const oldFormId = existingSlugForm.id;
+          await env.DB.batch([
+            env.DB.prepare("DELETE FROM email_logs WHERE form_id=?").bind(oldFormId),
+            env.DB.prepare("DELETE FROM submission_file_items WHERE submission_id IN (SELECT id FROM submissions WHERE form_id=?)").bind(oldFormId),
+            env.DB.prepare("DELETE FROM submission_uploads WHERE form_id=?").bind(oldFormId),
+            env.DB.prepare("DELETE FROM submissions WHERE form_id=?").bind(oldFormId),
+            env.DB.prepare("DELETE FROM form_versions WHERE form_id=?").bind(oldFormId),
+            env.DB.prepare("DELETE FROM forms WHERE id=?").bind(oldFormId)
+          ]);
         }
 
         const statements = [
