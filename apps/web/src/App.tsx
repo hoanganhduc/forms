@@ -1319,8 +1319,9 @@ function FieldBuilderPanel({
         {["text", "full_name", "email", "github_username", "url", "number", "textarea", "custom"].includes(builderType) ? (
           <div className="col-md-6">
             <label className="form-label">Placeholder</label>
-            <input
+            <textarea
               className="form-control"
+              rows={2}
               value={builderPlaceholder}
               onChange={(event) => onPlaceholderChange(event.target.value)}
             />
