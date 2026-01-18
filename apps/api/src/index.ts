@@ -9255,6 +9255,23 @@ export default {
           canvasAllowedSectionIds && canvasAllowedSectionIds.length > 0
             ? JSON.stringify(canvasAllowedSectionIds)
             : null;
+        const existingSlugForm = await env.DB.prepare(
+          "SELECT id, deleted_at FROM forms WHERE slug=?"
+        )
+          .bind(body.slug.trim())
+          .first<{ id: string; deleted_at: string | null }>();
+
+        if (existingSlugForm) {
+          if (existingSlugForm.deleted_at === null) {
+            return errorResponse(409, "conflict", requestId, corsHeaders, {
+              message: "slug_exists"
+            });
+          }
+          // Form exists but is in trash. Hard delete it (and let cascade handle relations if configured, or orphan them).
+          // We prioritize allowing the user to "Create" the form over preserving trash state for a name collision.
+          await env.DB.prepare("DELETE FROM forms WHERE id=?").bind(existingSlugForm.id).run();
+        }
+
         const statements = [
           env.DB.prepare(
             "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, created_by, reminder_enabled, reminder_frequency, reminder_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
