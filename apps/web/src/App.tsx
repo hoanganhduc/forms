@@ -3152,7 +3152,6 @@ function FormPage({
             disabled={locked || !canSubmit}
             onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
           >
-            <option value="">{field.label}</option>
             {options.map((option: string) => (
               <option key={option} value={option}>
                 {option}
