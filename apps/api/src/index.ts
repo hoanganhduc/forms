@@ -1534,15 +1534,29 @@ async function processCanvasRetryQueue(env: Env, limit = 10) {
 
 async function runPeriodicReminders(env: Env) {
   const { results: forms } = await env.DB.prepare(
-    "SELECT id, slug, title, reminder_frequency, reminder_until FROM forms WHERE reminder_enabled=1 AND deleted_at IS NULL"
-  ).all<{ id: string; slug: string; title: string; reminder_frequency: string; reminder_until: string | null }>();
+    "SELECT id, slug, title, reminder_frequency, reminder_until, available_from, available_until FROM forms WHERE reminder_enabled=1 AND deleted_at IS NULL"
+  ).all<{ id: string; slug: string; title: string; reminder_frequency: string; reminder_until: string | null; available_from: string | null; available_until: string | null }>();
 
   if (!forms || forms.length === 0) return;
 
+  const now = new Date();
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
   for (const form of forms) {
+    // Skip if form is not yet open (available_from is in the future)
+    if (form.available_from) {
+      const openDate = new Date(form.available_from);
+      if (now < openDate) continue;
+    }
+
+    // Skip if form is already closed (available_until is in the past)
+    if (form.available_until) {
+      const closeDate = new Date(form.available_until);
+      if (now > closeDate) continue;
+    }
+
+    // Skip if reminder_until has passed
     if (form.reminder_until) {
       const untilDate = new Date(form.reminder_until);
       untilDate.setHours(23, 59, 59, 999);
