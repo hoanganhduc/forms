@@ -4,7 +4,7 @@ Monorepo for a Cloudflare Worker API (apps/api) and a Vite + React web app (apps
 The app supports public forms, OAuth (Google/GitHub), user submissions, file uploads
 with VirusTotal scanning, and optional Google Drive finalization.
 
-This codebase was developed with the assistance of GitHub Copilot and ChatGPT Codex.
+This codebase was developed with the assistance of GitHub Copilot, ChatGPT Codex, and Google Antigravity.
 
 ## Prereqs
 - Node.js (npm)

@@ -2386,7 +2386,7 @@ function FormPage({
         const submissionData = payload.data.data_json ?? payload.data.data ?? null;
         if (submissionData && typeof submissionData === "object") {
           const nextValues: Record<string, string> = { ...(submissionData as Record<string, string>) };
-          form?.fields || []
+          (form?.fields || [])
             .filter((field) => field.type === "date")
             .forEach((field) => {
               const raw = (submissionData as Record<string, unknown>)[field.id];
@@ -3931,7 +3931,7 @@ function DocsPage() {
         This guide explains how Form App is structured and how to use the main features.
       </p>
       <p className="muted">
-        Note: This codebase was built with the assistance of GitHub Copilot and ChatGPT Codex.
+        Note: This codebase was built with the assistance of GitHub Copilot, ChatGPT Codex, and Google Antigravity.
       </p>
 
       <div className="panel panel--compact">
@@ -13198,7 +13198,7 @@ function AppShell() {
       <footer className="site-footer">
         <div>{APP_INFO.title}</div>
         <div>{APP_INFO.description}</div>
-        <div>Built with assistance from GitHub Copilot and ChatGPT Codex.</div>
+        <div>Built with assistance from GitHub Copilot, ChatGPT Codex, and Google Antigravity.</div>
         <div>
           (c) {new Date().getFullYear()} {APP_INFO.author}.{" "}
           License:{" "}
