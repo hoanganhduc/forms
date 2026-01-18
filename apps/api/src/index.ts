@@ -9255,8 +9255,11 @@ export default {
           canvasAllowedSectionIds && canvasAllowedSectionIds.length > 0
             ? JSON.stringify(canvasAllowedSectionIds)
             : null;
+        // Use a write operation (UPDATE) to check existence to bypass Read Replica lag (Eventual Consistency).
+        // If we just SELECT, we might miss a recently deleted or created form in Production.
+        // UPDATE ensures we hit the Primary DB.
         const existingSlugForm = await env.DB.prepare(
-          "SELECT id, slug, deleted_at FROM forms WHERE lower(slug)=lower(?)"
+          "UPDATE forms SET updated_at=updated_at WHERE lower(slug)=lower(?) RETURNING id, slug, deleted_at"
         )
           .bind(body.slug.trim())
           .first<{ id: string; slug: string; deleted_at: string | null }>();
