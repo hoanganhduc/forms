@@ -1073,14 +1073,11 @@ async function getFormWithRules(env: Env, slug: string) {
     "reminder_enabled",
     "reminder_frequency"
   ];
-  const columnSelects = [
-    ...baseColumns.map((column) => `f.${column}`),
-    ...(await Promise.all(
-      optionalColumns.map(async (column) =>
-        (await hasColumn(env, "forms", column)) ? `f.${column}` : `NULL as ${column}`
-      )
-    ))
-  ];
+  const columnSelects = baseColumns.map((column) => `f.${column}`);
+  for (const column of optionalColumns) {
+    const select = (await hasColumn(env, "forms", column)) ? `f.${column}` : `NULL as ${column}`;
+    columnSelects.push(select);
+  }
   const templateFileRulesSelect = (await hasColumn(env, "templates", "file_rules_json"))
     ? "t.file_rules_json as template_file_rules_json"
     : "NULL as template_file_rules_json";
@@ -9453,14 +9450,53 @@ export default {
           const updates: string[] = [];
           const params: Array<string | number | null> = [];
           let canvasWarning: string | null = null;
+          const missingColumns: string[] = [];
+          const optionalColumns = [
+            "available_from",
+            "available_until",
+            "password_required",
+            "password_require_access",
+            "password_require_submit",
+            "password_salt",
+            "password_hash",
+            "canvas_enabled",
+            "canvas_course_id",
+            "canvas_allowed_section_ids_json",
+            "canvas_fields_position",
+            "reminder_enabled",
+            "reminder_frequency",
+            "reminder_until",
+            "file_rules_json",
+            "template_id"
+          ];
+          const supportedColumns = new Map<string, boolean>();
+          for (const column of optionalColumns) {
+            supportedColumns.set(column, await hasColumn(env, "forms", column));
+          }
+          const formRowColumns = ["id", "slug"];
+          const formRowOptionalColumns = [
+            "password_required",
+            "password_require_access",
+            "password_require_submit",
+            "password_salt",
+            "password_hash",
+            "available_from",
+            "available_until",
+            "reminder_until",
+            "canvas_course_id"
+          ];
+          for (const column of formRowOptionalColumns) {
+            const select = (await hasColumn(env, "forms", column)) ? column : `NULL as ${column}`;
+            formRowColumns.push(select);
+          }
           const formRow = await env.DB.prepare(
-            "SELECT id, slug, password_required, password_require_access, password_require_submit, password_salt, password_hash, available_from, available_until, reminder_until FROM forms WHERE slug=? AND deleted_at IS NULL"
+            `SELECT ${formRowColumns.join(", ")} FROM forms WHERE slug=? AND deleted_at IS NULL`
           )
             .bind(slug)
             .first<{
               id: string;
               slug: string;
-              password_required: number;
+              password_required: number | null;
               password_require_access: number | null;
               password_require_submit: number | null;
               password_salt: string | null;
@@ -9468,6 +9504,7 @@ export default {
               available_from: string | null;
               available_until: string | null;
               reminder_until: string | null;
+              canvas_course_id: string | null;
             }>();
           if (!formRow) {
             return errorResponse(404, "not_found", requestId, corsHeaders);
@@ -9554,13 +9591,20 @@ export default {
               });
             }
           }
+          const pushOptionalUpdate = (column: string, value: string | number | null, requested: boolean) => {
+            if (!requested) return;
+            if (supportedColumns.get(column) !== true) {
+              missingColumns.push(column);
+              return;
+            }
+            updates.push(`${column}=?`);
+            params.push(value);
+          };
           if (body?.availableFrom !== undefined) {
-            updates.push("available_from=?");
-            params.push(nextAvailableFrom);
+            pushOptionalUpdate("available_from", nextAvailableFrom, true);
           }
           if (body?.availableUntil !== undefined) {
-            updates.push("available_until=?");
-            params.push(nextAvailableUntil);
+            pushOptionalUpdate("available_until", nextAvailableUntil, true);
           }
           if (body?.passwordRequired !== undefined && typeof body.passwordRequired !== "boolean") {
             return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
@@ -9609,10 +9653,8 @@ export default {
             if (raw) {
               const salt = crypto.randomUUID();
               const hash = await hashPasswordWithSalt(raw, salt);
-              updates.push("password_salt=?");
-              params.push(salt);
-              updates.push("password_hash=?");
-              params.push(hash);
+              pushOptionalUpdate("password_salt", salt, true);
+              pushOptionalUpdate("password_hash", hash, true);
               nextPasswordRequired = true;
               if (!nextRequireAccess && !nextRequireSubmit) {
                 nextRequireSubmit = true;
@@ -9620,17 +9662,12 @@ export default {
             }
           }
           if (roleFlagsProvided || body?.passwordRequired !== undefined || body?.formPassword !== undefined) {
-            updates.push("password_required=?");
-            params.push(nextPasswordRequired ? 1 : 0);
-            updates.push("password_require_access=?");
-            params.push(nextRequireAccess ? 1 : 0);
-            updates.push("password_require_submit=?");
-            params.push(nextRequireSubmit ? 1 : 0);
+            pushOptionalUpdate("password_required", nextPasswordRequired ? 1 : 0, true);
+            pushOptionalUpdate("password_require_access", nextRequireAccess ? 1 : 0, true);
+            pushOptionalUpdate("password_require_submit", nextRequireSubmit ? 1 : 0, true);
             if (!nextPasswordRequired) {
-              updates.push("password_salt=?");
-              params.push(null);
-              updates.push("password_hash=?");
-              params.push(null);
+              pushOptionalUpdate("password_salt", null, true);
+              pushOptionalUpdate("password_hash", null, true);
             }
           }
           if (body?.auth_policy) {
@@ -9657,7 +9694,7 @@ export default {
                 message: "required"
               });
             }
-            if (body.canvasEnabled && body.canvasCourseId === undefined) {
+            if (body.canvasEnabled && body.canvasCourseId === undefined && supportedColumns.get("canvas_course_id") === true) {
               const formRow = await env.DB.prepare(
                 "SELECT canvas_course_id FROM forms WHERE slug=? AND deleted_at IS NULL"
               )
@@ -9670,8 +9707,7 @@ export default {
                 });
               }
             }
-            updates.push("canvas_enabled=?");
-            params.push(body.canvasEnabled ? 1 : 0);
+            pushOptionalUpdate("canvas_enabled", body.canvasEnabled ? 1 : 0, true);
           }
           if (body?.canvasCourseId !== undefined) {
             if (body.canvasCourseId !== null && typeof body.canvasCourseId !== "string") {
@@ -9680,8 +9716,7 @@ export default {
                 message: "expected_string"
               });
             }
-            updates.push("canvas_course_id=?");
-            params.push(body.canvasCourseId ? body.canvasCourseId.trim() : null);
+            pushOptionalUpdate("canvas_course_id", body.canvasCourseId ? body.canvasCourseId.trim() : null, true);
           }
           if (body?.canvasAllowedSectionIds !== undefined) {
             if (!Array.isArray(body.canvasAllowedSectionIds)) {
@@ -9697,11 +9732,13 @@ export default {
             const courseId =
               body.canvasCourseId !== undefined
                 ? body.canvasCourseId?.trim() || null
-                : (await env.DB.prepare(
-                  "SELECT canvas_course_id FROM forms WHERE slug=? AND deleted_at IS NULL"
-                )
-                  .bind(slug)
-                  .first<{ canvas_course_id: string | null }>())?.canvas_course_id ?? null;
+                : supportedColumns.get("canvas_course_id") === true
+                  ? (await env.DB.prepare(
+                    "SELECT canvas_course_id FROM forms WHERE slug=? AND deleted_at IS NULL"
+                  )
+                    .bind(slug)
+                    .first<{ canvas_course_id: string | null }>())?.canvas_course_id ?? null
+                  : null;
             if (courseId && filtered.length > 0) {
               const { results } = await env.DB.prepare(
                 "SELECT id FROM canvas_sections_cache WHERE course_id=?"
@@ -9722,8 +9759,11 @@ export default {
                 canvasWarning = "canvas_sections_not_cached";
               }
             }
-            updates.push("canvas_allowed_section_ids_json=?");
-            params.push(filtered.length > 0 ? JSON.stringify(filtered) : null);
+            pushOptionalUpdate(
+              "canvas_allowed_section_ids_json",
+              filtered.length > 0 ? JSON.stringify(filtered) : null,
+              true
+            );
           }
           if (body?.canvasFieldsPosition !== undefined) {
             if (body.canvasFieldsPosition !== null && typeof body.canvasFieldsPosition !== "string") {
@@ -9742,8 +9782,7 @@ export default {
                 message: "invalid_value"
               });
             }
-            updates.push("canvas_fields_position=?");
-            params.push(value);
+            pushOptionalUpdate("canvas_fields_position", value, true);
           }
 
           if (body?.reminderEnabled !== undefined) {
@@ -9753,8 +9792,7 @@ export default {
                 message: "expected_boolean"
               });
             }
-            updates.push("reminder_enabled=?");
-            params.push(body.reminderEnabled ? 1 : 0);
+            pushOptionalUpdate("reminder_enabled", body.reminderEnabled ? 1 : 0, true);
           }
 
           if (body?.reminderFrequency !== undefined) {
@@ -9764,13 +9802,15 @@ export default {
                 message: "invalid_value"
               });
             }
-            updates.push("reminder_frequency=?");
-            params.push(body.reminderFrequency || "weekly");
+            pushOptionalUpdate("reminder_frequency", body.reminderFrequency || "weekly", true);
           }
 
           if (body?.reminderUntil !== undefined) {
-            updates.push("reminder_until=?");
-            params.push(normalizeDateTimeInput(body.reminderUntil ?? null));
+            pushOptionalUpdate(
+              "reminder_until",
+              normalizeDateTimeInput(body.reminderUntil ?? null),
+              true
+            );
           }
 
           let formId: string | null = null;
@@ -9803,8 +9843,7 @@ export default {
                 detail: templateRuleError
               });
             }
-            updates.push("template_id=?");
-            params.push(template.id);
+            pushOptionalUpdate("template_id", template.id, true);
             const formRow = await env.DB.prepare("SELECT id FROM forms WHERE slug=? AND deleted_at IS NULL")
               .bind(slug)
               .first<{ id: string }>();
@@ -9818,8 +9857,7 @@ export default {
               .bind(template.schema_json, formId)
               .run();
             const mirroredRules = buildFileRulesJsonFromSchema(template.schema_json);
-            updates.push("file_rules_json=?");
-            params.push(mirroredRules);
+            pushOptionalUpdate("file_rules_json", mirroredRules, true);
           }
 
           if (body?.schema_json && typeof body.schema_json === "string") {
@@ -9853,8 +9891,7 @@ export default {
               .bind(JSON.stringify(parsedSchema), formId)
               .run();
             const mirroredRules = buildFileRulesJsonFromSchema(body.schema_json);
-            updates.push("file_rules_json=?");
-            params.push(mirroredRules);
+            pushOptionalUpdate("file_rules_json", mirroredRules, true);
           }
           if (newSlug) {
             updates.push("slug=?");
@@ -9942,9 +9979,16 @@ export default {
             }
           }
 
+          const uniqueMissingColumns = Array.from(new Set(missingColumns));
+          const warnings = [
+            ...(canvasWarning ? [{ code: canvasWarning }] : []),
+            ...(uniqueMissingColumns.length > 0
+              ? [{ code: "missing_columns", columns: uniqueMissingColumns }]
+              : [])
+          ];
           return jsonResponse(
             200,
-            { ok: true, warning: canvasWarning ? { code: canvasWarning } : null, requestId },
+            { ok: true, warning: warnings.length > 0 ? warnings : null, requestId },
             requestId,
             corsHeaders
           );
