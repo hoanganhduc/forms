@@ -11127,8 +11127,19 @@ function BuilderPage({
       setFormBuilderSlug(nextSlug);
       setFormBuilderSlugEdit(nextSlug);
     }
-    setFormBuilderStatus("Form settings updated.");
-    onNotice("Form settings updated.", "success");
+    const warnings = Array.isArray(payload?.warning) ? payload.warning : payload?.warning ? [payload.warning] : [];
+    const missingColumns = warnings
+      .filter((warning: any) => warning?.code === "missing_columns" && Array.isArray(warning.columns))
+      .flatMap((warning: any) => warning.columns);
+    if (missingColumns.length > 0) {
+      const uniqueColumns = Array.from(new Set(missingColumns.map(String)));
+      const warningMessage = `Form settings updated, but some fields could not be saved: ${uniqueColumns.join(", ")}.`;
+      setFormBuilderStatus(warningMessage);
+      onNotice(warningMessage, "warning");
+    } else {
+      setFormBuilderStatus("Form settings updated.");
+      onNotice("Form settings updated.", "success");
+    }
     await loadBuilder();
   }
 
