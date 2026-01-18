@@ -7888,8 +7888,17 @@ export default {
       }
 
       if (request.method === "GET" && url.pathname === "/api/admin/forms") {
+        const reminderEnabledSelect = (await hasColumn(env, "forms", "reminder_enabled"))
+          ? "f.reminder_enabled"
+          : "NULL as reminder_enabled";
+        const reminderFrequencySelect = (await hasColumn(env, "forms", "reminder_frequency"))
+          ? "f.reminder_frequency"
+          : "NULL as reminder_frequency";
+        const reminderUntilSelect = (await hasColumn(env, "forms", "reminder_until"))
+          ? "f.reminder_until"
+          : "NULL as reminder_until";
         const { results } = await env.DB.prepare(
-          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC"
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
         ).all<AdminFormRow & { submission_count?: number; updated_at?: string | null; created_at?: string | null }>();
 
         const data = results.map((row) => ({
@@ -7912,7 +7921,10 @@ export default {
           available_until: row.available_until ?? null,
           password_required: toBoolean(row.password_required ?? 0),
           password_require_access: toBoolean(row.password_require_access ?? 0),
-          password_require_submit: toBoolean(row.password_require_submit ?? 0)
+          password_require_submit: toBoolean(row.password_require_submit ?? 0),
+          reminder_enabled: toBoolean((row as any).reminder_enabled ?? 0),
+          reminder_frequency: (row as any).reminder_frequency ?? null,
+          reminder_until: (row as any).reminder_until ?? null
         }));
 
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
