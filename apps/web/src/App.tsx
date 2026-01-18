@@ -2782,6 +2782,20 @@ function FormPage({
       </>
     );
   };
+  const renderPlaceholderHelp = (field: FormField) => {
+    const placeholder =
+      typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
+        ? String((field as any).placeholder)
+        : "";
+    if (!placeholder || (!markdownEnabled && !mathjaxEnabled)) {
+      return null;
+    }
+    return (
+      <span className="field-help">
+        <RichText text={placeholder} markdownEnabled={markdownEnabled} mathjaxEnabled={mathjaxEnabled} />
+      </span>
+    );
+  };
   const fieldNodes = (form?.fields || []).map((field) => {
     if (field.type === "file") {
       const rules = getFieldRule(fileRules, field.id);
@@ -2986,6 +3000,7 @@ function FormPage({
               }
             }}
           />
+          {renderPlaceholderHelp(field)}
           {field.type === "email" && domain ? (
             <span className="field-help">Email must end with @{domain}.</span>
           ) : null}
@@ -3015,6 +3030,7 @@ function FormPage({
             placeholder={placeholder}
             onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
           />
+          {renderPlaceholderHelp(field)}
         </label>
       );
     }
@@ -3039,6 +3055,7 @@ function FormPage({
             placeholder={placeholder}
             onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
           />
+          {renderPlaceholderHelp(field)}
           {showRichNotice ? (
             <span className="field-help">
               {markdownActive
@@ -3082,6 +3099,7 @@ function FormPage({
               updateFieldError(field, next.value);
             }}
           />
+          {renderPlaceholderHelp(field)}
           {fieldErrors[field.id] ? (
             <span className="field-error">{fieldErrors[field.id]}</span>
           ) : null}
@@ -3146,6 +3164,7 @@ function FormPage({
             placeholder={placeholder}
             onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
           />
+          {renderPlaceholderHelp(field)}
         </label>
       );
     }
@@ -3228,6 +3247,7 @@ function FormPage({
           placeholder={placeholder}
           onChange={(event) => setValues((prev) => ({ ...prev, [field.id]: event.target.value }))}
         />
+        {renderPlaceholderHelp(field)}
       </label>
     );
   });
