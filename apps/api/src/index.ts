@@ -506,6 +506,8 @@ function extractFields(schema: unknown): Array<{
   required: boolean;
   rules?: Record<string, unknown>;
   placeholder?: string;
+  options?: string[];
+  multiple?: boolean;
 }> {
   if (!schema || typeof schema !== "object") return [];
   const fields = (schema as { fields?: unknown }).fields;
@@ -523,11 +525,24 @@ function extractFields(schema: unknown): Array<{
           ? record.placeholder
           : undefined;
       const rules = record.rules && typeof record.rules === "object" ? (record.rules as Record<string, unknown>) : undefined;
+      const options = Array.isArray(record.options)
+        ? record.options.filter((option) => typeof option === "string")
+        : undefined;
+      const multiple = typeof record.multiple === "boolean" ? record.multiple : undefined;
       if (!id) return null;
-      return { id, label, type, required, rules, placeholder };
+      return { id, label, type, required, rules, placeholder, options, multiple };
     })
     .filter((field) => field !== null);
-  return filtered as Array<{ id: string; label: string; type: string; required: boolean; rules?: Record<string, unknown>; placeholder?: string; }>;
+  return filtered as Array<{
+    id: string;
+    label: string;
+    type: string;
+    required: boolean;
+    rules?: Record<string, unknown>;
+    placeholder?: string;
+    options?: string[];
+    multiple?: boolean;
+  }>;
 }
 
 function normalizeRules(input: unknown): FileRules {
