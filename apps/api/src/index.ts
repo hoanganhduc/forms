@@ -508,6 +508,7 @@ function extractFields(schema: unknown): Array<{
   placeholder?: string;
   options?: string[];
   multiple?: boolean;
+  description?: string;
 }> {
   if (!schema || typeof schema !== "object") return [];
   const fields = (schema as { fields?: unknown }).fields;
@@ -518,6 +519,7 @@ function extractFields(schema: unknown): Array<{
       const record = field as Record<string, unknown>;
       const id = typeof record.id === "string" ? record.id : "";
       const label = typeof record.label === "string" ? record.label : id;
+      const description = typeof record.description === "string" ? record.description : undefined;
       const type = typeof record.type === "string" ? record.type : "text";
       const required = Boolean(record.required);
       const placeholder =
@@ -530,7 +532,7 @@ function extractFields(schema: unknown): Array<{
         : undefined;
       const multiple = typeof record.multiple === "boolean" ? record.multiple : undefined;
       if (!id) return null;
-      return { id, label, type, required, rules, placeholder, options, multiple };
+      return { id, label, type, required, rules, placeholder, options, multiple, description };
     })
     .filter((field) => field !== null);
   return filtered as Array<{
@@ -542,6 +544,7 @@ function extractFields(schema: unknown): Array<{
     placeholder?: string;
     options?: string[];
     multiple?: boolean;
+    description?: string;
   }>;
 }
 
