@@ -2177,6 +2177,7 @@ function FormPage({
     null
   );
   const [draftVisible, setDraftVisible] = useState(false);
+  const [markdownImportStatus, setMarkdownImportStatus] = useState<string | null>(null);
 
   function getEmailDomain(field: FormField) {
     const rules = (field as any).rules || {};
@@ -3999,6 +4000,31 @@ function FormPage({
               </button>
             </div>
           </div>
+        </div>
+      ) : null}
+      {form ? (
+        <div className="panel panel--inline">
+          <div className="d-flex flex-wrap align-items-center justify-content-between gap-2">
+            <div>
+              <div className="fw-semibold">Markdown import</div>
+              <div className="muted">Download, fill, and re-upload to populate the form.</div>
+            </div>
+            <div className="d-flex flex-wrap gap-2 align-items-center">
+              <button type="button" className="btn btn-outline-secondary btn-sm" onClick={handleDownloadMarkdown}>
+                <i className="bi bi-download" aria-hidden="true" /> Download template
+              </button>
+              <label className="btn btn-outline-secondary btn-sm mb-0">
+                <i className="bi bi-upload" aria-hidden="true" /> Import markdown
+                <input
+                  type="file"
+                  accept=".md,text/markdown"
+                  onChange={handleImportMarkdown}
+                  style={{ display: "none" }}
+                />
+              </label>
+            </div>
+          </div>
+          {markdownImportStatus ? <div className="muted mt-2">{markdownImportStatus}</div> : null}
         </div>
       ) : null}
 
@@ -10677,6 +10703,144 @@ function BuilderPage({
     setFormBuilderStatus("Form schema updated.");
     onNotice("Form schema updated.", "success");
     await loadBuilder();
+  }
+
+  function buildMarkdownTemplate() {
+    if (!form) return "";
+    const lines: string[] = [];
+    lines.push(`# ${form.title || form.slug}`);
+    lines.push("");
+    lines.push(`<!-- formSlug: ${form.slug} -->`);
+    lines.push(`<!-- generatedAt: ${new Date().toISOString()} -->`);
+    lines.push("");
+    lines.push("Fill values under each Value: section. Leave empty to skip a field.");
+    lines.push("");
+    (form.fields || [])
+      .filter((field) => field.type !== "file")
+      .forEach((field) => {
+        lines.push(`## ${field.id}`);
+        lines.push(`Label: ${field.label}`);
+        lines.push(`Type: ${field.type}`);
+        if (field.description) {
+          lines.push(`Description: ${field.description}`);
+        }
+        if (Array.isArray(field.options) && field.options.length > 0) {
+          lines.push(`Options: ${field.options.join(" | ")}`);
+        }
+        if (field.type === "checkbox" && field.multiple) {
+          lines.push("Multiple: true");
+        }
+        lines.push("Value:");
+        lines.push("");
+        lines.push("");
+      });
+    return lines.join("\n");
+  }
+
+  function parseMarkdownTemplate(text: string) {
+    const values: Record<string, string> = {};
+    const slugMatch = text.match(/formSlug:\s*([a-zA-Z0-9_-]+)/);
+    const parsedSlug = slugMatch ? slugMatch[1] : null;
+    const lines = text.split(/\r?\n/);
+    let currentId: string | null = null;
+    let collecting = false;
+    let buffer: string[] = [];
+    const commit = () => {
+      if (currentId) {
+        const value = buffer.join("\n").replace(/\s+$/, "");
+        values[currentId] = value;
+      }
+      buffer = [];
+      collecting = false;
+    };
+    for (const line of lines) {
+      const headingMatch = line.match(/^##\s+(.+)$/);
+      if (headingMatch) {
+        commit();
+        currentId = headingMatch[1].trim();
+        continue;
+      }
+      if (!currentId) {
+        continue;
+      }
+      if (line.startsWith("Value:")) {
+        collecting = true;
+        const remainder = line.slice("Value:".length).trim();
+        if (remainder) {
+          buffer.push(remainder);
+        }
+        continue;
+      }
+      if (collecting) {
+        buffer.push(line);
+      }
+    }
+    commit();
+    return { slug: parsedSlug, values };
+  }
+
+  function normalizeImportedValue(field: FormField, rawValue: string) {
+    const trimmed = rawValue.trim();
+    if (!trimmed) return "";
+    if (field.type === "checkbox" && field.multiple) {
+      const parts = trimmed
+        .split(/[\n,]+/)
+        .map((part) => part.trim())
+        .filter(Boolean);
+      return parts.join(", ");
+    }
+    const firstLine = trimmed.split(/\r?\n/).find((line) => line.trim());
+    return firstLine ? firstLine.trim() : trimmed;
+  }
+
+  async function handleImportMarkdown(event: React.ChangeEvent<HTMLInputElement>) {
+    setMarkdownImportStatus(null);
+    const file = event.target.files?.[0];
+    if (!file || !form) return;
+    try {
+      const text = await file.text();
+      const parsed = parseMarkdownTemplate(text);
+      if (parsed.slug && parsed.slug !== form.slug) {
+        onNotice("Markdown template is for a different form.", "warning");
+      }
+      const nextValues: Record<string, string> = {};
+      const unknownFields: string[] = [];
+      for (const [fieldId, value] of Object.entries(parsed.values)) {
+        const field = form.fields.find((item) => item.id === fieldId);
+        if (!field) {
+          unknownFields.push(fieldId);
+          continue;
+        }
+        nextValues[fieldId] = normalizeImportedValue(field, value);
+      }
+      setValues((prev) => ({ ...prev, ...nextValues }));
+      Object.entries(nextValues).forEach(([fieldId, value]) => {
+        const field = form.fields.find((item) => item.id === fieldId);
+        if (!field) return;
+        updateFieldError(field, value);
+      });
+      setMarkdownImportStatus(
+        unknownFields.length > 0
+          ? `Imported values. Unknown fields ignored: ${unknownFields.join(", ")}.`
+          : "Imported values from markdown."
+      );
+    } catch (error) {
+      setMarkdownImportStatus("Failed to import markdown.");
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  function handleDownloadMarkdown() {
+    const template = buildMarkdownTemplate();
+    if (!template || !form) return;
+    const blob = new Blob([template], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${form.slug}-template.md`;
+    link.click();
+    URL.revokeObjectURL(url);
   }
 
   async function handleRefreshFormFromTemplate() {
