@@ -2177,6 +2177,10 @@ function FormPage({
     null
   );
   const [draftVisible, setDraftVisible] = useState(false);
+  const [previousSubmission, setPreviousSubmission] = useState<{ values: Record<string, string>; updatedAt: string | null } | null>(
+    null
+  );
+  const [previousSubmissionVisible, setPreviousSubmissionVisible] = useState(false);
   const [markdownImportStatus, setMarkdownImportStatus] = useState<string | null>(null);
 
   function getEmailDomain(field: FormField) {
@@ -2510,7 +2514,11 @@ function FormPage({
                 }
               }
             });
-          setValues(nextValues);
+          setPreviousSubmission({
+            values: nextValues,
+            updatedAt: payload.data.updated_at || payload.data.created_at || null
+          });
+          setPreviousSubmissionVisible(true);
         }
         setSavedAt(payload.data.updated_at || payload.data.created_at || null);
         if (resolvedId) {
@@ -3963,6 +3971,65 @@ function FormPage({
             <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
               <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
             </button>
+          </div>
+        </div>
+      ) : null}
+
+      {previousSubmissionVisible && previousSubmission ? (
+        <div className="panel panel--inline">
+          <div className="d-flex flex-wrap align-items-center justify-content-between gap-2">
+            <div>
+              <div className="fw-semibold">Previous submission available</div>
+              {previousSubmission.updatedAt ? (
+                <div className="muted">Last submitted: {formatTimeICT(previousSubmission.updatedAt)}</div>
+              ) : null}
+            </div>
+            <div className="d-flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="btn btn-outline-secondary btn-sm"
+                onClick={() => {
+                  setValues(previousSubmission.values);
+                  Object.entries(previousSubmission.values).forEach(([fieldId, value]) => {
+                    const field = form?.fields.find((item) => item.id === fieldId);
+                    if (field) updateFieldError(field, value);
+                  });
+                  setPreviousSubmissionVisible(false);
+                }}
+              >
+                <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Use previous submission
+              </button>
+              <button
+                type="button"
+                className="btn btn-outline-secondary btn-sm"
+                onClick={() => {
+                  const currentValues = values;
+                  const next = { ...currentValues };
+                  Object.entries(previousSubmission.values).forEach(([fieldId, value]) => {
+                    if (!String(currentValues[fieldId] || "").trim()) {
+                      next[fieldId] = value;
+                    }
+                  });
+                  setValues(next);
+                  Object.entries(previousSubmission.values).forEach(([fieldId, value]) => {
+                    if (!String(currentValues[fieldId] || "").trim()) {
+                      const field = form?.fields.find((item) => item.id === fieldId);
+                      if (field) updateFieldError(field, value);
+                    }
+                  });
+                  setPreviousSubmissionVisible(false);
+                }}
+              >
+                <i className="bi bi-arrow-down" aria-hidden="true" /> Fill empty fields
+              </button>
+              <button
+                type="button"
+                className="btn btn-outline-danger btn-sm"
+                onClick={() => setPreviousSubmissionVisible(false)}
+              >
+                <i className="bi bi-x-circle" aria-hidden="true" /> Dismiss
+              </button>
+            </div>
           </div>
         </div>
       ) : null}
