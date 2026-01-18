@@ -10992,7 +10992,14 @@ function BuilderPage({
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
-      setFormCreateStatus(payload?.error || "Failed to create form.");
+      const detailMessage =
+        typeof payload?.detail?.message === "string"
+          ? payload.detail.message
+          : typeof payload?.detail === "string"
+            ? payload.detail
+            : "";
+      const statusMessage = [payload?.error, detailMessage].filter(Boolean).join(": ");
+      setFormCreateStatus(statusMessage || "Failed to create form.");
       return;
     }
     setFormCreateStatus("Form created.");

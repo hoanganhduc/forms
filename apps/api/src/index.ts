@@ -9255,40 +9255,52 @@ export default {
           canvasAllowedSectionIds && canvasAllowedSectionIds.length > 0
             ? JSON.stringify(canvasAllowedSectionIds)
             : null;
+        const formInsertBase = [
+          { name: "id", value: formId },
+          { name: "slug", value: body.slug.trim() },
+          { name: "title", value: body.title.trim() },
+          { name: "description", value: description },
+          { name: "template_id", value: template.id },
+          { name: "is_public", value: isPublic },
+          { name: "auth_policy", value: authPolicy },
+          { name: "created_by", value: authPayload?.userId ?? null }
+        ];
+        const formInsertOptional = [
+          { name: "drive_folder_id", value: driveFolderId },
+          { name: "file_rules_json", value: mirroredRules },
+          { name: "canvas_enabled", value: canvasEnabled ? 1 : 0 },
+          { name: "canvas_course_id", value: canvasCourseId },
+          { name: "canvas_allowed_section_ids_json", value: canvasAllowedJson },
+          { name: "canvas_fields_position", value: canvasFieldsPosition },
+          { name: "available_from", value: availableFrom },
+          { name: "available_until", value: availableUntil },
+          { name: "password_required", value: passwordRequired ? 1 : 0 },
+          { name: "password_require_access", value: passwordRequireAccess ? 1 : 0 },
+          { name: "password_require_submit", value: passwordRequireSubmit ? 1 : 0 },
+          { name: "password_salt", value: passwordSalt },
+          { name: "password_hash", value: passwordHash },
+          { name: "reminder_enabled", value: body.reminderEnabled ? 1 : 0 },
+          { name: "reminder_frequency", value: body.reminderFrequency || "weekly" },
+          { name: "reminder_until", value: body.reminderUntil || null }
+        ];
+        const formInsertColumns = formInsertBase.map((item) => item.name);
+        const formInsertValues = formInsertBase.map((item) => item.value);
+        for (const column of formInsertOptional) {
+          if (await hasColumn(env, "forms", column.name)) {
+            formInsertColumns.push(column.name);
+            formInsertValues.push(column.value);
+          }
+        }
+        const formInsertSql = `INSERT INTO forms (${formInsertColumns.join(", ")}) VALUES (${formInsertColumns
+          .map(() => "?")
+          .join(", ")})`;
         // Optimistic approach: Try to insert. If conflict, cleanup and retry.
         // This handles cases where pre-checks miss the form (replication lag, case sensitivity) but INSERT enforces uniqueness.
         let createdFormId = null;
         for (let attempt = 0; attempt < 2; attempt++) {
           try {
             const statements = [
-              env.DB.prepare(
-                "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, created_by, reminder_enabled, reminder_frequency, reminder_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-              ).bind(
-                formId,
-                body.slug.trim(),
-                body.title.trim(),
-                description,
-                template.id,
-                isPublic,
-                authPolicy,
-                driveFolderId,
-                mirroredRules,
-                canvasEnabled ? 1 : 0,
-                canvasCourseId,
-                canvasAllowedJson,
-                canvasFieldsPosition,
-                availableFrom,
-                availableUntil,
-                passwordRequired ? 1 : 0,
-                passwordRequireAccess ? 1 : 0,
-                passwordRequireSubmit ? 1 : 0,
-                passwordSalt,
-                passwordHash,
-                authPayload?.userId ?? null,
-                body.reminderEnabled ? 1 : 0,
-                body.reminderFrequency || "weekly",
-                body.reminderUntil || null
-              ),
+              env.DB.prepare(formInsertSql).bind(...formInsertValues),
               env.DB.prepare(
                 "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
               ).bind(versionId, formId, template.schema_json)
