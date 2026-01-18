@@ -9256,10 +9256,10 @@ export default {
             ? JSON.stringify(canvasAllowedSectionIds)
             : null;
         const existingSlugForm = await env.DB.prepare(
-          "SELECT id, deleted_at FROM forms WHERE slug=?"
+          "SELECT id, slug, deleted_at FROM forms WHERE lower(slug)=lower(?)"
         )
           .bind(body.slug.trim())
-          .first<{ id: string; deleted_at: string | null }>();
+          .first<{ id: string; slug: string; deleted_at: string | null }>();
 
         if (existingSlugForm) {
           if (existingSlugForm.deleted_at === null) {
@@ -9267,9 +9267,9 @@ export default {
               message: "slug_exists"
             });
           }
-          // Form exists but is in trash. Hard delete it (and let cascade handle relations if configured, or orphan them).
-          // We prioritize allowing the user to "Create" the form over preserving trash state for a name collision.
-          await env.DB.prepare("DELETE FROM forms WHERE id=?").bind(existingSlugForm.id).run();
+          // Form exists but is in trash. Hard delete it using helper to clear dependencies.
+          // Use the ACTUAL slug from the database to ensure we delete the correct row if case differs.
+          await hardDeleteForm(env, existingSlugForm.slug);
         }
 
         const statements = [
