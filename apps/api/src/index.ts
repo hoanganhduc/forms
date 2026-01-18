@@ -9255,75 +9255,85 @@ export default {
           canvasAllowedSectionIds && canvasAllowedSectionIds.length > 0
             ? JSON.stringify(canvasAllowedSectionIds)
             : null;
-        // Use a write operation (UPDATE) to check existence to bypass Read Replica lag (Eventual Consistency).
-        // If we just SELECT, we might miss a recently deleted or created form in Production.
-        // UPDATE ensures we hit the Primary DB.
-        const existingSlugForm = await env.DB.prepare(
-          "UPDATE forms SET updated_at=updated_at WHERE lower(slug)=lower(?) RETURNING id, slug, deleted_at"
-        )
-          .bind(body.slug.trim())
-          .first<{ id: string; slug: string; deleted_at: string | null }>();
+        // Optimistic approach: Try to insert. If conflict, cleanup and retry.
+        // This handles cases where pre-checks miss the form (replication lag, case sensitivity) but INSERT enforces uniqueness.
+        let createdFormId = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const statements = [
+              env.DB.prepare(
+                "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, created_by, reminder_enabled, reminder_frequency, reminder_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              ).bind(
+                formId,
+                body.slug.trim(),
+                body.title.trim(),
+                description,
+                template.id,
+                isPublic,
+                authPolicy,
+                driveFolderId,
+                mirroredRules,
+                canvasEnabled ? 1 : 0,
+                canvasCourseId,
+                canvasAllowedJson,
+                canvasFieldsPosition,
+                availableFrom,
+                availableUntil,
+                passwordRequired ? 1 : 0,
+                passwordRequireAccess ? 1 : 0,
+                passwordRequireSubmit ? 1 : 0,
+                passwordSalt,
+                passwordHash,
+                authPayload?.userId ?? null,
+                body.reminderEnabled ? 1 : 0,
+                body.reminderFrequency || "weekly",
+                body.reminderUntil || null
+              ),
+              env.DB.prepare(
+                "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
+              ).bind(versionId, formId, template.schema_json)
+            ];
 
-        if (existingSlugForm) {
-          if (existingSlugForm.deleted_at === null) {
+            await env.DB.batch(statements);
+            createdFormId = formId;
+            break; // Success
+          } catch (error) {
+            const message = String((error as Error | undefined)?.message || error);
+            if (message.includes("UNIQUE") && attempt === 0) {
+              // Conflict detected. Try to clean up "Ghost" or "Trash" form.
+              const slugTarget = body.slug.trim();
+
+              // Check if it is valid to delete (e.g. is it trash?). 
+              // We check simply: If it exists, we assume we can overwrite if we are in this retry loop?
+              // Wait, if it is ACTIVE, we should NOT delete.
+              // So we MUST checking status first.
+              const existing = await env.DB.prepare("SELECT id, deleted_at FROM forms WHERE lower(slug)=lower(?)").bind(slugTarget).first<{ id: string, deleted_at: string | null }>();
+
+              if (existing && existing.deleted_at === null) {
+                // Active form exists. Report conflict.
+                return errorResponse(409, "conflict", requestId, corsHeaders, { message: "slug_exists" });
+              }
+
+              // If existing (Trash) OR Not Found (Ghost), we try to delete dependencies.
+              // Query based delete.
+              // Note: If Not Found, ID is null. checking by slug.
+              await env.DB.batch([
+                env.DB.prepare("DELETE FROM email_logs WHERE form_id IN (SELECT id FROM forms WHERE lower(slug)=lower(?))").bind(slugTarget),
+                env.DB.prepare("DELETE FROM submission_file_items WHERE submission_id IN (SELECT id FROM submissions WHERE form_id IN (SELECT id FROM forms WHERE lower(slug)=lower(?)))").bind(slugTarget),
+                env.DB.prepare("DELETE FROM submission_uploads WHERE form_id IN (SELECT id FROM forms WHERE lower(slug)=lower(?))").bind(slugTarget),
+                env.DB.prepare("DELETE FROM submissions WHERE form_id IN (SELECT id FROM forms WHERE lower(slug)=lower(?))").bind(slugTarget),
+                env.DB.prepare("DELETE FROM form_versions WHERE form_id IN (SELECT id FROM forms WHERE lower(slug)=lower(?))").bind(slugTarget),
+                env.DB.prepare("DELETE FROM forms WHERE lower(slug)=lower(?)").bind(slugTarget)
+              ]);
+              continue; // Retry Insert
+            }
+
+            // Other error or retry failed
             return errorResponse(409, "conflict", requestId, corsHeaders, {
-              message: "slug_exists"
+              message: message.includes("UNIQUE") ? "slug_exists" : "form_create_failed",
+              detail: message // Expose raw error for debugging
             });
           }
-          // Form exists but is in trash. Hard delete it manually to ensure it is gone.
-          // We bypass hardDeleteForm helper to avoid potential issues with argument mismatches or logic failures.
-          const oldFormId = existingSlugForm.id;
-          await env.DB.batch([
-            env.DB.prepare("DELETE FROM email_logs WHERE form_id=?").bind(oldFormId),
-            env.DB.prepare("DELETE FROM submission_file_items WHERE submission_id IN (SELECT id FROM submissions WHERE form_id=?)").bind(oldFormId),
-            env.DB.prepare("DELETE FROM submission_uploads WHERE form_id=?").bind(oldFormId),
-            env.DB.prepare("DELETE FROM submissions WHERE form_id=?").bind(oldFormId),
-            env.DB.prepare("DELETE FROM form_versions WHERE form_id=?").bind(oldFormId),
-            env.DB.prepare("DELETE FROM forms WHERE id=?").bind(oldFormId)
-          ]);
-        }
-
-        const statements = [
-          env.DB.prepare(
-            "INSERT INTO forms (id, slug, title, description, template_id, is_public, auth_policy, drive_folder_id, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, created_by, reminder_enabled, reminder_frequency, reminder_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-          ).bind(
-            formId,
-            body.slug.trim(),
-            body.title.trim(),
-            description,
-            template.id,
-            isPublic,
-            authPolicy,
-            driveFolderId,
-            mirroredRules,
-            canvasEnabled ? 1 : 0,
-            canvasCourseId,
-            canvasAllowedJson,
-            canvasFieldsPosition,
-            availableFrom,
-            availableUntil,
-            passwordRequired ? 1 : 0,
-            passwordRequireAccess ? 1 : 0,
-            passwordRequireSubmit ? 1 : 0,
-            passwordSalt,
-            passwordHash,
-            authPayload?.userId ?? null,
-            body.reminderEnabled ? 1 : 0,
-            body.reminderFrequency || "weekly",
-            body.reminderUntil || null
-          ),
-          env.DB.prepare(
-            "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
-          ).bind(versionId, formId, template.schema_json)
-        ];
-
-        try {
-          await env.DB.batch(statements);
-        } catch (error) {
-          const message = String((error as Error | undefined)?.message || error);
-          return errorResponse(409, "conflict", requestId, corsHeaders, {
-            message: message.includes("UNIQUE") ? "slug_exists" : "form_create_failed"
-          });
         }
 
         return jsonResponse(
