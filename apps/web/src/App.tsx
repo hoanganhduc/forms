@@ -2263,86 +2263,95 @@ function FormPage({
       setSubmissionId(null);
       setHasExistingSubmission(false);
       setFileItems([]);
-      const response = await apiFetch(`${API_BASE}/api/forms/${slug}`);
-      const text = await response.text();
-      let payload: any = null;
       try {
-        payload = JSON.parse(text);
-      } catch {
-        payload = null;
-      }
+        const response = await apiFetch(`${API_BASE}/api/forms/${slug}`);
+        const text = await response.text();
+        let payload: any = null;
+        try {
+          payload = JSON.parse(text);
+        } catch {
+          payload = null;
+        }
 
-      if (!response.ok) {
-        if (
-          response.status === 403 &&
-          payload?.error === "invalid_payload" &&
-          payload?.detail?.field === "formPassword"
-        ) {
-          let cachedPassword = "";
-          try {
-            const cachedRaw = localStorage.getItem(accessCacheKey);
-            if (cachedRaw) {
-              const cached = JSON.parse(cachedRaw) as { password?: string; expiresAt?: number };
-              if (cached?.password && cached?.expiresAt && cached.expiresAt > Date.now()) {
-                cachedPassword = String(cached.password);
-              } else {
-                localStorage.removeItem(accessCacheKey);
-              }
-            }
-          } catch {
-            // ignore cache read failures
-          }
-          if (cachedPassword) {
-            const accessResponse = await apiFetch(
-              `${API_BASE}/api/forms/${encodeURIComponent(slug)}/access`,
-              {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ formPassword: cachedPassword })
-              }
-            );
-            const accessPayload = await accessResponse.json().catch(() => null);
-            if (!active) return;
-            if (accessResponse.ok) {
-              setForm(accessPayload?.data || null);
-              setAccessRequired(false);
-              setAccessError(null);
-              setFormPassword(cachedPassword);
-              setLocked(
-                Boolean(accessPayload?.data?.is_locked) || accessPayload?.data?.is_open === false
-              );
-              setLoading(false);
-              return;
-            }
+        if (!response.ok) {
+          if (
+            response.status === 403 &&
+            payload?.error === "invalid_payload" &&
+            payload?.detail?.field === "formPassword"
+          ) {
+            let cachedPassword = "";
             try {
-              localStorage.removeItem(accessCacheKey);
+              const cachedRaw = localStorage.getItem(accessCacheKey);
+              if (cachedRaw) {
+                const cached = JSON.parse(cachedRaw) as { password?: string; expiresAt?: number };
+                if (cached?.password && cached?.expiresAt && cached.expiresAt > Date.now()) {
+                  cachedPassword = String(cached.password);
+                } else {
+                  localStorage.removeItem(accessCacheKey);
+                }
+              }
             } catch {
-              // ignore cache removal failures
+              // ignore cache read failures
             }
+            if (cachedPassword) {
+              const accessResponse = await apiFetch(
+                `${API_BASE}/api/forms/${encodeURIComponent(slug)}/access`,
+                {
+                  method: "POST",
+                  headers: { "content-type": "application/json" },
+                  body: JSON.stringify({ formPassword: cachedPassword })
+                }
+              );
+              const accessPayload = await accessResponse.json().catch(() => null);
+              if (!active) return;
+              if (accessResponse.ok) {
+                setForm(accessPayload?.data || null);
+                setAccessRequired(false);
+                setAccessError(null);
+                setFormPassword(cachedPassword);
+                setLocked(
+                  Boolean(accessPayload?.data?.is_locked) || accessPayload?.data?.is_open === false
+                );
+                setLoading(false);
+                return;
+              }
+              try {
+                localStorage.removeItem(accessCacheKey);
+              } catch {
+                // ignore cache removal failures
+              }
+            }
+            if (!active) return;
+            setAccessRequired(true);
+            setAccessError("Form password is required to access this form.");
+            setLoading(false);
+            return;
           }
           if (!active) return;
-          setAccessRequired(true);
-          setAccessError("Form password is required to access this form.");
+          setLoadError({
+            status: response.status,
+            requestId: payload?.requestId ?? undefined,
+            message: payload?.error ?? "Request failed"
+          });
           setLoading(false);
           return;
         }
+
+        const data = payload?.data;
+        if (!active) return;
+        setForm(data);
+        setAccessRequired(false);
+        setAccessError(null);
+        setLocked(Boolean(data?.is_locked) || data?.is_open === false);
+        setLoading(false);
+      } catch (err) {
         if (!active) return;
         setLoadError({
-          status: response.status,
-          requestId: payload?.requestId ?? undefined,
-          message: payload?.error ?? "Request failed"
+          status: 0,
+          message: err instanceof Error ? err.message : "Network error"
         });
         setLoading(false);
-        return;
       }
-
-      const data = payload?.data;
-      if (!active) return;
-      setForm(data);
-      setAccessRequired(false);
-      setAccessError(null);
-      setLocked(Boolean(data?.is_locked) || data?.is_open === false);
-      setLoading(false);
     }
 
     loadForm();

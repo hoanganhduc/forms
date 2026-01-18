@@ -1049,8 +1049,47 @@ async function getGithubLoginForUser(env: Env, userId: string): Promise<string |
 }
 
 async function getFormWithRules(env: Env, slug: string) {
+  const baseColumns = [
+    "id",
+    "slug",
+    "title",
+    "description",
+    "is_locked",
+    "is_public",
+    "auth_policy"
+  ];
+  const optionalColumns = [
+    "canvas_enabled",
+    "canvas_course_id",
+    "canvas_allowed_section_ids_json",
+    "canvas_fields_position",
+    "available_from",
+    "available_until",
+    "password_required",
+    "password_require_access",
+    "password_require_submit",
+    "password_salt",
+    "password_hash",
+    "reminder_enabled",
+    "reminder_frequency"
+  ];
+  const columnSelects = [
+    ...baseColumns.map((column) => `f.${column}`),
+    ...(await Promise.all(
+      optionalColumns.map(async (column) =>
+        (await hasColumn(env, "forms", column)) ? `f.${column}` : `NULL as ${column}`
+      )
+    ))
+  ];
+  const templateFileRulesSelect = (await hasColumn(env, "templates", "file_rules_json"))
+    ? "t.file_rules_json as template_file_rules_json"
+    : "NULL as template_file_rules_json";
+  const formFileRulesSelect = (await hasColumn(env, "forms", "file_rules_json"))
+    ? "f.file_rules_json as form_file_rules_json"
+    : "NULL as form_file_rules_json";
+
   return env.DB.prepare(
-    "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.reminder_enabled,f.reminder_frequency,t.key as templateKey,fv.schema_json,t.file_rules_json as template_file_rules_json,f.file_rules_json as form_file_rules_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+    `SELECT ${columnSelects.join(",")},t.key as templateKey,fv.schema_json,${templateFileRulesSelect},${formFileRulesSelect} FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL`
   )
     .bind(slug)
     .first<
