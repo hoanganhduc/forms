@@ -2778,6 +2778,10 @@ function FormPage({
   const requiresAuth = form && form.auth_policy !== "optional";
   const canSubmit = form && (!requiresAuth || Boolean(user));
   const authPolicy = form?.auth_policy || "optional";
+  const allowGoogleAuth =
+    authPolicy === "required" || authPolicy === "either" || authPolicy === "google";
+  const allowGithubAuth =
+    authPolicy === "required" || authPolicy === "either" || authPolicy === "github";
   const isAuthorized =
     authPolicy === "optional" ||
     (authPolicy === "required" && Boolean(user)) ||
@@ -4114,12 +4118,16 @@ function FormPage({
             Please sign in to continue.
           </p>
           <div className="auth-bar">
-            <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
-              <i className="bi bi-google" aria-hidden="true" /> Login with Google
-            </button>
-            <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
-              <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
-            </button>
+            {allowGoogleAuth ? (
+              <button type="button" className="btn btn-primary btn-auth" onClick={() => onLogin("google")}>
+                <i className="bi bi-google" aria-hidden="true" /> Login with Google
+              </button>
+            ) : null}
+            {allowGithubAuth ? (
+              <button type="button" className="btn btn-dark btn-auth" onClick={() => onLogin("github")}>
+                <i className="bi bi-github" aria-hidden="true" /> Login with GitHub
+              </button>
+            ) : null}
           </div>
         </div>
       ) : null}
