@@ -4459,23 +4459,29 @@ function FormPage({
               <div className="muted">Import a markdown or JSON file to populate the form.</div>
             </div>
             <div className="d-flex flex-wrap gap-2 align-items-center">
-              <div className="btn-group btn-group-sm" role="group">
-                <button type="button" className="btn btn-outline-secondary" onClick={handleDownloadMarkdown}>
-                  <i className="bi bi-download" aria-hidden="true" /> Export markdown
-                </button>
-                <button type="button" className="btn btn-outline-secondary" onClick={handleDownloadJson}>
-                  <i className="bi bi-download" aria-hidden="true" /> Export JSON
-                </button>
-              </div>
-              <label className="btn btn-outline-secondary btn-sm mb-0">
-                <i className="bi bi-upload" aria-hidden="true" /> Import file
-                <input
-                  type="file"
-                  accept=".md,.json,text/markdown,application/json,text/plain"
-                  onChange={handleImportFile}
-                  style={{ display: "none" }}
-                />
-              </label>
+              {isAuthorized && hasPassword ? (
+                <>
+                  <div className="btn-group btn-group-sm" role="group">
+                    <button type="button" className="btn btn-outline-secondary" onClick={handleDownloadMarkdown}>
+                      <i className="bi bi-download" aria-hidden="true" /> Export markdown
+                    </button>
+                    <button type="button" className="btn btn-outline-secondary" onClick={handleDownloadJson}>
+                      <i className="bi bi-download" aria-hidden="true" /> Export JSON
+                    </button>
+                  </div>
+                  <label className="btn btn-outline-secondary btn-sm mb-0">
+                    <i className="bi bi-upload" aria-hidden="true" /> Import file
+                    <input
+                      type="file"
+                      accept=".md,.json,text/markdown,application/json,text/plain"
+                      onChange={handleImportFile}
+                      style={{ display: "none" }}
+                    />
+                  </label>
+                </>
+              ) : (
+                <span className="muted">Sign in and unlock the form to use import/export.</span>
+              )}
             </div>
           </div>
           {importStatus ? <div className="muted mt-2">{importStatus}</div> : null}
