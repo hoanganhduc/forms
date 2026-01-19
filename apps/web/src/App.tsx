@@ -4856,6 +4856,9 @@ function DashboardPage({
   const [items, setItems] = useState<any[]>([]);
   const [error, setError] = useState<ApiError | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [emailsLoading, setEmailsLoading] = useState(true);
+  const [emailsError, setEmailsError] = useState<ApiError | null>(null);
+  const [emails, setEmails] = useState<any[]>([]);
 
   useEffect(() => {
     if (!user) {
@@ -4892,6 +4895,37 @@ function DashboardPage({
       setLoading(false);
     }
     loadDashboard();
+    return () => {
+      active = false;
+    };
+  }, [user]);
+
+  useEffect(() => {
+    if (!user) {
+      setEmails([]);
+      setEmailsLoading(false);
+      return;
+    }
+    let active = true;
+    async function loadEmails() {
+      setEmailsLoading(true);
+      const response = await apiFetch(`${API_BASE}/api/me/emails?page=1&pageSize=100`);
+      const payload = await response.json().catch(() => null);
+      if (!active) return;
+      if (!response.ok) {
+        setEmailsError({
+          status: response.status,
+          requestId: payload?.requestId,
+          message: payload?.error || "Request failed"
+        });
+        setEmailsLoading(false);
+        return;
+      }
+      setEmails(Array.isArray(payload?.data) ? payload.data : []);
+      setEmailsError(null);
+      setEmailsLoading(false);
+    }
+    loadEmails();
     return () => {
       active = false;
     };
@@ -5053,6 +5087,73 @@ function DashboardPage({
           </table>
         </div>
       ) : null}
+      <div className="panel panel--compact mt-3">
+        <div className="panel-header">
+          <h3 className="mb-0">Email log</h3>
+        </div>
+        {emailsLoading ? <p className="muted">Loading emails...</p> : null}
+        {emailsError ? (
+          <div className="alert alert-danger" role="alert">
+            {emailsError.message || "Failed to load emails."}
+          </div>
+        ) : null}
+        {!emailsLoading && emails.length === 0 ? (
+          <div className="muted">No emails sent to your linked identities yet.</div>
+        ) : null}
+        {emails.length > 0 ? (
+          <div className="table-responsive">
+            <table className="table table-sm">
+              <thead>
+                <tr>
+                  <th>Sent</th>
+                  <th>To</th>
+                  <th>Subject</th>
+                  <th>Status</th>
+                  <th>Form</th>
+                  <th>Submission</th>
+                  <th>Trigger</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {emails.map((item) => (
+                  <tr key={item.id}>
+                    <td className="text-nowrap">
+                      {item.created_at ? formatTimeICT(item.created_at) : "n/a"}
+                    </td>
+                    <td className="text-break">{item.to_email || "n/a"}</td>
+                    <td className="text-break">{item.subject || "n/a"}</td>
+                    <td className="text-nowrap">
+                      {item.status || "n/a"}
+                      {item.error ? <div className="muted">{item.error}</div> : null}
+                    </td>
+                    <td className="text-break">
+                      {item.form_title || item.form_slug || "n/a"}
+                      {item.form_slug ? <div className="muted">{item.form_slug}</div> : null}
+                    </td>
+                    <td className="text-break">{item.submission_id || "n/a"}</td>
+                    <td className="text-break">
+                      {item.trigger_source || "n/a"}
+                      {item.triggered_by ? <div className="muted">{item.triggered_by}</div> : null}
+                    </td>
+                    <td className="text-break">
+                      <details>
+                        <summary>View</summary>
+                        <div className="mt-2">
+                          <div className="muted">Body</div>
+                          <pre className="mb-2">{item.body || ""}</pre>
+                          <div className="muted">All fields</div>
+                          <pre className="mb-0">{JSON.stringify(item, null, 2)}</pre>
+                        </div>
+                      </details>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : null}
+      </div>
     </section>
   );
 }
@@ -8808,10 +8909,13 @@ function AdminEmailsPage({
   const [total, setTotal] = useState(0);
   const [filterStatus, setFilterStatus] = useState("");
   const [filterEmail, setFilterEmail] = useState("");
+  const [filterUserId, setFilterUserId] = useState("");
   const [filterForm, setFilterForm] = useState("");
   const [forms, setForms] = useState<Array<{ slug: string; title: string }>>([]);
+  const [users, setUsers] = useState<Array<{ id: string; email?: string | null; google_email?: string | null }>>([]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [testRecipient, setTestRecipient] = useState("");
+  const [testUserId, setTestUserId] = useState("");
   const [testSubject, setTestSubject] = useState("Test email from Form App");
   const [testBody, setTestBody] = useState("This is a test email from Form App.");
   const [testPresetKey, setTestPresetKey] = useState("custom");
@@ -8826,6 +8930,22 @@ function AdminEmailsPage({
     const custom = [{ key: "custom", label: "Custom" }];
     return [...custom, ...(Array.isArray(testPresetList) ? testPresetList : [])];
   }, [testPresetList]);
+  const usersById = useMemo(() => {
+    const map = new Map<string, { id: string; email?: string | null; google_email?: string | null }>();
+    users.forEach((item) => {
+      map.set(item.id, item);
+    });
+    return map;
+  }, [users]);
+  const testUserEmails = useMemo(() => {
+    if (!testUserId) return [];
+    const userInfo = usersById.get(testUserId);
+    if (!userInfo) return [];
+    const emails = new Set<string>();
+    if (userInfo.email) emails.add(userInfo.email.trim());
+    if (userInfo.google_email) emails.add(userInfo.google_email.trim());
+    return Array.from(emails).filter(Boolean);
+  }, [testUserId, usersById]);
 
   useEffect(() => {
     let active = true;
@@ -8844,6 +8964,32 @@ function AdminEmailsPage({
       );
     }
     loadForms();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    async function loadUsers() {
+      const response = await apiFetch(`${API_BASE}/api/admin/users`);
+      const payload = await response.json().catch(() => null);
+      if (!active) return;
+      if (!response.ok || !Array.isArray(payload?.data)) {
+        setUsers([]);
+        return;
+      }
+      setUsers(
+        payload.data
+          .filter((item: any) => item?.id)
+          .map((item: any) => ({
+            id: String(item.id),
+            email: typeof item.email === "string" ? item.email : null,
+            google_email: typeof item.google_email === "string" ? item.google_email : null
+          }))
+      );
+    }
+    loadUsers();
     return () => {
       active = false;
     };
@@ -8886,6 +9032,7 @@ function AdminEmailsPage({
       params.set("includeBody", "1");
       if (filterStatus) params.set("status", filterStatus);
       if (filterEmail) params.set("email", filterEmail);
+      if (filterUserId) params.set("userId", filterUserId);
       if (filterForm) params.set("formSlug", filterForm);
       const response = await apiFetch(`${API_BASE}/api/admin/emails?${params.toString()}`);
       const payload = await response.json().catch(() => null);
@@ -8909,7 +9056,7 @@ function AdminEmailsPage({
     return () => {
       active = false;
     };
-  }, [page, pageSize, filterStatus, filterEmail, filterForm]);
+  }, [page, pageSize, filterStatus, filterEmail, filterUserId, filterForm]);
 
   if (status === "loading") {
     return (
@@ -8979,6 +9126,36 @@ function AdminEmailsPage({
             <div className="muted mt-1">Selecting a preset will overwrite the subject/body.</div>
           </div>
           <div className="col-md-4">
+            <label className="form-label">Recipient user</label>
+            <select
+              className="form-select"
+              value={testUserId}
+              onChange={(event) => {
+                const nextUserId = event.target.value;
+                setTestUserId(nextUserId);
+                const userInfo = usersById.get(nextUserId);
+                const nextEmail =
+                  (userInfo?.email && userInfo.email.trim()) ||
+                  (userInfo?.google_email && userInfo.google_email.trim()) ||
+                  "";
+                setTestRecipient(nextEmail);
+              }}
+            >
+              <option value="">Select user</option>
+              {users.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.email || item.google_email || item.id}
+                </option>
+              ))}
+            </select>
+            {testUserId && testUserEmails.length === 0 ? (
+              <div className="muted mt-1">No emails found for this user.</div>
+            ) : null}
+            {testUserEmails.length > 1 ? (
+              <div className="muted mt-1">Will send to {testUserEmails.length} linked emails.</div>
+            ) : null}
+          </div>
+          <div className="col-md-4">
             <label className="form-label">Recipient</label>
             <input
               className="form-control"
@@ -9041,6 +9218,41 @@ function AdminEmailsPage({
             >
               <i className="bi bi-send" aria-hidden="true" /> Send test email
             </button>
+            <button
+              type="button"
+              className="btn btn-outline-secondary"
+              disabled={!testUserId || testUserEmails.length === 0}
+              onClick={async () => {
+                setTestStatus(null);
+                if (!testUserId || testUserEmails.length === 0) {
+                  setTestStatus("Select a user with a linked email.");
+                  return;
+                }
+                const failures: string[] = [];
+                for (const email of testUserEmails) {
+                  const response = await apiFetch(`${API_BASE}/api/admin/emails/test`, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({
+                      to: email,
+                      subject: testSubject.trim() || "Test email from Form App",
+                      body: testBody.trim() || "This is a test email from Form App."
+                    })
+                  });
+                  if (!response.ok) {
+                    const payload = await response.json().catch(() => null);
+                    failures.push(payload?.error || "send_failed");
+                  }
+                }
+                if (failures.length > 0) {
+                  setTestStatus(`Failed to send to ${failures.length} email(s).`);
+                  return;
+                }
+                setTestStatus(`Test email sent to ${testUserEmails.length} linked email(s).`);
+              }}
+            >
+              <i className="bi bi-person" aria-hidden="true" /> Send to user
+            </button>
             {testStatus ? <span className="muted">{testStatus}</span> : null}
           </div>
         </div>
@@ -9072,6 +9284,24 @@ function AdminEmailsPage({
             }}
             placeholder="Search email"
           />
+        </div>
+        <div>
+          <label className="form-label">User</label>
+          <select
+            className="form-select form-select-sm"
+            value={filterUserId}
+            onChange={(event) => {
+              setPage(1);
+              setFilterUserId(event.target.value);
+            }}
+          >
+            <option value="">All</option>
+            {users.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.email || item.google_email || item.id}
+              </option>
+            ))}
+          </select>
         </div>
         <div>
           <label className="form-label">Form</label>

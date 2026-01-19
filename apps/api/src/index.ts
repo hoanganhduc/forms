@@ -7583,11 +7583,26 @@ export default {
         const pageSize = Math.min(Math.max(toNumber(url.searchParams.get("pageSize"), 50), 1), 200);
         const status = (url.searchParams.get("status") || "").trim();
         const email = (url.searchParams.get("email") || "").trim();
+        const userId = (url.searchParams.get("userId") || "").trim();
         const submissionId = (url.searchParams.get("submissionId") || "").trim();
         const formSlug = (url.searchParams.get("formSlug") || "").trim();
         const includeBody = url.searchParams.get("includeBody") === "1";
         const where: string[] = [];
         const params: Array<string | number> = [];
+        if (userId) {
+          const { results } = await env.DB.prepare(
+            "SELECT email FROM user_identities WHERE user_id=? AND email IS NOT NULL"
+          )
+            .bind(userId)
+            .all<{ email: string }>();
+          const emails = results.map((row) => row.email?.trim().toLowerCase()).filter(Boolean);
+          if (emails.length === 0) {
+            return jsonResponse(200, { data: [], page, pageSize, total: 0, requestId }, requestId, corsHeaders);
+          }
+          const placeholders = emails.map(() => "?").join(",");
+          where.push(`lower(l.to_email) IN (${placeholders})`);
+          params.push(...emails);
+        }
         if (status) {
           where.push("l.status=?");
           params.push(status);
@@ -12028,6 +12043,118 @@ export default {
       await ensureIdentityFromAuthPayload(env, authPayload);
       const identities = await getUserIdentities(env, authPayload.userId);
       return jsonResponse(200, { data: identities, requestId }, requestId, corsHeaders);
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/me/emails") {
+      const authPayload = await getAuthPayload(request, env);
+      if (!authPayload) {
+        return errorResponse(401, "auth_required", requestId, corsHeaders);
+      }
+      await ensureIdentityFromAuthPayload(env, authPayload);
+      const identities = await getUserIdentities(env, authPayload.userId);
+      const emails = new Set<string>();
+      if (authPayload.email) {
+        emails.add(authPayload.email.trim().toLowerCase());
+      }
+      identities.forEach((identity) => {
+        if (identity.email) {
+          emails.add(identity.email.trim().toLowerCase());
+        }
+      });
+      const emailList = Array.from(emails).filter(Boolean);
+      if (emailList.length === 0) {
+        return jsonResponse(200, { data: [], page: 1, pageSize: 50, total: 0, requestId }, requestId, corsHeaders);
+      }
+      const page = Math.max(toNumber(url.searchParams.get("page"), 1), 1);
+      const pageSize = Math.min(Math.max(toNumber(url.searchParams.get("pageSize"), 50), 1), 200);
+      let canSoftDelete = await hasEmailLogsSoftDelete(env);
+      const where: string[] = [];
+      const params: Array<string | number> = [];
+      const placeholders = emailList.map(() => "?").join(",");
+      where.push(`lower(l.to_email) IN (${placeholders})`);
+      params.push(...emailList);
+      if (canSoftDelete) {
+        where.push("l.deleted_at IS NULL");
+      }
+      const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+      const deletedAtSelect = (await hasColumn(env, "email_logs", "deleted_at"))
+        ? "l.deleted_at as deleted_at"
+        : "NULL as deleted_at";
+      const deletedBySelect = (await hasColumn(env, "email_logs", "deleted_by"))
+        ? "l.deleted_by as deleted_by"
+        : "NULL as deleted_by";
+      const deletedReasonSelect = (await hasColumn(env, "email_logs", "deleted_reason"))
+        ? "l.deleted_reason as deleted_reason"
+        : "NULL as deleted_reason";
+      const formSlugSelect = (await hasColumn(env, "email_logs", "form_slug"))
+        ? "COALESCE(l.form_slug,f.slug) as form_slug"
+        : "f.slug as form_slug";
+      const formTitleSelect = (await hasColumn(env, "email_logs", "form_title"))
+        ? "COALESCE(l.form_title,f.title) as form_title"
+        : "f.title as form_title";
+      const selectFields = [
+        "l.id",
+        "l.to_email",
+        "l.subject",
+        "l.body",
+        "l.status",
+        "l.error",
+        "l.submission_id",
+        "l.form_id",
+        formSlugSelect,
+        formTitleSelect,
+        "l.canvas_course_id",
+        "l.canvas_section_id",
+        "l.triggered_by",
+        "l.trigger_source",
+        "l.created_at",
+        deletedAtSelect,
+        deletedBySelect,
+        deletedReasonSelect
+      ].join(",");
+      const limit = pageSize;
+      const offset = (page - 1) * pageSize;
+      let total = 0;
+      let results: unknown[] = [];
+      try {
+        const totalRow = await env.DB.prepare(
+          `SELECT COUNT(1) as total FROM email_logs l ${whereClause}`
+        )
+          .bind(...params)
+          .first<{ total: number }>();
+        total = totalRow?.total ?? 0;
+        const response = await env.DB.prepare(
+          `SELECT ${selectFields} FROM email_logs l LEFT JOIN forms f ON f.id=l.form_id ${whereClause} ORDER BY l.created_at DESC LIMIT ? OFFSET ?`
+        )
+          .bind(...params, limit, offset)
+          .all();
+        results = response.results;
+      } catch (error) {
+        const message = String((error as Error)?.message || error);
+        if (canSoftDelete && message.includes("no such column: l.deleted_at")) {
+          EMAIL_LOGS_SOFT_DELETE = false;
+          const idx = where.indexOf("l.deleted_at IS NULL");
+          if (idx >= 0) {
+            where.splice(idx, 1);
+          }
+          const nextWhereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+          const totalRow = await env.DB.prepare(
+            `SELECT COUNT(1) as total FROM email_logs l ${nextWhereClause}`
+          )
+            .bind(...params)
+            .first<{ total: number }>();
+          total = totalRow?.total ?? 0;
+          const response = await env.DB.prepare(
+            `SELECT ${selectFields} FROM email_logs l LEFT JOIN forms f ON f.id=l.form_id ${nextWhereClause} ORDER BY l.created_at DESC LIMIT ? OFFSET ?`
+          )
+            .bind(...params, limit, offset)
+            .all();
+          results = response.results;
+        } else {
+          throw error;
+        }
+      }
+      return jsonResponse(200, { data: results, page, pageSize, total, requestId }, requestId, corsHeaders);
     }
 
     if (request.method === "GET" && url.pathname === "/api/me/submissions") {
