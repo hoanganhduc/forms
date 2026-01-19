@@ -12102,8 +12102,17 @@ export default {
         return errorResponse(401, "auth_required", requestId, corsHeaders);
       }
 
+      const reminderEnabledSelect = (await hasColumn(env, "forms", "reminder_enabled"))
+        ? "f.reminder_enabled as reminder_enabled"
+        : "NULL as reminder_enabled";
+      const reminderFrequencySelect = (await hasColumn(env, "forms", "reminder_frequency"))
+        ? "f.reminder_frequency as reminder_frequency"
+        : "NULL as reminder_frequency";
+      const reminderUntilSelect = (await hasColumn(env, "forms", "reminder_until"))
+        ? "f.reminder_until as reminder_until"
+        : "NULL as reminder_until";
       const submission = await env.DB.prepare(
-        "SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL"
+        `SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect} FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL`
       )
         .bind(submissionId)
         .first<{
@@ -12125,6 +12134,9 @@ export default {
           is_locked: number;
           is_public: number;
           auth_policy: string | null;
+          reminder_enabled: number | null;
+          reminder_frequency: string | null;
+          reminder_until: string | null;
         }>();
 
       if (!submission) {
@@ -12195,7 +12207,10 @@ export default {
               title: submission.form_title,
               is_locked: toBoolean(submission.is_locked),
               is_public: toBoolean(submission.is_public),
-              auth_policy: submission.auth_policy ?? "optional"
+              auth_policy: submission.auth_policy ?? "optional",
+              reminder_enabled: toBoolean(submission.reminder_enabled ?? 0),
+              reminder_frequency: submission.reminder_frequency ?? null,
+              reminder_until: submission.reminder_until ?? null
             }
           },
           requestId

@@ -563,6 +563,22 @@ function isValidTimeString(value: string) {
   return /^([01]\d|2[0-3]):([0-5]\d)$/.test(value);
 }
 
+function formatReminderFrequency(value: string | null | undefined) {
+  if (!value) return "";
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return "";
+  if (normalized === "daily") return "every day";
+  if (normalized === "weekly") return "every week";
+  if (normalized === "monthly") return "every month";
+  const match = /^(\d+):(days|weeks|months)$/.exec(normalized);
+  if (!match) return "";
+  const count = Number(match[1]);
+  if (!Number.isFinite(count) || count <= 0) return "";
+  const unit = match[2];
+  const label = count === 1 ? unit.replace(/s$/, "") : unit;
+  return `every ${count} ${label}`;
+}
+
 function zonedTimeToUtcIso(localValue: string, timeZone: string) {
   if (!localValue) return "";
   const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(localValue);
@@ -2109,7 +2125,7 @@ function HomePage({
             </li>
             <li>
               <i className="bi bi-stars me-2" aria-hidden="true" />
-              <strong>Assistants:</strong> GitHub Copilot, ChatGPT Codex
+              <strong>Assistants:</strong> GitHub Copilot, ChatGPT Codex, Google Antigravity
             </li>
           </ul>
         </div>
@@ -5480,6 +5496,15 @@ function SubmissionDetailPage({
   const renderValue = (value: string) => (
     <RichText text={value} markdownEnabled={markdownEnabled} mathjaxEnabled={mathjaxEnabled} />
   );
+  const reminderText = useMemo(() => {
+    if (!data?.form?.reminder_enabled) return "";
+    const freqText = formatReminderFrequency(data.form.reminder_frequency);
+    if (!freqText) return "";
+    const untilText = data.form.reminder_until ? formatTimeICT(data.form.reminder_until) : "";
+    return untilText
+      ? `Reminder: resubmit ${freqText} until ${untilText}.`
+      : `Reminder: resubmit ${freqText}.`;
+  }, [data]);
 
   useEffect(() => {
     if (!user || !id) {
@@ -5693,6 +5718,11 @@ function SubmissionDetailPage({
           <div className="muted">
             Updated: {data.updated_at ? formatTimeICT(data.updated_at) : "n/a"}
           </div>
+          {reminderText ? (
+            <div className="alert alert-info mt-2 mb-0">
+              <i className="bi bi-info-circle" aria-hidden="true" /> {reminderText}
+            </div>
+          ) : null}
           {data.canvas?.status ? (
             <div className="muted">
               Canvas enrollment: {data.canvas.status === "deleted" ? "unenrolled" : data.canvas.status}

@@ -40,8 +40,9 @@ This codebase was developed with the assistance of GitHub Copilot, ChatGPT Codex
 - Theme: dark is default; the toggle persists in localStorage.
 - Theme toggle: floating button at bottom-right.
 - Form drafts: unsent inputs auto-save to localStorage and can be restored on return.
+- Import/export: download Markdown or JSON, and import either format to fill a form (auto-detected).
 - Builder: duplicate forms/templates to speed up reuse.
-- Rich text: Markdown + MathJax + HTML rendering can be toggled in Admin App settings.
+- Rich text: Markdown + MathJax rendering can be toggled in Admin App settings (raw HTML stripped).
 
 ## Mobile QA
 - Run `npm run dev:web` and open `http://localhost:5173/forms/`.
@@ -150,7 +151,7 @@ This codebase was developed with the assistance of GitHub Copilot, ChatGPT Codex
   - `/#/me` dashboard
   - `/#/me/submissions/:id` submission detail
   - `/#/account` linked identities + delete account
-  - `/#/canvas` user Canvas info
+  - `/#/canvas` user Canvas info (visible after Canvas-related submission)
 - Admin:
   - `/#/admin` dashboard
 
@@ -196,7 +197,7 @@ The API uses a staged upload flow:
 - Form availability uses a timezone selector; open/close times are stored in UTC.
 - The timezone picker is searchable and uses the full IANA list with a curated fallback (Asia/Ho_Chi_Minh always available).
 - Admin can set a global default timezone (Admin App settings); times are displayed in the viewer's local timezone.
-- Markdown/MathJax/HTML rendering is global (Admin App settings) and applies to form titles, descriptions, labels, and text values.
+- Markdown/MathJax rendering is global (Admin App settings) and applies to form titles, descriptions, labels, and text values. Raw HTML is stripped.
 
 ## Deletion policy
 - User deletes account via `DELETE /api/me`:
@@ -214,6 +215,7 @@ The API uses a staged upload flow:
 - Toggle **New** vs **Edit**:
   - **New**: enter slug/title/template and status fields, then create.
   - **Edit**: select an existing item and update schema/settings.
+- Edit form: optionally select a template; “Refresh from template” appears only when selected.
 - Field builder supports: text, textarea, number, date/time, email, URL, GitHub username, full name,
   select, checkbox, and file fields.
 - File fields: configure extensions, max size, and max files; rules are stored per field.
