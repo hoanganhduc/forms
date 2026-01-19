@@ -2182,8 +2182,7 @@ function FormPage({
     null
   );
   const [previousSubmissionVisible, setPreviousSubmissionVisible] = useState(false);
-  const [markdownImportStatus, setMarkdownImportStatus] = useState<string | null>(null);
-  const [jsonImportStatus, setJsonImportStatus] = useState<string | null>(null);
+  const [importStatus, setImportStatus] = useState<string | null>(null);
 
   function getEmailDomain(field: FormField) {
     const rules = (field as any).rules || {};
@@ -2395,54 +2394,22 @@ function FormPage({
     return String(rawValue);
   }
 
-  async function handleImportMarkdown(event: React.ChangeEvent<HTMLInputElement>) {
-    setMarkdownImportStatus(null);
-    const file = event.target.files?.[0];
-    if (!file || !form) return;
-    try {
-      const text = await file.text();
-      const parsed = parseMarkdownTemplate(text);
-      if (parsed.slug && parsed.slug !== form.slug) {
-        onNotice("Markdown template is for a different form.", "warning");
-      }
-      const nextValues: Record<string, string> = {};
-      const unknownFields: string[] = [];
-      for (const [fieldId, value] of Object.entries(parsed.values)) {
-        const field = form.fields.find((item) => item.id === fieldId);
-        if (!field) {
-          unknownFields.push(fieldId);
-          continue;
-        }
-        nextValues[fieldId] = normalizeImportedValue(field, value);
-      }
-      setValues((prev) => ({ ...prev, ...nextValues }));
-      Object.entries(nextValues).forEach(([fieldId, value]) => {
-        const field = form.fields.find((item) => item.id === fieldId);
-        if (!field) return;
-        updateFieldError(field, value);
-      });
-      setMarkdownImportStatus(
-        unknownFields.length > 0
-          ? `Imported values. Unknown fields ignored: ${unknownFields.join(", ")}.`
-          : "Imported values from markdown."
-      );
-    } catch (error) {
-      setMarkdownImportStatus("Failed to import markdown.");
-    } finally {
-      event.target.value = "";
-    }
-  }
-
-  function handleDownloadMarkdown() {
-    const template = buildMarkdownTemplate();
-    if (!template || !form) return;
-    const blob = new Blob([template], { type: "text/markdown" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${form.slug}-template.md`;
-    link.click();
-    URL.revokeObjectURL(url);
+  function applyImportedValues(
+    nextValues: Record<string, string>,
+    unknownFields: string[],
+    sourceLabel: string
+  ) {
+    setValues((prev) => ({ ...prev, ...nextValues }));
+    Object.entries(nextValues).forEach(([fieldId, value]) => {
+      const field = form?.fields.find((item) => item.id === fieldId);
+      if (!field) return;
+      updateFieldError(field, value);
+    });
+    setImportStatus(
+      unknownFields.length > 0
+        ? `Imported values from ${sourceLabel}. Unknown fields ignored: ${unknownFields.join(", ")}.`
+        : `Imported values from ${sourceLabel}.`
+    );
   }
 
   function buildJsonPayload() {
@@ -2466,51 +2433,84 @@ function FormPage({
     };
   }
 
-  async function handleImportJson(event: React.ChangeEvent<HTMLInputElement>) {
-    setJsonImportStatus(null);
+  async function handleImportFile(event: React.ChangeEvent<HTMLInputElement>) {
+    setImportStatus(null);
     const file = event.target.files?.[0];
     if (!file || !form) return;
     try {
       const text = await file.text();
-      const parsed = JSON.parse(text);
-      const valuesPayload =
-        parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.values
-          ? parsed.values
-          : parsed;
-      if (!valuesPayload || typeof valuesPayload !== "object" || Array.isArray(valuesPayload)) {
-        setJsonImportStatus("JSON must be an object of field values.");
+      const trimmed = text.trim();
+      let parsedJson: any = null;
+      if (trimmed) {
+        try {
+          parsedJson = JSON.parse(trimmed);
+        } catch {
+          parsedJson = null;
+        }
+      }
+      if (parsedJson) {
+        const valuesPayload =
+          parsedJson && typeof parsedJson === "object" && !Array.isArray(parsedJson) && parsedJson.values
+            ? parsedJson.values
+            : parsedJson;
+        if (!valuesPayload || typeof valuesPayload !== "object" || Array.isArray(valuesPayload)) {
+          setImportStatus("JSON must be an object of field values.");
+          return;
+        }
+        if (
+          parsedJson &&
+          typeof parsedJson === "object" &&
+          parsedJson.formSlug &&
+          parsedJson.formSlug !== form.slug
+        ) {
+          onNotice("JSON payload is for a different form.", "warning");
+        }
+        const nextValues: Record<string, string> = {};
+        const unknownFields: string[] = [];
+        for (const [fieldId, value] of Object.entries(valuesPayload)) {
+          const field = form.fields.find((item) => item.id === fieldId);
+          if (!field) {
+            unknownFields.push(fieldId);
+            continue;
+          }
+          const normalized = normalizeJsonValue(field, value);
+          nextValues[fieldId] = normalizeImportedValue(field, normalized);
+        }
+        applyImportedValues(nextValues, unknownFields, "JSON");
         return;
       }
-      if (parsed && typeof parsed === "object" && parsed.formSlug && parsed.formSlug !== form.slug) {
-        onNotice("JSON payload is for a different form.", "warning");
+      const parsed = parseMarkdownTemplate(text);
+      if (parsed.slug && parsed.slug !== form.slug) {
+        onNotice("Markdown template is for a different form.", "warning");
       }
       const nextValues: Record<string, string> = {};
       const unknownFields: string[] = [];
-      for (const [fieldId, value] of Object.entries(valuesPayload)) {
+      for (const [fieldId, value] of Object.entries(parsed.values)) {
         const field = form.fields.find((item) => item.id === fieldId);
         if (!field) {
           unknownFields.push(fieldId);
           continue;
         }
-        const normalized = normalizeJsonValue(field, value);
-        nextValues[fieldId] = normalizeImportedValue(field, normalized);
+        nextValues[fieldId] = normalizeImportedValue(field, value);
       }
-      setValues((prev) => ({ ...prev, ...nextValues }));
-      Object.entries(nextValues).forEach(([fieldId, value]) => {
-        const field = form.fields.find((item) => item.id === fieldId);
-        if (!field) return;
-        updateFieldError(field, value);
-      });
-      setJsonImportStatus(
-        unknownFields.length > 0
-          ? `Imported values. Unknown fields ignored: ${unknownFields.join(", ")}.`
-          : "Imported values from JSON."
-      );
+      applyImportedValues(nextValues, unknownFields, "markdown");
     } catch (error) {
-      setJsonImportStatus("Failed to import JSON.");
+      setImportStatus("Failed to import file.");
     } finally {
       event.target.value = "";
     }
+  }
+
+  function handleDownloadMarkdown() {
+    const template = buildMarkdownTemplate();
+    if (!template || !form) return;
+    const blob = new Blob([template], { type: "text/markdown" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${form.slug}-template.md`;
+    link.click();
+    URL.revokeObjectURL(url);
   }
 
   function handleDownloadJson() {
@@ -4325,50 +4325,30 @@ function FormPage({
         <div className="panel panel--inline">
           <div className="d-flex flex-wrap align-items-center justify-content-between gap-2">
             <div>
-              <div className="fw-semibold">Markdown import</div>
-              <div className="muted">Download, fill, and re-upload to populate the form.</div>
+              <div className="fw-semibold">Import/export</div>
+              <div className="muted">Import a markdown or JSON file to populate the form.</div>
             </div>
             <div className="d-flex flex-wrap gap-2 align-items-center">
-              <button type="button" className="btn btn-outline-secondary btn-sm" onClick={handleDownloadMarkdown}>
-                <i className="bi bi-download" aria-hidden="true" /> Download template
-              </button>
+              <div className="btn-group btn-group-sm" role="group">
+                <button type="button" className="btn btn-outline-secondary" onClick={handleDownloadMarkdown}>
+                  <i className="bi bi-download" aria-hidden="true" /> Export markdown
+                </button>
+                <button type="button" className="btn btn-outline-secondary" onClick={handleDownloadJson}>
+                  <i className="bi bi-download" aria-hidden="true" /> Export JSON
+                </button>
+              </div>
               <label className="btn btn-outline-secondary btn-sm mb-0">
-                <i className="bi bi-upload" aria-hidden="true" /> Import markdown
+                <i className="bi bi-upload" aria-hidden="true" /> Import file
                 <input
                   type="file"
-                  accept=".md,text/markdown"
-                  onChange={handleImportMarkdown}
+                  accept=".md,.json,text/markdown,application/json,text/plain"
+                  onChange={handleImportFile}
                   style={{ display: "none" }}
                 />
               </label>
             </div>
           </div>
-          {markdownImportStatus ? <div className="muted mt-2">{markdownImportStatus}</div> : null}
-        </div>
-      ) : null}
-      {form ? (
-        <div className="panel panel--inline">
-          <div className="d-flex flex-wrap align-items-center justify-content-between gap-2">
-            <div>
-              <div className="fw-semibold">JSON import/export</div>
-              <div className="muted">Export current values or import a JSON payload to fill the form.</div>
-            </div>
-            <div className="d-flex flex-wrap gap-2 align-items-center">
-              <button type="button" className="btn btn-outline-secondary btn-sm" onClick={handleDownloadJson}>
-                <i className="bi bi-download" aria-hidden="true" /> Export JSON
-              </button>
-              <label className="btn btn-outline-secondary btn-sm mb-0">
-                <i className="bi bi-upload" aria-hidden="true" /> Import JSON
-                <input
-                  type="file"
-                  accept="application/json,.json"
-                  onChange={handleImportJson}
-                  style={{ display: "none" }}
-                />
-              </label>
-            </div>
-          </div>
-          {jsonImportStatus ? <div className="muted mt-2">{jsonImportStatus}</div> : null}
+          {importStatus ? <div className="muted mt-2">{importStatus}</div> : null}
         </div>
       ) : null}
 
@@ -10214,6 +10194,7 @@ function BuilderPage({
   const [formBuilderSchema, setFormBuilderSchema] = useState("");
   const [formBuilderStatus, setFormBuilderStatus] = useState<string | null>(null);
   const [formBuilderDescription, setFormBuilderDescription] = useState("");
+  const [formBuilderTemplateKey, setFormBuilderTemplateKey] = useState("");
   const [formBuilderPublic, setFormBuilderPublic] = useState(true);
   const [formBuilderLocked, setFormBuilderLocked] = useState(false);
   const [formBuilderAuthPolicy, setFormBuilderAuthPolicy] = useState("optional");
@@ -10910,6 +10891,7 @@ function BuilderPage({
       setFormCreateReminderValue(1);
       setFormCreateReminderUnit("weeks");
       setFormCreateReminderUntil("");
+      setFormBuilderTemplateKey("");
       setFormBuilderSlugEdit("");
       return;
     }
@@ -10938,6 +10920,7 @@ function BuilderPage({
     const selected = safeForms.find((form) => form.slug === slug);
     if (selected) {
       setFormBuilderDescription(String(selected.description || ""));
+      setFormBuilderTemplateKey(selected.templateKey ? String(selected.templateKey) : "");
       setFormBuilderPublic(Boolean(selected.is_public));
       setFormBuilderLocked(Boolean(selected.is_locked));
       setFormBuilderAuthPolicy(String(selected.auth_policy || "optional"));
@@ -11055,8 +11038,7 @@ function BuilderPage({
       setFormBuilderStatus("Select a form to update.");
       return;
     }
-    const selected = safeForms.find((form) => form.slug === formBuilderSlug);
-    const templateKey = selected?.templateKey;
+    const templateKey = formBuilderTemplateKey.trim();
     if (!templateKey) {
       setFormBuilderStatus("This form has no template to refresh from.");
       return;
@@ -11067,7 +11049,7 @@ function BuilderPage({
     const response = await apiFetch(`${API_BASE}/api/admin/forms/${encodeURIComponent(formBuilderSlug)}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ templateKey })
+      body: JSON.stringify({ templateKey, refreshTemplate: true })
     });
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
@@ -11212,6 +11194,8 @@ function BuilderPage({
         body: JSON.stringify({
           newSlug: nextSlug || undefined,
           description: formBuilderDescription || null,
+          templateKey: formBuilderTemplateKey.trim() || null,
+          refreshTemplate: false,
           is_public: formBuilderPublic,
           is_locked: formBuilderLocked,
           auth_policy: formBuilderAuthPolicy,
@@ -12235,6 +12219,24 @@ function BuilderPage({
                     ) : null}
                   </div>
                   <div className="col-md-4">
+                    <label className="form-label">Template (optional)</label>
+                    <select
+                      className="form-select"
+                      value={formBuilderTemplateKey}
+                      onChange={(event) => setFormBuilderTemplateKey(event.target.value)}
+                      disabled={!formBuilderSlug}
+                    >
+                      <option value="">Select template</option>
+                      {safeTemplates
+                        .filter((tpl) => typeof tpl.key === "string")
+                        .map((tpl) => (
+                          <option key={tpl.key} value={tpl.key}>
+                            {tpl.name} ({tpl.key})
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+                  <div className="col-md-4">
                     <label className="form-label">Auth policy</label>
                     <select
                       className="form-select"
@@ -12777,14 +12779,16 @@ function BuilderPage({
                   >
                     <i className="bi bi-link-45deg" aria-hidden="true" /> Copy form link
                   </button>
-                  <button
-                    type="button"
-                    className="btn btn-outline-primary"
-                    onClick={handleRefreshFormFromTemplate}
-                    disabled={!formBuilderSlug || !selectedBuilderForm?.templateKey}
-                  >
-                    <i className="bi bi-arrow-repeat" aria-hidden="true" /> Refresh from template
-                  </button>
+                  {formBuilderTemplateKey.trim() ? (
+                    <button
+                      type="button"
+                      className="btn btn-outline-primary"
+                      onClick={handleRefreshFormFromTemplate}
+                      disabled={!formBuilderSlug}
+                    >
+                      <i className="bi bi-arrow-repeat" aria-hidden="true" /> Refresh from template
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="btn btn-primary"

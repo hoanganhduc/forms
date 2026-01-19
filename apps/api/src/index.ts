@@ -9876,50 +9876,73 @@ export default {
           }
 
           let formId: string | null = null;
-          if (body?.templateKey) {
-            const template = await env.DB.prepare(
-              "SELECT id, schema_json FROM templates WHERE key=? AND deleted_at IS NULL"
-            )
-              .bind(body.templateKey)
-              .first<{ id: string; schema_json: string }>();
-            if (!template) {
+          if (body?.templateKey !== undefined) {
+            if (body.refreshTemplate !== undefined && typeof body.refreshTemplate !== "boolean") {
               return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-                field: "templateKey",
-                message: "template_not_found"
+                field: "refreshTemplate",
+                message: "expected_boolean"
               });
             }
-            let parsedTemplateSchema: unknown = null;
-            try {
-              parsedTemplateSchema = JSON.parse(template.schema_json);
-            } catch (error) {
+            const refreshTemplate = body.refreshTemplate !== undefined ? body.refreshTemplate === true : true;
+            if (body.templateKey === null) {
+              pushOptionalUpdate("template_id", null, true);
+            } else if (typeof body.templateKey === "string") {
+              const templateKey = body.templateKey.trim();
+              if (!templateKey) {
+                pushOptionalUpdate("template_id", null, true);
+              } else {
+                const template = await env.DB.prepare(
+                  "SELECT id, schema_json FROM templates WHERE key=? AND deleted_at IS NULL"
+                )
+                  .bind(templateKey)
+                  .first<{ id: string; schema_json: string }>();
+                if (!template) {
+                  return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                    field: "templateKey",
+                    message: "template_not_found"
+                  });
+                }
+                let parsedTemplateSchema: unknown = null;
+                try {
+                  parsedTemplateSchema = JSON.parse(template.schema_json);
+                } catch (error) {
+                  return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                    field: "templateKey",
+                    message: "invalid_template_schema"
+                  });
+                }
+                const templateRuleError = validateFileRulesFromSchema(parsedTemplateSchema);
+                if (templateRuleError) {
+                  return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                    field: "templateKey",
+                    message: "invalid_file_rules",
+                    detail: templateRuleError
+                  });
+                }
+                pushOptionalUpdate("template_id", template.id, true);
+                if (refreshTemplate) {
+                  const formRow = await env.DB.prepare("SELECT id FROM forms WHERE slug=? AND deleted_at IS NULL")
+                    .bind(slug)
+                    .first<{ id: string }>();
+                  if (!formRow) {
+                    return errorResponse(404, "not_found", requestId, corsHeaders);
+                  }
+                  formId = formRow.id;
+                  await env.DB.prepare(
+                    "UPDATE form_versions SET schema_json=? WHERE form_id=? AND version=1"
+                  )
+                    .bind(template.schema_json, formId)
+                    .run();
+                  const mirroredRules = buildFileRulesJsonFromSchema(template.schema_json);
+                  pushOptionalUpdate("file_rules_json", mirroredRules, true);
+                }
+              }
+            } else {
               return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
                 field: "templateKey",
-                message: "invalid_template_schema"
+                message: "expected_string"
               });
             }
-            const templateRuleError = validateFileRulesFromSchema(parsedTemplateSchema);
-            if (templateRuleError) {
-              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-                field: "templateKey",
-                message: "invalid_file_rules",
-                detail: templateRuleError
-              });
-            }
-            pushOptionalUpdate("template_id", template.id, true);
-            const formRow = await env.DB.prepare("SELECT id FROM forms WHERE slug=? AND deleted_at IS NULL")
-              .bind(slug)
-              .first<{ id: string }>();
-            if (!formRow) {
-              return errorResponse(404, "not_found", requestId, corsHeaders);
-            }
-            formId = formRow.id;
-            await env.DB.prepare(
-              "UPDATE form_versions SET schema_json=? WHERE form_id=? AND version=1"
-            )
-              .bind(template.schema_json, formId)
-              .run();
-            const mirroredRules = buildFileRulesJsonFromSchema(template.schema_json);
-            pushOptionalUpdate("file_rules_json", mirroredRules, true);
           }
 
           if (body?.schema_json && typeof body.schema_json === "string") {
