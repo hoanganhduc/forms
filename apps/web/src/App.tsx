@@ -1,5 +1,5 @@
 import React, { Fragment, useEffect, useMemo, useRef, useState } from "react";
-import { HashRouter, Link, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
+import { HashRouter, Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import { APP_INFO } from "./config";
@@ -57,6 +57,8 @@ const RICH_ALLOWED_TAGS = [
   "h6",
   "hr",
   "i",
+  "img",
+  "input",
   "li",
   "ol",
   "p",
@@ -83,12 +85,31 @@ const RICH_ALLOWED_ATTR = [
   "id",
   "aria-label",
   "aria-hidden",
+  "src",
+  "alt",
+  "width",
+  "height",
+  "type",
+  "checked",
+  "disabled",
   "colspan",
   "rowspan",
   "align"
 ];
 const RICH_FORBID_TAGS = ["style", "script", "iframe", "object", "embed", "svg", "math"];
 const RICH_URI_ALLOWLIST = /^(?:(?:https?|mailto):|\/|#)/i;
+let markedConfigured = false;
+
+function ensureMarkedConfigured() {
+  if (markedConfigured) return;
+  marked.setOptions({ gfm: true, breaks: true });
+  marked.use({
+    renderer: {
+      html: () => ""
+    }
+  });
+  markedConfigured = true;
+}
 
 function sanitizeRichHtml(input: string) {
   return DOMPurify.sanitize(input, {
@@ -106,7 +127,7 @@ function renderRichTextHtml(text: string, markdownEnabled: boolean, inline: bool
     const escaped = escapeHtml(text);
     return inline ? escaped.replace(/\n/g, "<br />") : escaped.replace(/\n/g, "<br />");
   }
-  marked.setOptions({ gfm: true, breaks: true });
+  ensureMarkedConfigured();
   const html = inline ? marked.parseInline(text) : marked.parse(text);
   return sanitizeRichHtml(String(html));
 }
@@ -2907,24 +2928,41 @@ function FormPage({
   }, [fileItems]);
   const isAnyUploading = Object.values(fieldUploading).some(Boolean);
   const submitLabel = "Submit";
-  const isFormComplete = Boolean(
-    form &&
-    form.fields.every((field) => {
+  const completionCheck = useMemo(() => {
+    if (!form) {
+      return { complete: false, reason: "" };
+    }
+    for (const field of form.fields) {
       if (field.type === "file") {
         const files = selectedFiles[field.id] || [];
         const existing = existingFilesByField[field.id] || [];
-        if (field.required && files.length === 0 && existing.length === 0) return false;
-        return true;
+        if (field.required && files.length === 0 && existing.length === 0) {
+          return { complete: false, reason: `Missing required file: ${field.label || field.id}` };
+        }
+        continue;
       }
       const raw = values[field.id] || "";
       const autofillValue = getAutofillValue(field);
       const value = (raw.trim() || autofillValue).trim();
-      if (field.required && !value) return false;
-      if (value && validateFieldValue(field, value)) return false;
-      return true;
-    }) &&
-    hasPassword
-  );
+      if (field.required && !value) {
+        return { complete: false, reason: `Missing required field: ${field.label || field.id}` };
+      }
+      if (value) {
+        const message = validateFieldValue(field, value);
+        if (message) {
+          return {
+            complete: false,
+            reason: `Invalid ${field.label || field.id}: ${message}`
+          };
+        }
+      }
+    }
+    if (!hasPassword) {
+      return { complete: false, reason: "Enter the form password." };
+    }
+    return { complete: true, reason: "" };
+  }, [form, values, selectedFiles, existingFilesByField, hasPassword, user]);
+  const isFormComplete = completionCheck.complete;
   const submitDisabledReason = !canSubmit
     ? "Please sign in to submit."
     : !isOpen
@@ -2933,11 +2971,9 @@ function FormPage({
         ? "Form is locked."
         : isAnyUploading
           ? "Files are uploading."
-          : !hasPassword
-            ? "Enter the form password."
-            : !isFormComplete
-              ? "Complete required fields and select required files."
-              : "";
+          : !isFormComplete
+            ? completionCheck.reason || "Complete required fields and select required files."
+            : "";
   const canvasFieldsPosition = form?.canvas_fields_position || "bottom";
   const canvasCourseTitle =
     form?.canvas_enabled && form?.canvas_course_name ? form.canvas_course_name : null;
@@ -4368,6 +4404,7 @@ function FormPage({
             </button>
           ) : null}
           {savedAt ? <span className="muted">Last saved: {formatTimeICT(savedAt)}</span> : null}
+          {submitDisabledReason ? <span className="muted">{submitDisabledReason}</span> : null}
         </div>
       </form>
     </section>
@@ -13250,6 +13287,7 @@ function AppShell() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<ApiError | null>(null);
   const [user, setUser] = useState<UserInfo | null>(null);
+  const [hasCanvasSubmission, setHasCanvasSubmission] = useState(false);
   const [routeKey, setRouteKey] = useState(0);
   const [toasts, setToasts] = useState<ToastNotice[]>([]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -13277,6 +13315,31 @@ function AppShell() {
 
     loadUser();
   }, [routeKey]);
+
+  useEffect(() => {
+    if (!user) {
+      setHasCanvasSubmission(false);
+      return;
+    }
+    let active = true;
+    async function loadCanvasFlag() {
+      const response = await apiFetch(`${API_BASE}/api/me`);
+      const payload = await response.json().catch(() => null);
+      if (!active) return;
+      if (!response.ok) {
+        setHasCanvasSubmission(false);
+        return;
+      }
+      const canvas = payload?.canvas;
+      setHasCanvasSubmission(Boolean(canvas?.course_id || canvas?.submission_id || canvas?.form_title));
+    }
+    loadCanvasFlag().catch(() => {
+      if (active) setHasCanvasSubmission(false);
+    });
+    return () => {
+      active = false;
+    };
+  }, [user?.userId]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -13504,7 +13567,12 @@ function AppShell() {
   const navLinks: Array<{ to: string; label: string; icon: string; show: boolean }> = [
     { to: "/", label: "Home", icon: "bi-house", show: true },
     { to: "/dashboard", label: "My Dashboard", icon: "bi-speedometer2", show: Boolean(user) },
-    { to: "/canvas", label: "Canvas", icon: "bi-mortarboard", show: Boolean(user && !user.isAdmin) },
+    {
+      to: "/canvas",
+      label: "Canvas",
+      icon: "bi-mortarboard",
+      show: Boolean(user && !user.isAdmin && hasCanvasSubmission)
+    },
     { to: "/trash", label: "Trash", icon: "bi-trash", show: Boolean(user && !user.isAdmin) },
     { to: "/account", label: "Account", icon: "bi-person", show: Boolean(user) }
   ];
@@ -13737,12 +13805,16 @@ function AppShell() {
         <Route
           path="/canvas"
           element={
-            <CanvasPage
-              user={user}
-              onLogin={handleLogin}
-              markdownEnabled={appMarkdownEnabled}
-              mathjaxEnabled={appMathjaxEnabled}
-            />
+            user && !user.isAdmin && hasCanvasSubmission ? (
+              <CanvasPage
+                user={user}
+                onLogin={handleLogin}
+                markdownEnabled={appMarkdownEnabled}
+                mathjaxEnabled={appMathjaxEnabled}
+              />
+            ) : (
+              <Navigate to="/dashboard" replace />
+            )
           }
         />
         <Route
