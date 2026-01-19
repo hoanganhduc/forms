@@ -2337,7 +2337,9 @@ function FormPage({
     lines.push(`<!-- formSlug: ${form.slug} -->`);
     lines.push(`<!-- generatedAt: ${new Date().toISOString()} -->`);
     lines.push("");
-    lines.push("Fill values under each Value: section. Leave empty to skip a field.");
+    lines.push(
+      "Fill values under each Value: section. Example values are placeholders and can be modified or removed."
+    );
     lines.push("");
     (form.fields || [])
       .filter((field) => field.type !== "file")
@@ -2355,7 +2357,25 @@ function FormPage({
           lines.push("Multiple: true");
         }
         lines.push("Value:");
-        lines.push("");
+        if (Array.isArray(field.options) && field.options.length > 0) {
+          lines.push(`Example: ${field.options[0]} (edit as needed)`);
+        } else {
+          const example =
+            typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
+              ? (field as any).placeholder.trim()
+              : field.type === "email"
+                ? "name@example.com"
+                : field.type === "url"
+                  ? "https://example.com"
+                  : field.type === "number"
+                    ? "123"
+                    : field.type === "date"
+                      ? "2024-01-01"
+                      : field.type === "full_name"
+                        ? "Jane Doe"
+                        : "Example text";
+          lines.push(`Example: ${example} (edit as needed)`);
+        }
         lines.push("");
       });
     return lines.join("\n");
@@ -2368,6 +2388,7 @@ function FormPage({
     const lines = text.split(/\r?\n/);
     let currentId: string | null = null;
     let collecting = false;
+    let skipExample = false;
     let buffer: string[] = [];
     const commit = () => {
       if (currentId) {
@@ -2376,6 +2397,7 @@ function FormPage({
       }
       buffer = [];
       collecting = false;
+      skipExample = false;
     };
     for (const line of lines) {
       const headingMatch = line.match(/^##\s+(.+)$/);
@@ -2395,7 +2417,15 @@ function FormPage({
         }
         continue;
       }
+      if (collecting && line.startsWith("Example:")) {
+        skipExample = true;
+        continue;
+      }
       if (collecting) {
+        if (skipExample && !line.trim()) {
+          skipExample = false;
+          continue;
+        }
         buffer.push(line);
       }
     }
@@ -2460,11 +2490,33 @@ function FormPage({
       }));
     const valuesPayload: Record<string, string> = {};
     fields.forEach((field) => {
-      valuesPayload[field.id] = values[field.id] ?? "";
+      const raw = values[field.id];
+      if (raw !== undefined && String(raw).trim()) {
+        valuesPayload[field.id] = raw;
+        return;
+      }
+      const example =
+        typeof (field as any).placeholder === "string" && (field as any).placeholder.trim()
+          ? (field as any).placeholder.trim()
+          : field.type === "email"
+            ? "name@example.com"
+            : field.type === "url"
+              ? "https://example.com"
+              : field.type === "number"
+                ? "123"
+                : field.type === "date"
+                  ? "2024-01-01"
+                  : field.type === "full_name"
+                    ? "Jane Doe"
+                    : Array.isArray((field as any).options) && (field as any).options.length > 0
+                      ? String((field as any).options[0])
+                      : "Example text";
+      valuesPayload[field.id] = example;
     });
     return {
       formSlug: form.slug,
       generatedAt: new Date().toISOString(),
+      note: "Example values below are placeholders and can be modified or removed.",
       fields,
       values: valuesPayload
     };
