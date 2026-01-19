@@ -2,7 +2,7 @@ const TOKEN_KEY = "form_app_token";
 
 export function getToken() {
   try {
-    return sessionStorage.getItem(TOKEN_KEY);
+    return localStorage.getItem(TOKEN_KEY);
   } catch {
     return null;
   }
@@ -10,7 +10,7 @@ export function getToken() {
 
 export function setToken(token: string) {
   try {
-    sessionStorage.setItem(TOKEN_KEY, token);
+    localStorage.setItem(TOKEN_KEY, token);
   } catch {
     // ignore storage failures; cookie auth may still work
   }
@@ -18,7 +18,7 @@ export function setToken(token: string) {
 
 export function clearToken() {
   try {
-    sessionStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(TOKEN_KEY);
   } catch {
     // ignore
   }
