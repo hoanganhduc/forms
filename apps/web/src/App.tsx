@@ -2183,6 +2183,7 @@ function FormPage({
   );
   const [previousSubmissionVisible, setPreviousSubmissionVisible] = useState(false);
   const [markdownImportStatus, setMarkdownImportStatus] = useState<string | null>(null);
+  const [jsonImportStatus, setJsonImportStatus] = useState<string | null>(null);
 
   function getEmailDomain(field: FormField) {
     const rules = (field as any).rules || {};
@@ -2380,6 +2381,20 @@ function FormPage({
     return firstLine ? firstLine.trim() : trimmed;
   }
 
+  function normalizeJsonValue(field: FormField, rawValue: unknown) {
+    if (rawValue == null) return "";
+    if (Array.isArray(rawValue)) {
+      if (field.type === "checkbox") {
+        return rawValue.map((item) => String(item).trim()).filter(Boolean).join(", ");
+      }
+      return rawValue.map((item) => String(item).trim()).filter(Boolean).join("\n");
+    }
+    if (typeof rawValue === "object") {
+      return JSON.stringify(rawValue);
+    }
+    return String(rawValue);
+  }
+
   async function handleImportMarkdown(event: React.ChangeEvent<HTMLInputElement>) {
     setMarkdownImportStatus(null);
     const file = event.target.files?.[0];
@@ -2426,6 +2441,86 @@ function FormPage({
     const link = document.createElement("a");
     link.href = url;
     link.download = `${form.slug}-template.md`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function buildJsonPayload() {
+    if (!form) return null;
+    const fields = (form.fields || [])
+      .filter((field) => field.type !== "file")
+      .map((field) => ({
+        id: field.id,
+        label: field.label,
+        type: field.type
+      }));
+    const valuesPayload: Record<string, string> = {};
+    fields.forEach((field) => {
+      valuesPayload[field.id] = values[field.id] ?? "";
+    });
+    return {
+      formSlug: form.slug,
+      generatedAt: new Date().toISOString(),
+      fields,
+      values: valuesPayload
+    };
+  }
+
+  async function handleImportJson(event: React.ChangeEvent<HTMLInputElement>) {
+    setJsonImportStatus(null);
+    const file = event.target.files?.[0];
+    if (!file || !form) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const valuesPayload =
+        parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.values
+          ? parsed.values
+          : parsed;
+      if (!valuesPayload || typeof valuesPayload !== "object" || Array.isArray(valuesPayload)) {
+        setJsonImportStatus("JSON must be an object of field values.");
+        return;
+      }
+      if (parsed && typeof parsed === "object" && parsed.formSlug && parsed.formSlug !== form.slug) {
+        onNotice("JSON payload is for a different form.", "warning");
+      }
+      const nextValues: Record<string, string> = {};
+      const unknownFields: string[] = [];
+      for (const [fieldId, value] of Object.entries(valuesPayload)) {
+        const field = form.fields.find((item) => item.id === fieldId);
+        if (!field) {
+          unknownFields.push(fieldId);
+          continue;
+        }
+        const normalized = normalizeJsonValue(field, value);
+        nextValues[fieldId] = normalizeImportedValue(field, normalized);
+      }
+      setValues((prev) => ({ ...prev, ...nextValues }));
+      Object.entries(nextValues).forEach(([fieldId, value]) => {
+        const field = form.fields.find((item) => item.id === fieldId);
+        if (!field) return;
+        updateFieldError(field, value);
+      });
+      setJsonImportStatus(
+        unknownFields.length > 0
+          ? `Imported values. Unknown fields ignored: ${unknownFields.join(", ")}.`
+          : "Imported values from JSON."
+      );
+    } catch (error) {
+      setJsonImportStatus("Failed to import JSON.");
+    } finally {
+      event.target.value = "";
+    }
+  }
+
+  function handleDownloadJson() {
+    const payload = buildJsonPayload();
+    if (!payload || !form) return;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${form.slug}-values.json`;
     link.click();
     URL.revokeObjectURL(url);
   }
@@ -4249,6 +4344,31 @@ function FormPage({
             </div>
           </div>
           {markdownImportStatus ? <div className="muted mt-2">{markdownImportStatus}</div> : null}
+        </div>
+      ) : null}
+      {form ? (
+        <div className="panel panel--inline">
+          <div className="d-flex flex-wrap align-items-center justify-content-between gap-2">
+            <div>
+              <div className="fw-semibold">JSON import/export</div>
+              <div className="muted">Export current values or import a JSON payload to fill the form.</div>
+            </div>
+            <div className="d-flex flex-wrap gap-2 align-items-center">
+              <button type="button" className="btn btn-outline-secondary btn-sm" onClick={handleDownloadJson}>
+                <i className="bi bi-download" aria-hidden="true" /> Export JSON
+              </button>
+              <label className="btn btn-outline-secondary btn-sm mb-0">
+                <i className="bi bi-upload" aria-hidden="true" /> Import JSON
+                <input
+                  type="file"
+                  accept="application/json,.json"
+                  onChange={handleImportJson}
+                  style={{ display: "none" }}
+                />
+              </label>
+            </div>
+          </div>
+          {jsonImportStatus ? <div className="muted mt-2">{jsonImportStatus}</div> : null}
         </div>
       ) : null}
 
