@@ -932,6 +932,7 @@ type FieldBuilderConfig = {
   multiple: boolean;
   textareaMarkdownEnabled: boolean;
   textareaMathjaxEnabled: boolean;
+  textareaRows: number;
   emailDomain: string;
   autofillFromLogin: boolean;
   dateTimezone: string;
@@ -1014,6 +1015,9 @@ function buildFieldPayload(config: FieldBuilderConfig) {
     }
     if (config.textareaMathjaxEnabled) {
       rules.mathjaxEnabled = true;
+    }
+    if (Number.isFinite(config.textareaRows) && config.textareaRows > 0) {
+      rules.rows = Math.max(1, Math.round(config.textareaRows));
     }
     if (Object.keys(rules).length > 0) {
       field.rules = rules;
@@ -1196,6 +1200,7 @@ function FieldBuilderPanel({
   builderMultiple,
   builderTextareaMarkdownEnabled,
   builderTextareaMathjaxEnabled,
+  builderTextareaRows,
   builderEmailDomain,
   builderAutofillFromLogin,
   builderDateTimezone,
@@ -1214,6 +1219,7 @@ function FieldBuilderPanel({
   onMultipleChange,
   onTextareaMarkdownEnabledChange,
   onTextareaMathjaxEnabledChange,
+  onTextareaRowsChange,
   onEmailDomainChange,
   onAutofillFromLoginChange,
   onDateTimezoneChange,
@@ -1239,6 +1245,7 @@ function FieldBuilderPanel({
   builderMultiple: boolean;
   builderTextareaMarkdownEnabled: boolean;
   builderTextareaMathjaxEnabled: boolean;
+  builderTextareaRows: number;
   builderEmailDomain: string;
   builderAutofillFromLogin: boolean;
   builderDateTimezone: string;
@@ -1257,6 +1264,7 @@ function FieldBuilderPanel({
   onMultipleChange: (value: boolean) => void;
   onTextareaMarkdownEnabledChange: (value: boolean) => void;
   onTextareaMathjaxEnabledChange: (value: boolean) => void;
+  onTextareaRowsChange: (value: number) => void;
   onEmailDomainChange: (value: string) => void;
   onAutofillFromLoginChange: (value: boolean) => void;
   onDateTimezoneChange: (value: string) => void;
@@ -1423,6 +1431,17 @@ function FieldBuilderPanel({
               <label className="form-check-label" htmlFor={`${idPrefix}-textarea-mathjax`}>
                 Allow MathJax input
               </label>
+            </div>
+            <div className="mt-2">
+              <label className="form-label">Textarea rows</label>
+              <input
+                type="number"
+                className="form-control"
+                min={1}
+                value={builderTextareaRows}
+                onChange={(event) => onTextareaRowsChange(Math.max(1, parseInt(event.target.value, 10) || 1))}
+              />
+              <div className="muted mt-1">Fixed number of visible lines for this textarea.</div>
             </div>
             <div className="muted mt-2">
               Preview is shown to the user when enabled and the app settings allow it.
@@ -3375,7 +3394,11 @@ function FormPage({
       const value = values[field.id] || "";
       const activePlaceholder = value ? "" : placeholder;
       const placeholderLines = placeholder ? placeholder.split(/\r?\n/).length : 0;
-      const textareaRows = Math.max(3, placeholderLines || 3);
+      const fixedRows =
+        typeof (rules as any).rows === "number" && Number.isFinite((rules as any).rows)
+          ? Math.max(1, Math.round((rules as any).rows))
+          : null;
+      const textareaRows = fixedRows ?? Math.max(3, placeholderLines || 3);
       return (
         <label key={field.id} className="field">
           {renderFieldLabel(field)}
@@ -10525,6 +10548,7 @@ function BuilderPage({
   const [builderMultiple, setBuilderMultiple] = useState(false);
   const [builderTextareaMarkdownEnabled, setBuilderTextareaMarkdownEnabled] = useState(false);
   const [builderTextareaMathjaxEnabled, setBuilderTextareaMathjaxEnabled] = useState(false);
+  const [builderTextareaRows, setBuilderTextareaRows] = useState(4);
   const [builderEmailDomain, setBuilderEmailDomain] = useState("");
   const [builderDateTimezone, setBuilderDateTimezone] = useState(getAppDefaultTimezone());
   const [builderDateMode, setBuilderDateMode] = useState("datetime");
@@ -10577,6 +10601,7 @@ function BuilderPage({
   const [formFieldMultiple, setFormFieldMultiple] = useState(false);
   const [formFieldTextareaMarkdownEnabled, setFormFieldTextareaMarkdownEnabled] = useState(false);
   const [formFieldTextareaMathjaxEnabled, setFormFieldTextareaMathjaxEnabled] = useState(false);
+  const [formFieldTextareaRows, setFormFieldTextareaRows] = useState(4);
   const [formEmailDomain, setFormEmailDomain] = useState("");
   const [formDateTimezone, setFormDateTimezone] = useState(getAppDefaultTimezone());
   const [formDateMode, setFormDateMode] = useState("datetime");
@@ -11014,6 +11039,7 @@ function BuilderPage({
       multiple: builderMultiple,
       textareaMarkdownEnabled: builderTextareaMarkdownEnabled,
       textareaMathjaxEnabled: builderTextareaMathjaxEnabled,
+      textareaRows: builderTextareaRows,
       emailDomain: builderEmailDomain,
       autofillFromLogin: builderAutofillFromLogin,
       dateTimezone: builderDateTimezone,
@@ -11037,6 +11063,7 @@ function BuilderPage({
     setBuilderMultiple(false);
     setBuilderTextareaMarkdownEnabled(false);
     setBuilderTextareaMathjaxEnabled(false);
+    setBuilderTextareaRows(4);
     setBuilderEmailDomain("");
     setBuilderAutofillFromLogin(false);
     setBuilderDateTimezone(getAppDefaultTimezone());
@@ -11106,6 +11133,9 @@ function BuilderPage({
     setBuilderMultiple(Boolean((field as any).multiple));
     setBuilderTextareaMarkdownEnabled(type === "textarea" ? Boolean(rules.markdownEnabled) : false);
     setBuilderTextareaMathjaxEnabled(type === "textarea" ? Boolean(rules.mathjaxEnabled) : false);
+    setBuilderTextareaRows(
+      type === "textarea" && typeof rules.rows === "number" ? Math.max(1, Math.round(rules.rows)) : 4
+    );
     setBuilderEmailDomain(type === "email" ? String(domain) : "");
     setBuilderAutofillFromLogin(
       type === "email" || type === "github_username" ? Boolean(rules.autofill) : false
@@ -11134,6 +11164,7 @@ function BuilderPage({
       multiple: builderMultiple,
       textareaMarkdownEnabled: builderTextareaMarkdownEnabled,
       textareaMathjaxEnabled: builderTextareaMathjaxEnabled,
+      textareaRows: builderTextareaRows,
       emailDomain: builderEmailDomain,
       autofillFromLogin: builderAutofillFromLogin,
       dateTimezone: builderDateTimezone,
@@ -11633,6 +11664,7 @@ function BuilderPage({
       multiple: formFieldMultiple,
       textareaMarkdownEnabled: formFieldTextareaMarkdownEnabled,
       textareaMathjaxEnabled: formFieldTextareaMathjaxEnabled,
+      textareaRows: formFieldTextareaRows,
       emailDomain: formEmailDomain,
       autofillFromLogin: formAutofillFromLogin,
       dateTimezone: formDateTimezone,
@@ -11656,6 +11688,7 @@ function BuilderPage({
     setFormFieldMultiple(false);
     setFormFieldTextareaMarkdownEnabled(false);
     setFormFieldTextareaMathjaxEnabled(false);
+    setFormFieldTextareaRows(4);
     setFormEmailDomain("");
     setFormAutofillFromLogin(false);
     setFormDateTimezone(getAppDefaultTimezone());
@@ -11725,6 +11758,9 @@ function BuilderPage({
     setFormFieldMultiple(Boolean((field as any).multiple));
     setFormFieldTextareaMarkdownEnabled(type === "textarea" ? Boolean(rules.markdownEnabled) : false);
     setFormFieldTextareaMathjaxEnabled(type === "textarea" ? Boolean(rules.mathjaxEnabled) : false);
+    setFormFieldTextareaRows(
+      type === "textarea" && typeof rules.rows === "number" ? Math.max(1, Math.round(rules.rows)) : 4
+    );
     setFormEmailDomain(type === "email" ? String(domain) : "");
     setFormAutofillFromLogin(
       type === "email" || type === "github_username" ? Boolean(rules.autofill) : false
@@ -11753,6 +11789,7 @@ function BuilderPage({
       multiple: formFieldMultiple,
       textareaMarkdownEnabled: formFieldTextareaMarkdownEnabled,
       textareaMathjaxEnabled: formFieldTextareaMathjaxEnabled,
+      textareaRows: formFieldTextareaRows,
       emailDomain: formEmailDomain,
       autofillFromLogin: formAutofillFromLogin,
       dateTimezone: formDateTimezone,
@@ -12859,6 +12896,7 @@ function BuilderPage({
                       builderMultiple={formFieldMultiple}
                       builderTextareaMarkdownEnabled={formFieldTextareaMarkdownEnabled}
                       builderTextareaMathjaxEnabled={formFieldTextareaMathjaxEnabled}
+                      builderTextareaRows={formFieldTextareaRows}
                       builderEmailDomain={formEmailDomain}
                       builderAutofillFromLogin={formAutofillFromLogin}
                       builderDateTimezone={formDateTimezone}
@@ -12877,6 +12915,7 @@ function BuilderPage({
                       onMultipleChange={setFormFieldMultiple}
                       onTextareaMarkdownEnabledChange={setFormFieldTextareaMarkdownEnabled}
                       onTextareaMathjaxEnabledChange={setFormFieldTextareaMathjaxEnabled}
+                      onTextareaRowsChange={setFormFieldTextareaRows}
                       onEmailDomainChange={setFormEmailDomain}
                       onAutofillFromLoginChange={setFormAutofillFromLogin}
                       onDateTimezoneChange={setFormDateTimezone}
@@ -13313,6 +13352,7 @@ function BuilderPage({
                   builderMultiple={builderMultiple}
                   builderTextareaMarkdownEnabled={builderTextareaMarkdownEnabled}
                   builderTextareaMathjaxEnabled={builderTextareaMathjaxEnabled}
+                  builderTextareaRows={builderTextareaRows}
                   builderEmailDomain={builderEmailDomain}
                   builderAutofillFromLogin={builderAutofillFromLogin}
                   builderDateTimezone={builderDateTimezone}
@@ -13331,6 +13371,7 @@ function BuilderPage({
                   onMultipleChange={setBuilderMultiple}
                   onTextareaMarkdownEnabledChange={setBuilderTextareaMarkdownEnabled}
                   onTextareaMathjaxEnabledChange={setBuilderTextareaMathjaxEnabled}
+                  onTextareaRowsChange={setBuilderTextareaRows}
                   onEmailDomainChange={setBuilderEmailDomain}
                   onAutofillFromLoginChange={setBuilderAutofillFromLogin}
                   onDateTimezoneChange={setBuilderDateTimezone}
