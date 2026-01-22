@@ -7996,6 +7996,7 @@ export default {
           password_required: toBoolean(row.password_required ?? 0),
           password_require_access: toBoolean(row.password_require_access ?? 0),
           password_require_submit: toBoolean(row.password_require_submit ?? 0),
+          save_all_versions: toBoolean(row.save_all_versions ?? 0),
           reminder_enabled: toBoolean((row as any).reminder_enabled ?? 0),
           reminder_frequency: (row as any).reminder_frequency ?? null,
           reminder_until: (row as any).reminder_until ?? null
@@ -9167,6 +9168,7 @@ export default {
           reminderEnabled?: boolean;
           reminderFrequency?: string;
           reminderUntil?: string | null;
+          saveAllVersions?: boolean | number;
         } | null = null;
         try {
           body = await parseJsonBody(request);
@@ -9195,6 +9197,18 @@ export default {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             missing: ["templateKey", "schema_json"]
           });
+        }
+
+        if (body?.saveAllVersions !== undefined) {
+          const val = body.saveAllVersions;
+          const isBool = typeof val === "boolean";
+          const isNum = typeof val === "number" && (val === 0 || val === 1);
+          if (!isBool && !isNum) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "saveAllVersions",
+              message: "expected_boolean_or_0_1"
+            });
+          }
         }
 
         const authPolicy = body.auth_policy ?? "optional";
@@ -9451,6 +9465,7 @@ export default {
           { name: "password_require_submit", value: passwordRequireSubmit ? 1 : 0 },
           { name: "password_salt", value: passwordSalt },
           { name: "password_hash", value: passwordHash },
+          { name: "save_all_versions", value: body?.saveAllVersions ? 1 : 0 },
           { name: "reminder_enabled", value: body.reminderEnabled ? 1 : 0 },
           { name: "reminder_frequency", value: body.reminderFrequency || "weekly" },
           { name: "reminder_until", value: body.reminderUntil || null }
@@ -12314,7 +12329,7 @@ export default {
         ? "f.reminder_until as reminder_until"
         : "NULL as reminder_until";
       const submission = await env.DB.prepare(
-        `SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect} FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL`
+        `SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect} FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL`
       )
         .bind(submissionId)
         .first<{
@@ -12336,6 +12351,7 @@ export default {
           is_locked: number;
           is_public: number;
           auth_policy: string | null;
+          save_all_versions: number | null;
           reminder_enabled: number | null;
           reminder_frequency: string | null;
           reminder_until: string | null;
@@ -12410,6 +12426,7 @@ export default {
               is_locked: toBoolean(submission.is_locked),
               is_public: toBoolean(submission.is_public),
               auth_policy: submission.auth_policy ?? "optional",
+              save_all_versions: toBoolean(submission.save_all_versions ?? 0),
               reminder_enabled: toBoolean(submission.reminder_enabled ?? 0),
               reminder_frequency: submission.reminder_frequency ?? null,
               reminder_until: submission.reminder_until ?? null
@@ -12821,6 +12838,9 @@ export default {
       // Handle specific version number request
       if (versionParam !== "latest" && /^\d+$/.test(versionParam)) {
         const requestedVersion = parseInt(versionParam, 10);
+        if (!toBoolean(form.save_all_versions ?? 0)) {
+          return errorResponse(400, "versioning_not_enabled", requestId, corsHeaders);
+        }
 
         const version = await env.DB.prepare(
           "SELECT v.id, v.payload_json, v.version_number, v.created_at FROM submission_versions v WHERE v.submission_id=? AND v.version_number=?"
@@ -12905,6 +12925,10 @@ export default {
         return errorResponse(403, "forbidden", requestId, corsHeaders);
       }
 
+      if (!toBoolean(submission.save_all_versions ?? 0)) {
+        return errorResponse(400, "versioning_not_enabled", requestId, corsHeaders);
+      }
+
       const { results: versions } = await env.DB.prepare(
         "SELECT id, version_number, created_at, created_by FROM submission_versions WHERE submission_id=? ORDER BY version_number DESC"
       )
@@ -12938,6 +12962,10 @@ export default {
       // Verify user owns this submission
       if (submission.user_id !== authPayload.userId) {
         return errorResponse(403, "forbidden", requestId, corsHeaders);
+      }
+
+      if (!toBoolean(submission.save_all_versions ?? 0)) {
+        return errorResponse(400, "versioning_not_enabled", requestId, corsHeaders);
       }
 
       const version = await env.DB.prepare(
@@ -13204,7 +13232,9 @@ export default {
             submissionId = existing.id;
             updated = true;
 
-            await saveSubmissionVersion(env, submissionId, form.id, userId, userId);
+            if (toBoolean(form.save_all_versions ?? 0)) {
+              await saveSubmissionVersion(env, submissionId, form.id, userId, userId);
+            }
 
             await env.DB.prepare(
               "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), submitter_provider=?, submitter_email=?, submitter_github_username=?, canvas_course_id=? WHERE id=?"
@@ -14269,7 +14299,7 @@ export default {
       const isResubmission = Boolean(existingSubmissionId);
 
       if (existingSubmissionId) {
-        if (userId) {
+        if (userId && toBoolean(form.save_all_versions ?? 0)) {
           await saveSubmissionVersion(env, submissionId, form.id, userId, userId);
         }
 

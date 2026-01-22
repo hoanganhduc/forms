@@ -359,9 +359,11 @@ function TimezoneSelect({
 
 function VersionSelector({
   submissionId,
+  saveAllVersions,
   onVersionChange,
 }: {
   submissionId: string | null;
+  saveAllVersions: boolean;
   onVersionChange: (version: string) => void;
 }) {
   const [versions, setVersions] = useState<any[]>([]);
@@ -369,7 +371,7 @@ function VersionSelector({
   const [selectedVersion, setSelectedVersion] = useState<string>("none");
 
   useEffect(() => {
-    if (!submissionId) {
+    if (!saveAllVersions || !submissionId) {
       setVersions([]);
       return;
     }
@@ -398,9 +400,9 @@ function VersionSelector({
     return () => {
       active = false;
     };
-  }, [submissionId]);
+  }, [submissionId, saveAllVersions]);
 
-  if (versions.length === 0) {
+  if (!saveAllVersions || versions.length === 0) {
     return null;
   }
 
@@ -410,33 +412,26 @@ function VersionSelector({
   }
 
   return (
-    <div className="panel panel--compact mb-3">
-      <div className="panel-header">
-        <h4 className="mb-0">
-          <i className="bi bi-clock-history" aria-hidden="true" /> Load Previous Version
-        </h4>
-      </div>
-      <div className="form-group">
-        <label htmlFor="version-selector">
-          Select which version to load (or start with blank form):
-        </label>
-        <select
-          id="version-selector"
-          className="form-control"
-          value={selectedVersion}
-          onChange={(e) => handleChange(e.target.value)}
-          disabled={loading}
-        >
-          <option value="none">Start with blank form</option>
-          <option value="latest">Use latest submission</option>
-          {versions.map((v) => (
+    <div className="form-group">
+      <label htmlFor="version-selector">
+        Load previous version (or start with blank form):
+      </label>
+      <select
+        id="version-selector"
+        className="form-control"
+        value={selectedVersion}
+        onChange={(e) => handleChange(e.target.value)}
+        disabled={loading}
+      >
+        <option value="none">Start with blank form</option>
+        <option value="latest">Use latest submission</option>
+        {versions.map((v) => (
             <option key={v.version_number} value={String(v.version_number)}>
-              Version {v.version_number} (created {new Date(v.created_at).toLocaleString()})
+              Version {v.version_number} (submitted {v.created_at ? formatTimeICT(v.created_at) : "n/a"})
             </option>
-          ))}
-        </select>
-        {loading && <small className="text-muted">Loading versions...</small>}
-      </div>
+        ))}
+      </select>
+      {loading && <small className="text-muted">Loading versions...</small>}
     </div>
   );
 }
@@ -4547,13 +4542,6 @@ function FormPage({
       ) : null}
 
       {previousSubmissionVisible && previousSubmission ? (
-        <VersionSelector
-          submissionId={submissionId}
-          onVersionChange={handleVersionChange}
-        />
-      ) : null}
-
-      {previousSubmissionVisible && previousSubmission ? (
         <div className="panel panel--inline">
           <div className="d-flex flex-wrap align-items-center justify-content-between gap-2">
             <div>
@@ -4563,43 +4551,22 @@ function FormPage({
               ) : null}
             </div>
             <div className="d-flex flex-wrap gap-2">
-              <button
-                type="button"
-                className="btn btn-outline-secondary btn-sm"
-                onClick={() => {
-                  setValues(previousSubmission.values);
-                  Object.entries(previousSubmission.values).forEach(([fieldId, value]) => {
-                    const field = form?.fields.find((item) => item.id === fieldId);
-                    if (field) updateFieldError(field, value);
-                  });
-                  setPreviousSubmissionVisible(false);
-                }}
-              >
-                <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Use previous submission
-              </button>
-              <button
-                type="button"
-                className="btn btn-outline-secondary btn-sm"
-                onClick={() => {
-                  const currentValues = values;
-                  const next = { ...currentValues };
-                  Object.entries(previousSubmission.values).forEach(([fieldId, value]) => {
-                    if (!String(currentValues[fieldId] || "").trim()) {
-                      next[fieldId] = value;
-                    }
-                  });
-                  setValues(next);
-                  Object.entries(previousSubmission.values).forEach(([fieldId, value]) => {
-                    if (!String(currentValues[fieldId] || "").trim()) {
+              {!Boolean((form as any)?.save_all_versions) ? (
+                <button
+                  type="button"
+                  className="btn btn-outline-secondary btn-sm"
+                  onClick={() => {
+                    setValues(previousSubmission.values);
+                    Object.entries(previousSubmission.values).forEach(([fieldId, value]) => {
                       const field = form?.fields.find((item) => item.id === fieldId);
                       if (field) updateFieldError(field, value);
-                    }
-                  });
-                  setPreviousSubmissionVisible(false);
-                }}
-              >
-                <i className="bi bi-arrow-down" aria-hidden="true" /> Fill empty fields
-              </button>
+                    });
+                    setPreviousSubmissionVisible(false);
+                  }}
+                >
+                  <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Use previous submission
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="btn btn-outline-danger btn-sm"
@@ -4609,6 +4576,15 @@ function FormPage({
               </button>
             </div>
           </div>
+          {Boolean((form as any)?.save_all_versions) ? (
+            <div className="mt-3">
+              <VersionSelector
+                submissionId={submissionId}
+                saveAllVersions={Boolean((form as any)?.save_all_versions)}
+                onVersionChange={handleVersionChange}
+              />
+            </div>
+          ) : null}
         </div>
       ) : null}
 
@@ -5863,6 +5839,14 @@ function SubmissionDetailPage({
   const [fieldOrder, setFieldOrder] = useState<string[]>([]);
   const [showSubmitNotice, setShowSubmitNotice] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [versionList, setVersionList] = useState<any[]>([]);
+  const [versionListLoading, setVersionListLoading] = useState(false);
+  const [versionView, setVersionView] = useState<{
+    selected: string;
+    data: Record<string, unknown> | null;
+    createdAt: string | null;
+  }>({ selected: "latest", data: null, createdAt: null });
+  const [versionError, setVersionError] = useState<string | null>(null);
   const renderLabel = (label: string) => (
     <RichText
       text={label}
@@ -5883,6 +5867,75 @@ function SubmissionDetailPage({
       ? `Reminder: resubmit ${freqText} until ${untilText}.`
       : `Reminder: resubmit ${freqText}.`;
   }, [data]);
+
+  const renderSubmissionDataTable = (dataObject: Record<string, unknown>) => {
+    const orderedKeys = fieldOrder.filter(
+      (key) => key in dataObject && fieldMeta[key]?.type !== "file"
+    );
+    const remainingKeys = Object.keys(dataObject).filter(
+      (key) =>
+        !orderedKeys.includes(key) &&
+        !key.endsWith("__tz") &&
+        fieldMeta[key]?.type !== "file"
+    );
+    const allKeys = [...orderedKeys, ...remainingKeys];
+    if (allKeys.length === 0) {
+      return (
+        <tr>
+          <td className="muted">No data</td>
+        </tr>
+      );
+    }
+    return allKeys.map((key) => {
+      const meta = fieldMeta[key];
+      const raw = dataObject[key];
+      if (meta?.type === "date" && typeof raw === "string") {
+        const rules = meta.rules || {};
+        const mode =
+          typeof rules.mode === "string" && rules.mode.trim()
+            ? rules.mode.trim()
+            : "datetime";
+        const showTimezone = rules.timezoneOptional !== true;
+        const tzKey = `${key}__tz`;
+        const tzValue =
+          typeof dataObject[tzKey] === "string" && String(dataObject[tzKey]).trim()
+            ? String(dataObject[tzKey])
+            : typeof rules.timezoneDefault === "string"
+              ? String(rules.timezoneDefault)
+              : getAppDefaultTimezone();
+        const displayValue = raw.endsWith("Z")
+          ? mode === "time"
+            ? utcToLocalTimeOnly(raw, tzValue)
+            : mode === "date"
+              ? utcToLocalDateOnly(raw, tzValue)
+              : utcToLocalDateTime(raw, tzValue)
+          : raw;
+        return (
+          <tr key={key}>
+            <th className="text-nowrap">{renderLabel(meta?.label || key)}</th>
+            <td className="text-break">
+              <div>{renderValue(displayValue || "n/a")}</div>
+              {showTimezone && tzValue ? (
+                <div className="muted">Timezone: {tzValue}</div>
+              ) : null}
+            </td>
+          </tr>
+        );
+      }
+      return (
+        <tr key={key}>
+          <th className="text-nowrap">{renderLabel(meta?.label || key)}</th>
+          <td className="text-break">
+            {typeof raw === "string"
+              ? renderValue(raw)
+              : typeof raw === "number" || typeof raw === "boolean"
+                ? String(raw)
+                : JSON.stringify(raw)}
+          </td>
+        </tr>
+      );
+    });
+  };
 
   useEffect(() => {
     if (!user || !id) {
@@ -5913,6 +5966,69 @@ function SubmissionDetailPage({
       active = false;
     };
   }, [user, id]);
+
+  useEffect(() => {
+    if (!data?.submissionId || !data?.form?.save_all_versions) {
+      setVersionList([]);
+      setVersionListLoading(false);
+      setVersionView({ selected: "latest", data: null, createdAt: null });
+      setVersionError(null);
+      return;
+    }
+    let active = true;
+    async function loadVersions() {
+      setVersionListLoading(true);
+      setVersionError(null);
+      try {
+        const response = await apiFetch(
+          `${API_BASE}/api/me/submissions/${encodeURIComponent(data.submissionId)}/versions`
+        );
+        const payload = await response.json().catch(() => null);
+        if (!active) return;
+        if (!response.ok) {
+          setVersionError(payload?.error || "Failed to load versions.");
+          setVersionList([]);
+          return;
+        }
+        setVersionList(Array.isArray(payload?.versions) ? payload.versions : []);
+      } catch (error) {
+        if (!active) return;
+        setVersionError(error instanceof Error ? error.message : "Failed to load versions.");
+        setVersionList([]);
+      } finally {
+        if (active) setVersionListLoading(false);
+      }
+    }
+    loadVersions();
+    return () => {
+      active = false;
+    };
+  }, [data?.submissionId, data?.form?.save_all_versions]);
+
+  async function handleVersionViewChange(value: string) {
+    setVersionView({ selected: value, data: null, createdAt: null });
+    setVersionError(null);
+    if (value === "latest") {
+      return;
+    }
+    if (!data?.submissionId) {
+      return;
+    }
+    const response = await apiFetch(
+      `${API_BASE}/api/me/submissions/${encodeURIComponent(data.submissionId)}/versions/${encodeURIComponent(value)}`
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setVersionError(payload?.error || "Failed to load version.");
+      return;
+    }
+    const versionData = payload?.data ?? payload?.version?.data ?? null;
+    setVersionView({
+      selected: value,
+      data: versionData && typeof versionData === "object" ? versionData : null,
+      createdAt: payload?.version?.created_at || payload?.createdAt || null
+    });
+  }
 
   async function handleDeleteSubmission() {
     if (!data?.form?.slug) return;
@@ -6134,87 +6250,55 @@ function SubmissionDetailPage({
               Please update your Canvas display name to match your submitted full name.
             </div>
           ) : null}
+          {data.form?.save_all_versions ? (
+            <div className="mt-3">
+              <div className="muted mb-2">Version viewer</div>
+              <div className="form-group">
+                <label htmlFor="submission-version-viewer">Select version to view:</label>
+                <select
+                  id="submission-version-viewer"
+                  className="form-control"
+                  value={versionView.selected}
+                  onChange={(event) => handleVersionViewChange(event.target.value)}
+                  disabled={versionListLoading || versionList.length === 0}
+                >
+                  <option value="latest">Latest submission</option>
+                  {versionList.map((v) => (
+                    <option key={v.version_number} value={String(v.version_number)}>
+                      Version {v.version_number} (submitted {v.created_at ? formatTimeICT(v.created_at) : "n/a"})
+                    </option>
+                  ))}
+                </select>
+                {versionListLoading ? <small className="text-muted">Loading versions...</small> : null}
+                {!versionListLoading && versionList.length === 0 ? (
+                  <small className="text-muted">No previous versions yet.</small>
+                ) : null}
+                {versionError ? <div className="alert alert-warning mt-2">{versionError}</div> : null}
+              </div>
+            </div>
+          ) : null}
           <div className="mt-3">
             <div className="muted mb-2">Data</div>
-            {data.data_json && typeof data.data_json === "object" ? (
-              <div className="table-responsive">
-                <table className="table table-sm">
-                  <tbody>
-                    {(() => {
-                      const dataObject = data.data_json as Record<string, unknown>;
-                      const orderedKeys = fieldOrder.filter(
-                        (key) => key in dataObject && fieldMeta[key]?.type !== "file"
-                      );
-                      const remainingKeys = Object.keys(dataObject).filter(
-                        (key) =>
-                          !orderedKeys.includes(key) &&
-                          !key.endsWith("__tz") &&
-                          fieldMeta[key]?.type !== "file"
-                      );
-                      const allKeys = [...orderedKeys, ...remainingKeys];
-                      if (allKeys.length === 0) {
-                        return (
-                          <tr>
-                            <td className="muted">No data</td>
-                          </tr>
-                        );
-                      }
-                      return allKeys.map((key) => {
-                        const meta = fieldMeta[key];
-                        const raw = dataObject[key];
-                        if (meta?.type === "date" && typeof raw === "string") {
-                          const rules = meta.rules || {};
-                          const mode =
-                            typeof rules.mode === "string" && rules.mode.trim()
-                              ? rules.mode.trim()
-                              : "datetime";
-                          const showTimezone = rules.timezoneOptional !== true;
-                          const tzKey = `${key}__tz`;
-                          const tzValue =
-                            typeof dataObject[tzKey] === "string" && String(dataObject[tzKey]).trim()
-                              ? String(dataObject[tzKey])
-                              : typeof rules.timezoneDefault === "string"
-                                ? String(rules.timezoneDefault)
-                                : getAppDefaultTimezone();
-                          const displayValue = raw.endsWith("Z")
-                            ? mode === "time"
-                              ? utcToLocalTimeOnly(raw, tzValue)
-                              : mode === "date"
-                                ? utcToLocalDateOnly(raw, tzValue)
-                                : utcToLocalDateTime(raw, tzValue)
-                            : raw;
-                          return (
-                            <tr key={key}>
-                              <th className="text-nowrap">{renderLabel(meta?.label || key)}</th>
-                              <td className="text-break">
-                                <div>{renderValue(displayValue || "n/a")}</div>
-                                {showTimezone && tzValue ? (
-                                  <div className="muted">Timezone: {tzValue}</div>
-                                ) : null}
-                              </td>
-                            </tr>
-                          );
-                        }
-                        return (
-                          <tr key={key}>
-                            <th className="text-nowrap">{renderLabel(meta?.label || key)}</th>
-                            <td className="text-break">
-                              {typeof raw === "string"
-                                ? renderValue(raw)
-                                : typeof raw === "number" || typeof raw === "boolean"
-                                  ? String(raw)
-                                  : JSON.stringify(raw)}
-                            </td>
-                          </tr>
-                        );
-                      });
-                    })()}
-                  </tbody>
-                </table>
-              </div>
-            ) : (
-              <div className="muted">No data</div>
-            )}
+            {(() => {
+              const selectedIsLatest = versionView.selected === "latest" || !data.form?.save_all_versions;
+              const selectedData = selectedIsLatest
+                ? (data.data_json as Record<string, unknown> | null)
+                : versionView.data;
+              return selectedData && typeof selectedData === "object" ? (
+                <div className="table-responsive">
+                  <table className="table table-sm">
+                    <tbody>
+                      {renderSubmissionDataTable(selectedData as Record<string, unknown>)}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="muted">No data</div>
+              );
+            })()}
+            {data.form?.save_all_versions && versionView.selected !== "latest" && versionView.createdAt ? (
+              <div className="muted mt-1">Version submitted: {formatTimeICT(versionView.createdAt)}</div>
+            ) : null}
           </div>
           <div className="mt-3">
             <div className="muted mb-2">Files</div>
@@ -10863,6 +10947,7 @@ function BuilderPage({
   const [formCreateReminderValue, setFormCreateReminderValue] = useState(1);
   const [formCreateReminderUnit, setFormCreateReminderUnit] = useState("weeks");
   const [formCreateReminderUntil, setFormCreateReminderUntil] = useState("");
+  const [formCreateSaveAllVersions, setFormCreateSaveAllVersions] = useState(false);
 
   const prevDefaultTimezoneRef = useRef(appDefaultTimezone);
   useEffect(() => {
@@ -12148,6 +12233,7 @@ function BuilderPage({
           ? { canvasAllowedSectionIds: createCanvasAllowedSectionIds }
           : {}),
         canvasFieldsPosition: formCreateCanvasPosition,
+        saveAllVersions: formCreateSaveAllVersions,
         reminderEnabled: formCreateReminderEnabled,
         reminderFrequency: `${formCreateReminderValue}:${formCreateReminderUnit}`,
         reminderUntil: localInputToUtcWithZone(formCreateReminderUntil, formCreateAvailabilityTimezone) || null
@@ -12425,6 +12511,7 @@ function BuilderPage({
                     setFormCreateCanvasAllowedSections(null);
                     setFormCreateCanvasPosition("bottom");
                     setFormCreateAvailabilityTimezone(getAppDefaultTimezone());
+                    setFormCreateSaveAllVersions(false);
                     setFormDateShowTimezone(true);
                   }}
                 >
@@ -12565,6 +12652,21 @@ function BuilderPage({
                       id="formCreateLocked"
                     />
                     <label className="form-check-label" htmlFor="formCreateLocked">
+                      Yes
+                    </label>
+                  </div>
+                </div>
+                <div className="col-md-3">
+                  <label className="form-label">Save Versions</label>
+                  <div className="form-check mt-2">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      checked={formCreateSaveAllVersions}
+                      onChange={(event) => setFormCreateSaveAllVersions(event.target.checked)}
+                      id="formCreateSaveAllVersions"
+                    />
+                    <label className="form-check-label" htmlFor="formCreateSaveAllVersions">
                       Yes
                     </label>
                   </div>
