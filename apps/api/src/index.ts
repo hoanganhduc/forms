@@ -9577,6 +9577,7 @@ export default {
             reminderEnabled?: boolean;
             reminderFrequency?: string;
             reminderUntil?: string | null;
+            saveAllVersions?: boolean;
           } | null = null;
           try {
             body = await parseJsonBody(request);
@@ -9603,6 +9604,7 @@ export default {
             "reminder_enabled",
             "reminder_frequency",
             "reminder_until",
+            "save_all_versions",
             "file_rules_json",
             "template_id"
           ];
@@ -9948,6 +9950,16 @@ export default {
               normalizeDateTimeInput(body.reminderUntil ?? null),
               true
             );
+          }
+
+          if (body?.saveAllVersions !== undefined) {
+            if (typeof body.saveAllVersions !== "boolean") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "saveAllVersions",
+                message: "expected_boolean"
+              });
+            }
+            pushOptionalUpdate("save_all_versions", body.saveAllVersions ? 1 : 0, true);
           }
 
           let formId: string | null = null;
