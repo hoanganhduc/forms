@@ -10831,6 +10831,7 @@ function BuilderPage({
   const [formBuilderReminderValue, setFormBuilderReminderValue] = useState(1);
   const [formBuilderReminderUnit, setFormBuilderReminderUnit] = useState("weeks");
   const [formBuilderReminderUntil, setFormBuilderReminderUntil] = useState("");
+  const [formBuilderSaveAllVersions, setFormBuilderSaveAllVersions] = useState(false);
   const [formCreateReminderEnabled, setFormCreateReminderEnabled] = useState(false);
   const [formCreateReminderValue, setFormCreateReminderValue] = useState(1);
   const [formCreateReminderUnit, setFormCreateReminderUnit] = useState("weeks");
@@ -11514,6 +11515,7 @@ function BuilderPage({
       setFormBuilderReminderUntil(
         utcToLocalInputWithZone(selected.reminder_until ?? null, formBuilderAvailabilityTimezone)
       );
+      setFormBuilderSaveAllVersions(Boolean(selected.save_all_versions));
       if (selected.canvas_allowed_section_ids_json) {
         try {
           const parsed = JSON.parse(String(selected.canvas_allowed_section_ids_json));
@@ -11772,6 +11774,7 @@ function BuilderPage({
           reminderEnabled: formBuilderReminderEnabled,
           reminderFrequency: `${formBuilderReminderValue}:${formBuilderReminderUnit}`,
           reminderUntil: localInputToUtcWithZone(formBuilderReminderUntil, formBuilderAvailabilityTimezone) || null,
+          saveAllVersions: formBuilderSaveAllVersions ? 1 : 0
         })
       });
       payload = await response.json().catch(() => null);
@@ -12843,6 +12846,22 @@ function BuilderPage({
                         id="formBuilderLocked"
                       />
                       <label className="form-check-label" htmlFor="formBuilderLocked">
+                        Yes
+                      </label>
+                    </div>
+                  </div>
+                  <div className="col-md-2">
+                    <label className="form-label">Save Versions</label>
+                    <div className="form-check mt-2">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formBuilderSaveAllVersions}
+                        onChange={(event) => setFormBuilderSaveAllVersions(event.target.checked)}
+                        disabled={!formBuilderSlug}
+                        id="formBuilderSaveAllVersions"
+                      />
+                      <label className="form-check-label" htmlFor="formBuilderSaveAllVersions">
                         Yes
                       </label>
                     </div>
