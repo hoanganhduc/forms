@@ -12822,10 +12822,6 @@ export default {
       if (versionParam !== "latest" && /^\d+$/.test(versionParam)) {
         const requestedVersion = parseInt(versionParam, 10);
 
-        if (!toBoolean(form.save_all_versions ?? 0)) {
-          return errorResponse(400, "versioning_not_enabled", requestId, corsHeaders);
-        }
-
         const version = await env.DB.prepare(
           "SELECT v.id, v.payload_json, v.version_number, v.created_at FROM submission_versions v WHERE v.submission_id=? AND v.version_number=?"
         )
@@ -12909,10 +12905,6 @@ export default {
         return errorResponse(403, "forbidden", requestId, corsHeaders);
       }
 
-      if (!toBoolean(submission.save_all_versions ?? 0)) {
-        return errorResponse(400, "versioning_not_enabled", requestId, corsHeaders);
-      }
-
       const { results: versions } = await env.DB.prepare(
         "SELECT id, version_number, created_at, created_by FROM submission_versions WHERE submission_id=? ORDER BY version_number DESC"
       )
@@ -12948,10 +12940,6 @@ export default {
         return errorResponse(403, "forbidden", requestId, corsHeaders);
       }
 
-      if (!toBoolean(submission.save_all_versions ?? 0)) {
-        return errorResponse(400, "versioning_not_enabled", requestId, corsHeaders);
-      }
-
       const version = await env.DB.prepare(
         "SELECT v.id, v.payload_json, v.version_number, v.created_at, v.created_by FROM submission_versions v WHERE v.submission_id=? AND v.version_number=?"
       )
@@ -12970,16 +12958,22 @@ export default {
         data = null;
       }
 
-      return jsonResponse(200, {
-        version: {
-          id: version.id,
-          version_number: version.version_number,
+      return jsonResponse(
+        200,
+        {
           data,
-          created_at: version.created_at,
-          created_by: version.created_by
+          version: {
+            id: version.id,
+            version_number: version.version_number,
+            data,
+            created_at: version.created_at,
+            created_by: version.created_by
+          },
+          requestId
         },
-        requestId
-      }, requestId, corsHeaders);
+        requestId,
+        corsHeaders
+      );
     }
 
     if (
@@ -13210,16 +13204,7 @@ export default {
             submissionId = existing.id;
             updated = true;
 
-            // Save version if form has versioning enabled
-            if (toBoolean(form.save_all_versions ?? 0)) {
-              await saveSubmissionVersion(
-                env,
-                submissionId,
-                form.id,
-                userId,
-                userId
-              );
-            }
+            await saveSubmissionVersion(env, submissionId, form.id, userId, userId);
 
             await env.DB.prepare(
               "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), submitter_provider=?, submitter_email=?, submitter_github_username=?, canvas_course_id=? WHERE id=?"
@@ -14284,15 +14269,8 @@ export default {
       const isResubmission = Boolean(existingSubmissionId);
 
       if (existingSubmissionId) {
-        // Save version if form has versioning enabled
-        if (toBoolean(form.save_all_versions ?? 0)) {
-          await saveSubmissionVersion(
-            env,
-            submissionId,
-            form.id,
-            userId,
-            userId
-          );
+        if (userId) {
+          await saveSubmissionVersion(env, submissionId, form.id, userId, userId);
         }
 
         await env.DB.prepare(

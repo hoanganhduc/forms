@@ -359,13 +359,9 @@ function TimezoneSelect({
 
 function VersionSelector({
   submissionId,
-  formSlug,
-  saveAllVersions,
   onVersionChange,
 }: {
   submissionId: string | null;
-  formSlug: string;
-  saveAllVersions: boolean;
   onVersionChange: (version: string) => void;
 }) {
   const [versions, setVersions] = useState<any[]>([]);
@@ -373,7 +369,7 @@ function VersionSelector({
   const [selectedVersion, setSelectedVersion] = useState<string>("none");
 
   useEffect(() => {
-    if (!saveAllVersions || !submissionId) {
+    if (!submissionId) {
       setVersions([]);
       return;
     }
@@ -402,9 +398,9 @@ function VersionSelector({
     return () => {
       active = false;
     };
-  }, [submissionId, saveAllVersions]);
+  }, [submissionId]);
 
-  if (!saveAllVersions || versions.length === 0) {
+  if (versions.length === 0) {
     return null;
   }
 
@@ -431,8 +427,8 @@ function VersionSelector({
           onChange={(e) => handleChange(e.target.value)}
           disabled={loading}
         >
-          <option value="latest">Use latest submission</option>
           <option value="none">Start with blank form</option>
+          <option value="latest">Use latest submission</option>
           {versions.map((v) => (
             <option key={v.version_number} value={String(v.version_number)}>
               Version {v.version_number} (created {new Date(v.created_at).toLocaleString()})
@@ -445,16 +441,11 @@ function VersionSelector({
   );
 }
 
-function VersionHistorySection({ submissionId, saveAllVersions }: { submissionId: string; saveAllVersions: boolean }) {
+function VersionHistorySection({ submissionId }: { submissionId: string }) {
   const [versions, setVersions] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!saveAllVersions) {
-      setLoading(false);
-      return;
-    }
-
     let active = true;
     async function loadVersions() {
       setLoading(true);
@@ -479,11 +470,7 @@ function VersionHistorySection({ submissionId, saveAllVersions }: { submissionId
     return () => {
       active = false;
     };
-  }, [submissionId, saveAllVersions]);
-
-  if (!saveAllVersions) {
-    return null;
-  }
+  }, [submissionId]);
 
   return (
     <div className="panel panel--compact mt-3">
@@ -3066,8 +3053,13 @@ function FormPage({
     // Load specific version
     const response = await apiFetch(`${API_BASE}/api/me/submissions/${encodeURIComponent(submissionId)}/versions/${encodeURIComponent(version)}`);
     const payload = await response.json().catch(() => null);
-    if (response.ok && payload?.data) {
-      setValues(payload.data);
+    const versionData = payload?.data ?? payload?.version?.data ?? null;
+    if (response.ok) {
+      if (versionData && typeof versionData === "object") {
+        setValues(versionData);
+      } else {
+        setValues({});
+      }
       setPreviousSubmissionVisible(false); // Hide the "previous submission available" banner since we explicitly loaded one
     } else {
       onNotice("Failed to load version.", "error");
@@ -4557,8 +4549,6 @@ function FormPage({
       {previousSubmissionVisible && previousSubmission ? (
         <VersionSelector
           submissionId={submissionId}
-          formSlug={form?.slug || ""}
-          saveAllVersions={Boolean((form as any)?.save_all_versions)}
           onVersionChange={handleVersionChange}
         />
       ) : null}
