@@ -9577,7 +9577,7 @@ export default {
             reminderEnabled?: boolean;
             reminderFrequency?: string;
             reminderUntil?: string | null;
-            saveAllVersions?: boolean;
+            saveAllVersions?: boolean | number;
           } | null = null;
           try {
             body = await parseJsonBody(request);
@@ -9953,13 +9953,16 @@ export default {
           }
 
           if (body?.saveAllVersions !== undefined) {
-            if (typeof body.saveAllVersions !== "boolean") {
+            const val = body.saveAllVersions;
+            const isBool = typeof val === "boolean";
+            const isNum = typeof val === "number" && (val === 0 || val === 1);
+            if (!isBool && !isNum) {
               return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
                 field: "saveAllVersions",
-                message: "expected_boolean"
+                message: "expected_boolean_or_0_1"
               });
             }
-            pushOptionalUpdate("save_all_versions", body.saveAllVersions ? 1 : 0, true);
+            pushOptionalUpdate("save_all_versions", val ? 1 : 0, true);
           }
 
           let formId: string | null = null;
