@@ -49,6 +49,7 @@ type FormListRow = {
   password_required?: number | null;
   password_require_access?: number | null;
   password_require_submit?: number | null;
+  save_all_versions?: number | null;
 };
 
 type FormDetailRow = {
@@ -77,6 +78,7 @@ type FormDetailRow = {
   reminder_enabled?: number;
   reminder_frequency?: string | null;
   reminder_until?: string | null;
+  save_all_versions?: number | null;
 };
 
 type FormSubmissionRow = {
@@ -107,6 +109,7 @@ type AdminFormRow = {
   reminder_enabled?: number;
   reminder_frequency?: string | null;
   reminder_until?: string | null;
+  save_all_versions?: number | null;
 };
 
 type TemplateRow = {
@@ -132,6 +135,17 @@ type SubmissionDetailRow = {
   payload_json: string;
   created_at: string;
   updated_at: string | null;
+};
+
+type SubmissionVersionRow = {
+  id: string;
+  submission_id: string;
+  form_id: string;
+  user_id: string | null;
+  payload_json: string;
+  version_number: number;
+  created_at: string;
+  created_by: string | null;
 };
 
 type FileRules = {
@@ -1089,7 +1103,8 @@ async function getFormWithRules(env: Env, slug: string) {
     "password_salt",
     "password_hash",
     "reminder_enabled",
-    "reminder_frequency"
+    "reminder_frequency",
+    "save_all_versions"
   ];
   const columnSelects = baseColumns.map((column) => `f.${column}`);
   for (const column of optionalColumns) {
@@ -4633,6 +4648,49 @@ function getMissingEnv(env: Env, keys: Array<keyof Env>): string[] {
     .map((key) => String(key));
 }
 
+async function saveSubmissionVersion(
+  env: Env,
+  submissionId: string,
+  formId: string,
+  userId: string | null,
+  createdBy: string | null
+): Promise<void> {
+  // Get the current submission data before it gets updated
+  const currentSubmission = await env.DB.prepare(
+    "SELECT payload_json FROM submissions WHERE id=?"
+  )
+    .bind(submissionId)
+    .first<{ payload_json: string }>();
+
+  if (!currentSubmission) {
+    return; // Nothing to save if submission doesn't exist
+  }
+
+  // Get the next version number
+  const versionCount = await env.DB.prepare(
+    "SELECT COUNT(*) as count FROM submission_versions WHERE submission_id=?"
+  )
+    .bind(submissionId)
+    .first<{ count: number }>();
+
+  const versionNumber = (versionCount?.count ?? 0) + 1;
+
+  // Insert the version record
+  await env.DB.prepare(
+    "INSERT INTO submission_versions (id, submission_id, form_id, user_id, payload_json, version_number, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  )
+    .bind(
+      crypto.randomUUID(),
+      submissionId,
+      formId,
+      userId,
+      currentSubmission.payload_json,
+      versionNumber,
+      createdBy
+    )
+    .run();
+}
+
 async function getAuthPayload(request: Request, env: Env): Promise<JwtPayload | null> {
   if (!env.JWT_SECRET) return null;
   const token = getTokenFromRequest(request);
@@ -7913,7 +7971,7 @@ export default {
           ? "f.reminder_until"
           : "NULL as reminder_until";
         const { results } = await env.DB.prepare(
-          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
         ).all<AdminFormRow & { submission_count?: number; updated_at?: string | null; created_at?: string | null }>();
 
         const data = results.map((row) => ({
@@ -7949,7 +8007,7 @@ export default {
       if (request.method === "GET" && formBackupMatch) {
         const slug = decodeURIComponent(formBackupMatch[1]);
         const formRow = await env.DB.prepare(
-          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.reminder_enabled,f.reminder_frequency,t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
         )
           .bind(slug)
           .first<{
@@ -9503,6 +9561,7 @@ export default {
             is_locked?: boolean;
             auth_policy?: string;
             templateKey?: string;
+            refreshTemplate?: boolean;
             schema_json?: string;
             canvasEnabled?: boolean;
             canvasCourseId?: string | null;
@@ -12672,13 +12731,15 @@ export default {
         });
       }
 
+      const versionParam = url.searchParams.get("version")?.trim() || "latest";
+
       const authPayload = await getAuthPayload(request, env);
       if (!authPayload) {
         return errorResponse(401, "auth_required", requestId, corsHeaders);
       }
 
       const form = await env.DB.prepare(
-        "SELECT id, slug, title, is_locked, is_public, auth_policy FROM forms WHERE slug=? AND deleted_at IS NULL"
+        "SELECT id, slug, title, is_locked, is_public, auth_policy, save_all_versions FROM forms WHERE slug=? AND deleted_at IS NULL"
       )
         .bind(formSlug)
         .first<{
@@ -12688,6 +12749,7 @@ export default {
           is_locked: number;
           is_public: number;
           auth_policy: string | null;
+          save_all_versions: number | null;
         }>();
 
       if (!form) {
@@ -12697,6 +12759,33 @@ export default {
       const authCheck = checkAuthPolicy(form.auth_policy ?? "optional", authPayload);
       if (!authCheck.ok) {
         return errorResponse(authCheck.status!, authCheck.code!, requestId, corsHeaders);
+      }
+
+      // Handle "none" or "blank" to return empty form
+      if (versionParam === "none" || versionParam === "blank") {
+        return jsonResponse(
+          200,
+          {
+            data: {
+              submissionId: null,
+              data_json: null,
+              files: [],
+              created_at: null,
+              updated_at: null,
+              form: {
+                slug: form.slug,
+                title: form.title,
+                is_locked: toBoolean(form.is_locked),
+                is_public: toBoolean(form.is_public),
+                auth_policy: form.auth_policy ?? "optional",
+                save_all_versions: toBoolean(form.save_all_versions ?? 0)
+              }
+            },
+            requestId
+          },
+          requestId,
+          corsHeaders
+        );
       }
 
       const submission = await env.DB.prepare(
@@ -12710,10 +12799,41 @@ export default {
       }
 
       let payload: { data?: unknown } | null = null;
-      try {
-        payload = JSON.parse(submission.payload_json);
-      } catch (error) {
-        payload = null;
+      let versionNumber: number | null = null;
+      let versionCreatedAt: string | null = null;
+
+      // Handle specific version number request
+      if (versionParam !== "latest" && /^\d+$/.test(versionParam)) {
+        const requestedVersion = parseInt(versionParam, 10);
+
+        if (!toBoolean(form.save_all_versions ?? 0)) {
+          return errorResponse(400, "versioning_not_enabled", requestId, corsHeaders);
+        }
+
+        const version = await env.DB.prepare(
+          "SELECT v.id, v.payload_json, v.version_number, v.created_at FROM submission_versions v WHERE v.submission_id=? AND v.version_number=?"
+        )
+          .bind(submission.id, requestedVersion)
+          .first<{ id: string; payload_json: string; version_number: number; created_at: string }>();
+
+        if (!version) {
+          return errorResponse(404, "version_not_found", requestId, corsHeaders);
+        }
+
+        try {
+          payload = JSON.parse(version.payload_json);
+        } catch (error) {
+          payload = null;
+        }
+        versionNumber = version.version_number;
+        versionCreatedAt = version.created_at;
+      } else {
+        // Use latest submission (current behavior)
+        try {
+          payload = JSON.parse(submission.payload_json);
+        } catch (error) {
+          payload = null;
+        }
       }
 
       const filesResult = await env.DB.prepare(
@@ -12729,14 +12849,16 @@ export default {
             submissionId: submission.id,
             data_json: payload?.data ?? null,
             files: Array.isArray(filesResult?.results) ? filesResult.results : [],
-            created_at: submission.created_at,
+            created_at: versionCreatedAt || submission.created_at,
             updated_at: submission.updated_at,
+            version_number: versionNumber,
             form: {
               slug: form.slug,
               title: form.title,
               is_locked: toBoolean(form.is_locked),
               is_public: toBoolean(form.is_public),
-              auth_policy: form.auth_policy ?? "optional"
+              auth_policy: form.auth_policy ?? "optional",
+              save_all_versions: toBoolean(form.save_all_versions ?? 0)
             }
           },
           requestId
@@ -12744,6 +12866,104 @@ export default {
         requestId,
         corsHeaders
       );
+    }
+
+    // GET /api/me/submissions/:submissionId/versions - List all versions for a user's submission
+    if (request.method === "GET" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/versions$/)) {
+      const match = url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/versions$/);
+      const submissionId = decodeURIComponent(match![1]);
+
+      const authPayload = await getAuthPayload(request, env);
+      if (!authPayload) {
+        return errorResponse(401, "auth_required", requestId, corsHeaders);
+      }
+
+      const submission = await env.DB.prepare(
+        "SELECT s.id, s.user_id, s.form_id, f.slug, f.save_all_versions FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=?"
+      )
+        .bind(submissionId)
+        .first<{ id: string; user_id: string | null; form_id: string; slug: string; save_all_versions: number | null }>();
+
+      if (!submission) {
+        return errorResponse(404, "not_found", requestId, corsHeaders);
+      }
+
+      // Verify user owns this submission
+      if (submission.user_id !== authPayload.userId) {
+        return errorResponse(403, "forbidden", requestId, corsHeaders);
+      }
+
+      if (!toBoolean(submission.save_all_versions ?? 0)) {
+        return errorResponse(400, "versioning_not_enabled", requestId, corsHeaders);
+      }
+
+      const { results: versions } = await env.DB.prepare(
+        "SELECT id, version_number, created_at, created_by FROM submission_versions WHERE submission_id=? ORDER BY version_number DESC"
+      )
+        .bind(submissionId)
+        .all<{ id: string; version_number: number; created_at: string; created_by: string | null }>();
+
+      return jsonResponse(200, { versions, requestId }, requestId, corsHeaders);
+    }
+
+    // GET /api/me/submissions/:submissionId/versions/:versionNumber - Get specific version data
+    if (request.method === "GET" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/versions\/(\d+)$/)) {
+      const match = url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/versions\/(\d+)$/);
+      const submissionId = decodeURIComponent(match![1]);
+      const versionNumber = Number(match![2]);
+
+      const authPayload = await getAuthPayload(request, env);
+      if (!authPayload) {
+        return errorResponse(401, "auth_required", requestId, corsHeaders);
+      }
+
+      const submission = await env.DB.prepare(
+        "SELECT s.id, s.user_id, s.form_id, f.save_all_versions FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=?"
+      )
+        .bind(submissionId)
+        .first<{ id: string; user_id: string | null; form_id: string; save_all_versions: number | null }>();
+
+      if (!submission) {
+        return errorResponse(404, "not_found", requestId, corsHeaders);
+      }
+
+      // Verify user owns this submission
+      if (submission.user_id !== authPayload.userId) {
+        return errorResponse(403, "forbidden", requestId, corsHeaders);
+      }
+
+      if (!toBoolean(submission.save_all_versions ?? 0)) {
+        return errorResponse(400, "versioning_not_enabled", requestId, corsHeaders);
+      }
+
+      const version = await env.DB.prepare(
+        "SELECT v.id, v.payload_json, v.version_number, v.created_at, v.created_by FROM submission_versions v WHERE v.submission_id=? AND v.version_number=?"
+      )
+        .bind(submissionId, versionNumber)
+        .first<{ id: string; payload_json: string; version_number: number; created_at: string; created_by: string | null }>();
+
+      if (!version) {
+        return errorResponse(404, "not_found", requestId, corsHeaders);
+      }
+
+      let data = null;
+      try {
+        const parsed = JSON.parse(version.payload_json);
+        data = parsed.data || null;
+      } catch {
+        data = null;
+      }
+
+      return jsonResponse(200, {
+        version: {
+          id: version.id,
+          version_number: version.version_number,
+          data,
+          created_at: version.created_at,
+          created_by: version.created_by
+        },
+        requestId
+      }, requestId, corsHeaders);
     }
 
     if (
@@ -12888,6 +13108,18 @@ export default {
           if (existing) {
             submissionId = existing.id;
             updated = true;
+
+            // Save version if form has versioning enabled
+            if (toBoolean(form.save_all_versions ?? 0)) {
+              await saveSubmissionVersion(
+                env,
+                submissionId,
+                form.id,
+                userId,
+                userId
+              );
+            }
+
             await env.DB.prepare(
               "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), submitter_provider=?, submitter_email=?, submitter_github_username=?, canvas_course_id=? WHERE id=?"
             )
@@ -13951,6 +14183,17 @@ export default {
       const isResubmission = Boolean(existingSubmissionId);
 
       if (existingSubmissionId) {
+        // Save version if form has versioning enabled
+        if (toBoolean(form.save_all_versions ?? 0)) {
+          await saveSubmissionVersion(
+            env,
+            submissionId,
+            form.id,
+            userId,
+            userId
+          );
+        }
+
         await env.DB.prepare(
           "UPDATE submissions SET payload_json=?, updated_at=datetime('now'), submitter_provider=?, submitter_email=?, submitter_github_username=?, canvas_course_id=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
         )

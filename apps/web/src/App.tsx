@@ -357,6 +357,175 @@ function TimezoneSelect({
   );
 }
 
+function VersionSelector({
+  submissionId,
+  formSlug,
+  saveAllVersions,
+  onVersionChange,
+}: {
+  submissionId: string | null;
+  formSlug: string;
+  saveAllVersions: boolean;
+  onVersionChange: (version: string) => void;
+}) {
+  const [versions, setVersions] = useState<any[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [selectedVersion, setSelectedVersion] = useState<string>("none");
+
+  useEffect(() => {
+    if (!saveAllVersions || !submissionId) {
+      setVersions([]);
+      return;
+    }
+
+    let active = true;
+    async function loadVersions() {
+      setLoading(true);
+      try {
+        const response = await apiFetch(
+          `${API_BASE}/api/me/submissions/${encodeURIComponent(submissionId!)}/versions`
+        );
+        const payload = await response.json().catch(() => null);
+        if (!active) return;
+
+        if (response.ok && Array.isArray(payload?.versions)) {
+          setVersions(payload.versions);
+        }
+      } catch (error) {
+        console.error("Failed to load versions:", error);
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    loadVersions();
+    return () => {
+      active = false;
+    };
+  }, [submissionId, saveAllVersions]);
+
+  if (!saveAllVersions || versions.length === 0) {
+    return null;
+  }
+
+  function handleChange(value: string) {
+    setSelectedVersion(value);
+    onVersionChange(value);
+  }
+
+  return (
+    <div className="panel panel--compact mb-3">
+      <div className="panel-header">
+        <h4 className="mb-0">
+          <i className="bi bi-clock-history" aria-hidden="true" /> Load Previous Version
+        </h4>
+      </div>
+      <div className="form-group">
+        <label htmlFor="version-selector">
+          Select which version to load (or start with blank form):
+        </label>
+        <select
+          id="version-selector"
+          className="form-control"
+          value={selectedVersion}
+          onChange={(e) => handleChange(e.target.value)}
+          disabled={loading}
+        >
+          <option value="latest">Use latest submission</option>
+          <option value="none">Start with blank form</option>
+          {versions.map((v) => (
+            <option key={v.version_number} value={String(v.version_number)}>
+              Version {v.version_number} (created {new Date(v.created_at).toLocaleString()})
+            </option>
+          ))}
+        </select>
+        {loading && <small className="text-muted">Loading versions...</small>}
+      </div>
+    </div>
+  );
+}
+
+function VersionHistorySection({ submissionId, saveAllVersions }: { submissionId: string; saveAllVersions: boolean }) {
+  const [versions, setVersions] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    if (!saveAllVersions) {
+      setLoading(false);
+      return;
+    }
+
+    let active = true;
+    async function loadVersions() {
+      setLoading(true);
+      try {
+        const response = await apiFetch(
+          `${API_BASE}/api/me/submissions/${encodeURIComponent(submissionId)}/versions`
+        );
+        const payload = await response.json().catch(() => null);
+        if (!active) return;
+
+        if (response.ok && Array.isArray(payload?.versions)) {
+          setVersions(payload.versions);
+        }
+      } catch (error) {
+        console.error("Failed to load versions:", error);
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    loadVersions();
+    return () => {
+      active = false;
+    };
+  }, [submissionId, saveAllVersions]);
+
+  if (!saveAllVersions) {
+    return null;
+  }
+
+  return (
+    <div className="panel panel--compact mt-3">
+      <div className="panel-header">
+        <h3 className="mb-0">
+          <i className="bi bi-clock-history" aria-hidden="true" /> Version History
+        </h3>
+      </div>
+      {loading ? (
+        <p className="muted">Loading version history...</p>
+      ) : versions.length === 0 ? (
+        <p className="muted">No version history available.</p>
+      ) : (
+        <div className="table-responsive">
+          <table className="table table-sm">
+            <thead>
+              <tr>
+                <th>Version</th>
+                <th>Created</th>
+                <th>Created By</th>
+              </tr>
+            </thead>
+            <tbody>
+              {versions.map((v) => (
+                <tr key={v.version_number}>
+                  <td>
+                    <span className="badge text-bg-secondary">
+                      Version {v.version_number}
+                    </span>
+                  </td>
+                  <td>{new Date(v.created_at).toLocaleString()}</td>
+                  <td className="text-muted">{v.created_by || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
 type FormSummary = {
   slug: string;
   title: string;
@@ -10528,7 +10697,7 @@ function BuilderPage({
 }: {
   user: UserInfo | null;
   onLogin: (p: "google" | "github") => void;
-  onNotice: (message: string, type?: "success" | "error") => void;
+  onNotice: (message: string, type?: NoticeType) => void;
   appDefaultTimezone: string;
   markdownEnabled: boolean;
   mathjaxEnabled: boolean;
