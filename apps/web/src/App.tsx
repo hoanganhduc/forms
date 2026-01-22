@@ -3046,6 +3046,34 @@ function FormPage({
     };
   }, [form, user]);
 
+  async function handleVersionChange(version: string) {
+    if (!submissionId || !form) return;
+    if (version === "none") {
+      setValues({});
+      setPreviousSubmissionVisible(false);
+      return;
+    }
+    if (version === "latest") {
+      // Reload current
+      const response = await apiFetch(`${API_BASE}/api/forms/${encodeURIComponent(form.slug)}/my-submission`);
+      const payload = await response.json().catch(() => null);
+      if (response.ok && payload?.data?.data) {
+        setValues(payload.data.data);
+        setPreviousSubmissionVisible(false);
+      }
+      return;
+    }
+    // Load specific version
+    const response = await apiFetch(`${API_BASE}/api/me/submissions/${encodeURIComponent(submissionId)}/versions/${encodeURIComponent(version)}`);
+    const payload = await response.json().catch(() => null);
+    if (response.ok && payload?.data) {
+      setValues(payload.data);
+      setPreviousSubmissionVisible(false); // Hide the "previous submission available" banner since we explicitly loaded one
+    } else {
+      onNotice("Failed to load version.", "error");
+    }
+  }
+
   useEffect(() => {
     if (!form) return;
     if (hasExistingSubmission) return;
@@ -4524,6 +4552,15 @@ function FormPage({
             ) : null}
           </div>
         </div>
+      ) : null}
+
+      {previousSubmissionVisible && previousSubmission ? (
+        <VersionSelector
+          submissionId={submissionId}
+          formSlug={form?.slug || ""}
+          saveAllVersions={Boolean((form as any)?.save_all_versions)}
+          onVersionChange={handleVersionChange}
+        />
       ) : null}
 
       {previousSubmissionVisible && previousSubmission ? (

@@ -13044,6 +13044,91 @@ export default {
       }
     }
 
+    if (request.method === "GET") {
+      const versionsMatch = url.pathname.match(
+        /^\/api\/me\/submissions\/([^/]+)\/versions$/
+      );
+      if (versionsMatch) {
+        const submissionId = decodeURIComponent(versionsMatch[1]);
+        const authPayload = await getAuthPayload(request, env);
+        if (!authPayload) {
+          return errorResponse(401, "auth_required", requestId, corsHeaders);
+        }
+        const submission = await env.DB.prepare(
+          "SELECT user_id, form_id FROM submissions WHERE id=? AND deleted_at IS NULL"
+        )
+          .bind(submissionId)
+          .first<{ user_id: string; form_id: string }>();
+
+        if (!submission) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        if (!submission.user_id || submission.user_id !== authPayload.userId) {
+          return errorResponse(403, "forbidden", requestId, corsHeaders);
+        }
+
+        const versions = await env.DB.prepare(
+          "SELECT version_number, created_at FROM submission_versions WHERE submission_id=? ORDER BY version_number DESC"
+        )
+          .bind(submissionId)
+          .all<SubmissionVersionRow>();
+
+        return jsonResponse(
+          200,
+          { versions: versions?.results || [], requestId },
+          requestId,
+          corsHeaders
+        );
+      }
+
+      const versionDetailMatch = url.pathname.match(
+        /^\/api\/me\/submissions\/([^/]+)\/versions\/([^/]+)$/
+      );
+      if (versionDetailMatch) {
+        const submissionId = decodeURIComponent(versionDetailMatch[1]);
+        const versionStr = decodeURIComponent(versionDetailMatch[2]);
+        const versionNum = parseInt(versionStr, 10);
+
+        const authPayload = await getAuthPayload(request, env);
+        if (!authPayload) {
+          return errorResponse(401, "auth_required", requestId, corsHeaders);
+        }
+
+        const submission = await env.DB.prepare(
+          "SELECT user_id FROM submissions WHERE id=? AND deleted_at IS NULL"
+        )
+          .bind(submissionId)
+          .first<{ user_id: string }>();
+
+        if (!submission) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        if (!submission.user_id || submission.user_id !== authPayload.userId) {
+          return errorResponse(403, "forbidden", requestId, corsHeaders);
+        }
+
+        const version = await env.DB.prepare(
+          "SELECT payload_json, created_at FROM submission_versions WHERE submission_id=? AND version_number=?"
+        )
+          .bind(submissionId, versionNum)
+          .first<{ payload_json: string; created_at: string }>();
+
+        if (!version) {
+          return errorResponse(404, "version_not_found", requestId, corsHeaders);
+        }
+
+        let data = null;
+        try {
+          const parsed = JSON.parse(version.payload_json);
+          data = parsed.data || null;
+        } catch (e) {
+          data = null;
+        }
+
+        return jsonResponse(200, { data, createdAt: version.created_at, requestId }, requestId, corsHeaders);
+      }
+    }
+
     if (request.method === "POST") {
       const submitMatch = url.pathname.match(/^\/api\/forms\/([^/]+)\/submit$/);
       if (submitMatch) {
