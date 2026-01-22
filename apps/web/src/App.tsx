@@ -11811,7 +11811,7 @@ function BuilderPage({
           reminderEnabled: formBuilderReminderEnabled,
           reminderFrequency: `${formBuilderReminderValue}:${formBuilderReminderUnit}`,
           reminderUntil: localInputToUtcWithZone(formBuilderReminderUntil, formBuilderAvailabilityTimezone) || null,
-          saveAllVersions: formBuilderSaveAllVersions ? 1 : 0
+          saveAllVersions: formBuilderSaveAllVersions
         })
       });
       payload = await response.json().catch(() => null);
