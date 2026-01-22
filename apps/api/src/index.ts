@@ -1216,7 +1216,8 @@ async function buildFormDetailPayload(env: Env, row: FormDetailRow) {
       canvas_allowed_sections: canvasSections,
       canvas_fields_position: row.canvas_fields_position ?? "bottom",
       reminder_enabled: toBoolean(row.reminder_enabled ?? 0),
-      reminder_frequency: row.reminder_frequency ?? "weekly"
+      reminder_frequency: row.reminder_frequency ?? "weekly",
+      save_all_versions: toBoolean(row.save_all_versions ?? 0)
     }
   };
 }
