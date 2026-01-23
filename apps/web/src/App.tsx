@@ -132,6 +132,63 @@ function renderRichTextHtml(text: string, markdownEnabled: boolean, inline: bool
   return sanitizeRichHtml(String(html));
 }
 
+type SubmissionExportFormat = "markdown" | "txt" | "csv";
+type FieldMetaMap = Record<string, { label: string; type: string; rules?: Record<string, unknown> }>;
+
+function buildFieldMetaFromSchema(fields: any[]) {
+  const meta: FieldMetaMap = {};
+  const order: string[] = [];
+  fields.forEach((field) => {
+    if (!field?.id) return;
+    const id = String(field.id);
+    order.push(id);
+    meta[id] = {
+      label: field.label || id,
+      type: field.type || "text",
+      rules: field.rules && typeof field.rules === "object" ? field.rules : undefined
+    };
+  });
+  return { meta, order };
+}
+
+function formatFilenameTimestamp(date: Date) {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(
+    date.getHours()
+  )}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function csvEscapeValue(value: string) {
+  if (value.includes('"') || value.includes("\n") || value.includes("\r") || value.includes(",")) {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+  return value;
+}
+
+function escapeMarkdownCell(value: string) {
+  return value.replace(/\|/g, "\\|").replace(/\r?\n/g, "<br>");
+}
+
+function normalizeExportValue(value: unknown) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch (error) {
+    return String(value);
+  }
+}
+
+function downloadTextFile(filename: string, content: string, mimeType: string) {
+  const blob = new Blob([content], { type: mimeType });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
 function useMathJax(enabled: boolean) {
   useEffect(() => {
     if (!enabled) return;
@@ -2021,6 +2078,299 @@ function formatTimeICT(value: string | null) {
       return date.toLocaleString("en-GB");
     }
   }
+}
+
+function buildSubmissionExportContent({
+  submission,
+  dataValues,
+  fieldMeta,
+  fieldOrder,
+  format,
+  versionLabel
+}: {
+  submission: any;
+  dataValues: Record<string, unknown> | null;
+  fieldMeta: FieldMetaMap;
+  fieldOrder: string[];
+  format: SubmissionExportFormat;
+  versionLabel?: string | null;
+}) {
+  const submissionId = submission?.submissionId ? String(submission.submissionId) : "submission";
+  const formSlug = submission?.form?.slug ? String(submission.form.slug) : "submission";
+  const formTitle = submission?.form?.title ? String(submission.form.title) : formSlug;
+  const timestamp = formatFilenameTimestamp(new Date());
+  const slugPart = formSlug.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "submission";
+  const idPart = submissionId.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "submission";
+  const extension = format === "markdown" ? "md" : format;
+  const filename = `${slugPart}-${idPart}-${timestamp}.${extension}`;
+  const createdAt = formatTimeICT(submission?.created_at ?? null);
+  const updatedAt = formatTimeICT(submission?.updated_at ?? null);
+  const reminderText = submission?.form?.reminder_enabled
+    ? formatReminderFrequency(submission.form.reminder_frequency)
+    : "";
+
+  const metaEntries = [
+    { key: "exported_at", label: "Exported", value: formatTimeICT(new Date().toISOString()) },
+    { key: "submission_id", label: "Submission ID", value: submissionId },
+    { key: "form_title", label: "Form", value: formTitle },
+    { key: "form_slug", label: "Form slug", value: formSlug },
+    { key: "submitted_at", label: "Submitted", value: createdAt },
+    { key: "updated_at", label: "Updated", value: updatedAt }
+  ];
+  if (versionLabel) {
+    metaEntries.push({ key: "data_version", label: "Data version", value: versionLabel });
+  }
+  if (submission?.form?.auth_policy) {
+    metaEntries.push({
+      key: "auth_policy",
+      label: "Auth policy",
+      value: String(submission.form.auth_policy)
+    });
+  }
+  if (submission?.user_id) {
+    metaEntries.push({
+      key: "user_id",
+      label: "User ID",
+      value: submission.user_id
+    });
+  }
+  if (submission?.submitter?.provider) {
+    metaEntries.push({
+      key: "submitter_provider",
+      label: "Submitter provider",
+      value: submission.submitter.provider
+    });
+  }
+  if (submission?.submitter?.email) {
+    metaEntries.push({
+      key: "submitter_email",
+      label: "Submitter email",
+      value: submission.submitter.email
+    });
+  }
+  if (submission?.submitter?.github_username) {
+    metaEntries.push({
+      key: "submitter_github_username",
+      label: "Submitter GitHub username",
+      value: submission.submitter.github_username
+    });
+  }
+  if (submission?.created_ip) {
+    metaEntries.push({
+      key: "created_ip",
+      label: "Created IP",
+      value: submission.created_ip
+    });
+  }
+  if (submission?.created_user_agent) {
+    metaEntries.push({
+      key: "created_user_agent",
+      label: "Created user agent",
+      value: submission.created_user_agent
+    });
+  }
+  if (typeof submission?.form?.is_locked === "boolean") {
+    metaEntries.push({
+      key: "form_locked",
+      label: "Form locked",
+      value: submission.form.is_locked ? "yes" : "no"
+    });
+  }
+  if (typeof submission?.form?.is_public === "boolean") {
+    metaEntries.push({
+      key: "form_public",
+      label: "Form public",
+      value: submission.form.is_public ? "yes" : "no"
+    });
+  }
+  if (submission?.form?.reminder_enabled) {
+    metaEntries.push({
+      key: "reminder_frequency",
+      label: "Reminder frequency",
+      value: reminderText || "enabled"
+    });
+  }
+  if (submission?.form?.reminder_until) {
+    metaEntries.push({
+      key: "reminder_until",
+      label: "Reminder until",
+      value: formatTimeICT(submission.form.reminder_until)
+    });
+  }
+  if (submission?.canvas?.status) {
+    metaEntries.push({ key: "canvas_status", label: "Canvas status", value: submission.canvas.status });
+  }
+  if (submission?.canvas?.error) {
+    metaEntries.push({ key: "canvas_error", label: "Canvas error", value: submission.canvas.error });
+  }
+  if (submission?.canvas?.course_id) {
+    metaEntries.push({
+      key: "canvas_course_id",
+      label: "Canvas course ID",
+      value: submission.canvas.course_id
+    });
+  }
+  if (submission?.canvas?.section_id) {
+    metaEntries.push({
+      key: "canvas_section_id",
+      label: "Canvas section ID",
+      value: submission.canvas.section_id
+    });
+  }
+  if (submission?.canvas?.user_id) {
+    metaEntries.push({ key: "canvas_user_id", label: "Canvas user ID", value: submission.canvas.user_id });
+  }
+  if (submission?.canvas?.user_name) {
+    metaEntries.push({
+      key: "canvas_user_name",
+      label: "Canvas user name",
+      value: submission.canvas.user_name
+    });
+  }
+  if (submission?.canvas?.display_name) {
+    metaEntries.push({
+      key: "canvas_display_name",
+      label: "Canvas display name",
+      value: submission.canvas.display_name
+    });
+  }
+  if (submission?.canvas?.full_name) {
+    metaEntries.push({
+      key: "canvas_full_name",
+      label: "Canvas full name",
+      value: submission.canvas.full_name
+    });
+  }
+
+  const dataObject =
+    dataValues && typeof dataValues === "object" && !Array.isArray(dataValues) ? dataValues : {};
+  const orderedKeys = fieldOrder.filter((key) => key in dataObject);
+  const remainingKeys = Object.keys(dataObject).filter((key) => !orderedKeys.includes(key));
+  const dataKeys = [...orderedKeys, ...remainingKeys];
+  const dataEntries = dataKeys.map((key) => {
+    const metaLabel = fieldMeta[key]?.label || key;
+    const label = metaLabel !== key ? `${metaLabel} (${key})` : metaLabel;
+    return {
+      key,
+      label,
+      value: normalizeExportValue(dataObject[key])
+    };
+  });
+
+  const files = Array.isArray(submission?.files) ? submission.files : [];
+
+  if (format === "markdown") {
+    const lines = ["# Submission export", "", "## Metadata"];
+    metaEntries.forEach((entry) => {
+      lines.push(`- **${entry.label}:** ${escapeMarkdownCell(entry.value || "n/a")}`);
+    });
+    lines.push("", "## Data");
+    if (dataEntries.length === 0) {
+      lines.push("_No data_");
+    } else {
+      lines.push("| Field | Value |", "| --- | --- |");
+      dataEntries.forEach((entry) => {
+        lines.push(`| ${escapeMarkdownCell(entry.label)} | ${escapeMarkdownCell(entry.value || "")} |`);
+      });
+    }
+    lines.push("", "## Files");
+    if (files.length === 0) {
+      lines.push("_No files_");
+    } else {
+      lines.push("| Field | File | Size | VirusTotal |", "| --- | --- | --- | --- |");
+      files.forEach((file: any) => {
+        const fileLabel = fieldMeta[file.field_id]?.label || file.field_id || "file";
+        const sizeValue =
+          typeof file.size_bytes === "number"
+            ? `${formatSize(file.size_bytes)} (${file.size_bytes} bytes)`
+            : "n/a";
+        const vtLabel = file.vt_verdict
+          ? `${file.vt_status || "pending"} (${file.vt_verdict})`
+          : file.vt_status || "pending";
+        lines.push(
+          `| ${escapeMarkdownCell(fileLabel)} | ${escapeMarkdownCell(
+            String(file.original_name || "")
+          )} | ${escapeMarkdownCell(sizeValue)} | ${escapeMarkdownCell(vtLabel)} |`
+        );
+      });
+    }
+    return { filename, content: lines.join("\n"), mimeType: "text/markdown; charset=utf-8" };
+  }
+
+  if (format === "txt") {
+    const lines = ["Submission export", ""];
+    metaEntries.forEach((entry) => {
+      lines.push(`${entry.label}: ${entry.value || "n/a"}`);
+    });
+    lines.push("", "Data:");
+    if (dataEntries.length === 0) {
+      lines.push("  (no data)");
+    } else {
+      dataEntries.forEach((entry) => {
+        lines.push(`- ${entry.label}: ${entry.value || ""}`);
+      });
+    }
+    lines.push("", "Files:");
+    if (files.length === 0) {
+      lines.push("  (no files)");
+    } else {
+      files.forEach((file: any, index: number) => {
+        const fileLabel = fieldMeta[file.field_id]?.label || file.field_id || "file";
+        lines.push(`- File ${index + 1}`);
+        lines.push(`  Field: ${fileLabel}`);
+        lines.push(`  Name: ${file.original_name || "n/a"}`);
+        if (typeof file.size_bytes === "number") {
+          lines.push(`  Size: ${formatSize(file.size_bytes)} (${file.size_bytes} bytes)`);
+        }
+        if (file.vt_status) {
+          lines.push(`  VirusTotal: ${file.vt_status}${file.vt_verdict ? ` (${file.vt_verdict})` : ""}`);
+        }
+        if (file.final_drive_file_id) {
+          lines.push(`  Drive file ID: ${file.final_drive_file_id}`);
+        }
+        if (file.drive_web_view_link) {
+          lines.push(`  Drive link: ${file.drive_web_view_link}`);
+        }
+        if (file.finalized_at) {
+          lines.push(`  Finalized: ${formatTimeICT(file.finalized_at)}`);
+        }
+      });
+    }
+    return { filename, content: lines.join("\n"), mimeType: "text/plain; charset=utf-8" };
+  }
+
+  const rows: string[][] = [["section", "key", "value"]];
+  metaEntries.forEach((entry) => {
+    rows.push(["meta", entry.key, entry.value || ""]);
+  });
+  dataEntries.forEach((entry) => {
+    rows.push(["data", entry.key, entry.value || ""]);
+  });
+  files.forEach((file: any, index: number) => {
+    const prefix = `file.${index + 1}`;
+    rows.push(["file", `${prefix}.field`, fieldMeta[file.field_id]?.label || file.field_id || "file"]);
+    rows.push(["file", `${prefix}.name`, String(file.original_name || "")]);
+    if (typeof file.size_bytes === "number") {
+      rows.push(["file", `${prefix}.size_bytes`, String(file.size_bytes)]);
+    }
+    if (file.vt_status) {
+      rows.push(["file", `${prefix}.vt_status`, String(file.vt_status)]);
+    }
+    if (file.vt_verdict) {
+      rows.push(["file", `${prefix}.vt_verdict`, String(file.vt_verdict)]);
+    }
+    if (file.final_drive_file_id) {
+      rows.push(["file", `${prefix}.drive_file_id`, String(file.final_drive_file_id)]);
+    }
+    if (file.drive_web_view_link) {
+      rows.push(["file", `${prefix}.drive_link`, String(file.drive_web_view_link)]);
+    }
+    if (file.finalized_at) {
+      rows.push(["file", `${prefix}.finalized_at`, formatTimeICT(file.finalized_at)]);
+    }
+  });
+  const content = rows.map((row) => row.map((cell) => csvEscapeValue(String(cell))).join(",")).join("\n");
+  return { filename, content, mimeType: "text/csv; charset=utf-8" };
 }
 
 function isoToLocalInput(value?: string | null) {
@@ -6065,6 +6415,37 @@ function SubmissionDetailPage({
     navigate("/me");
   }
 
+  function resolveSelectedSubmissionData() {
+    const selectedIsLatest = versionView.selected === "latest" || !data?.form?.save_all_versions;
+    const selectedData = selectedIsLatest ? data?.data_json : versionView.data;
+    return {
+      selectedIsLatest,
+      selectedData:
+        selectedData && typeof selectedData === "object" && !Array.isArray(selectedData)
+          ? (selectedData as Record<string, unknown>)
+          : null
+    };
+  }
+
+  function handleExportSubmission(format: SubmissionExportFormat) {
+    if (!data) return;
+    const selection = resolveSelectedSubmissionData();
+    const versionLabel = selection.selectedIsLatest
+      ? "latest"
+      : versionView.selected
+        ? `version ${versionView.selected}`
+        : "version";
+    const exportPayload = buildSubmissionExportContent({
+      submission: data,
+      dataValues: selection.selectedData,
+      fieldMeta,
+      fieldOrder,
+      format,
+      versionLabel
+    });
+    downloadTextFile(exportPayload.filename, exportPayload.content, exportPayload.mimeType);
+  }
+
   useEffect(() => {
     if (!data?.form?.slug) {
       setFieldMeta({});
@@ -6082,20 +6463,8 @@ function SubmissionDetailPage({
         return;
       }
       const fields = Array.isArray(payload?.data?.fields) ? payload.data.fields : [];
-      const nextMeta: Record<string, { label: string; type: string; rules?: Record<string, unknown> }> = {};
-      const order: string[] = [];
-      fields.forEach((field: any) => {
-        if (field?.id) {
-          const id = String(field.id);
-          order.push(id);
-          nextMeta[id] = {
-            label: field.label || id,
-            type: field.type || "text",
-            rules: field.rules && typeof field.rules === "object" ? field.rules : undefined
-          };
-        }
-      });
-      setFieldMeta(nextMeta);
+      const { meta, order } = buildFieldMetaFromSchema(fields);
+      setFieldMeta(meta);
       setFieldOrder(order);
     }
     loadFormLabels();
@@ -6197,7 +6566,30 @@ function SubmissionDetailPage({
               <div className="fw-semibold">{data.form?.title || data.form?.slug || "Form"}</div>
               {data.form?.slug ? <div className="muted">{data.form.slug}</div> : null}
             </div>
-            <div className="d-flex gap-2">
+            <div className="d-flex flex-wrap gap-2">
+              <div className="btn-group">
+                <button
+                  type="button"
+                  className="btn btn-outline-secondary btn-sm"
+                  onClick={() => handleExportSubmission("markdown")}
+                >
+                  <i className="bi bi-download" aria-hidden="true" /> Export Markdown
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-outline-secondary btn-sm"
+                  onClick={() => handleExportSubmission("txt")}
+                >
+                  <i className="bi bi-download" aria-hidden="true" /> Export TXT
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-outline-secondary btn-sm"
+                  onClick={() => handleExportSubmission("csv")}
+                >
+                  <i className="bi bi-download" aria-hidden="true" /> Export CSV
+                </button>
+              </div>
               <Link className="btn btn-outline-primary btn-sm" to={`/f/${data.form?.slug || ""}`}>
                 <i className="bi bi-box-arrow-up-right" aria-hidden="true" /> Open form
               </Link>
@@ -6280,15 +6672,12 @@ function SubmissionDetailPage({
           <div className="mt-3">
             <div className="muted mb-2">Data</div>
             {(() => {
-              const selectedIsLatest = versionView.selected === "latest" || !data.form?.save_all_versions;
-              const selectedData = selectedIsLatest
-                ? (data.data_json as Record<string, unknown> | null)
-                : versionView.data;
-              return selectedData && typeof selectedData === "object" ? (
+              const selection = resolveSelectedSubmissionData();
+              return selection.selectedData ? (
                 <div className="table-responsive">
                   <table className="table table-sm">
                     <tbody>
-                      {renderSubmissionDataTable(selectedData as Record<string, unknown>)}
+                      {renderSubmissionDataTable(selection.selectedData)}
                     </tbody>
                   </table>
                 </div>
@@ -7476,6 +7865,7 @@ function AdminPage({
   const [uploads, setUploads] = useState<any[]>([]);
   const [submissions, setSubmissions] = useState<any[]>([]);
   const [submissionsError, setSubmissionsError] = useState<string | null>(null);
+  const [submissionExportingId, setSubmissionExportingId] = useState<string | null>(null);
   const [routines, setRoutines] = useState<any[]>([]);
   const [healthSummary, setHealthSummary] = useState<any[]>([]);
   const [lastRefresh, setLastRefresh] = useState<string | null>(null);
@@ -7885,6 +8275,56 @@ function AdminPage({
 
   function clearAdminSelection(type: "forms" | "templates" | "users" | "submissions") {
     setAdminSelected((prev) => ({ ...prev, [type]: new Set() }));
+  }
+
+  async function handleAdminSubmissionExport(submissionId: string, format: SubmissionExportFormat) {
+    setSubmissionExportingId(submissionId);
+    try {
+      const response = await apiFetch(
+        `${API_BASE}/api/me/submissions/${encodeURIComponent(submissionId)}`
+      );
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        onNotice(payload?.error || "Failed to load submission.", "warning");
+        return;
+      }
+      const submission = payload?.data;
+      if (!submission) {
+        onNotice("Submission data is unavailable.", "warning");
+        return;
+      }
+
+      let meta: FieldMetaMap = {};
+      let order: string[] = [];
+      const slug = submission?.form?.slug;
+      if (slug) {
+        const formRes = await apiFetch(`${API_BASE}/api/forms/${encodeURIComponent(slug)}`);
+        const formPayload = await formRes.json().catch(() => null);
+        if (formRes.ok) {
+          const fields = Array.isArray(formPayload?.data?.fields) ? formPayload.data.fields : [];
+          const built = buildFieldMetaFromSchema(fields);
+          meta = built.meta;
+          order = built.order;
+        }
+      }
+
+      const exportPayload = buildSubmissionExportContent({
+        submission,
+        dataValues:
+          submission?.data_json && typeof submission.data_json === "object"
+            ? (submission.data_json as Record<string, unknown>)
+            : null,
+        fieldMeta: meta,
+        fieldOrder: order,
+        format,
+        versionLabel: "latest"
+      });
+      downloadTextFile(exportPayload.filename, exportPayload.content, exportPayload.mimeType);
+    } catch (error) {
+      onNotice("Failed to export submission.", "warning");
+    } finally {
+      setSubmissionExportingId(null);
+    }
   }
 
   async function loadAdmin() {
@@ -8799,6 +9239,22 @@ function AdminPage({
                       <td>{item.created_at ? formatTimeICT(item.created_at) : "n/a"}</td>
                       <td>
                         <div className="d-flex flex-wrap gap-2">
+                          <select
+                            className="form-select form-select-sm"
+                            defaultValue=""
+                            disabled={submissionExportingId === item.id}
+                            onChange={(event) => {
+                              const value = event.currentTarget.value as SubmissionExportFormat | "";
+                              if (!value) return;
+                              event.currentTarget.value = "";
+                              handleAdminSubmissionExport(item.id, value);
+                            }}
+                          >
+                            <option value="">Export...</option>
+                            <option value="markdown">Markdown</option>
+                            <option value="txt">TXT</option>
+                            <option value="csv">CSV</option>
+                          </select>
                           <button
                             type="button"
                             className="btn btn-outline-danger btn-sm"
@@ -10943,11 +11399,15 @@ function BuilderPage({
   const [formBuilderReminderUnit, setFormBuilderReminderUnit] = useState("weeks");
   const [formBuilderReminderUntil, setFormBuilderReminderUntil] = useState("");
   const [formBuilderSaveAllVersions, setFormBuilderSaveAllVersions] = useState(false);
+  const [formBuilderSubmissionBackupEnabled, setFormBuilderSubmissionBackupEnabled] =
+    useState(false);
   const [formCreateReminderEnabled, setFormCreateReminderEnabled] = useState(false);
   const [formCreateReminderValue, setFormCreateReminderValue] = useState(1);
   const [formCreateReminderUnit, setFormCreateReminderUnit] = useState("weeks");
   const [formCreateReminderUntil, setFormCreateReminderUntil] = useState("");
   const [formCreateSaveAllVersions, setFormCreateSaveAllVersions] = useState(false);
+  const [formCreateSubmissionBackupEnabled, setFormCreateSubmissionBackupEnabled] =
+    useState(false);
 
   const prevDefaultTimezoneRef = useRef(appDefaultTimezone);
   useEffect(() => {
@@ -11558,6 +12018,7 @@ function BuilderPage({
       setFormBuilderReminderValue(1);
       setFormBuilderReminderUnit("weeks");
       setFormBuilderReminderUntil("");
+      setFormBuilderSubmissionBackupEnabled(false);
       setFormCreateReminderEnabled(false);
       setFormCreateReminderValue(1);
       setFormCreateReminderUnit("weeks");
@@ -11628,6 +12089,7 @@ function BuilderPage({
         utcToLocalInputWithZone(selected.reminder_until ?? null, formBuilderAvailabilityTimezone)
       );
       setFormBuilderSaveAllVersions(Boolean(selected.save_all_versions));
+      setFormBuilderSubmissionBackupEnabled(Boolean(selected.submission_backup_enabled));
       if (selected.canvas_allowed_section_ids_json) {
         try {
           const parsed = JSON.parse(String(selected.canvas_allowed_section_ids_json));
@@ -11800,7 +12262,8 @@ function BuilderPage({
         canvasEnabled: Boolean(formData.canvas_enabled),
         canvasCourseId: formData.canvas_course_id ?? null,
         canvasAllowedSectionIds,
-        canvasFieldsPosition: formData.canvas_fields_position || "bottom"
+        canvasFieldsPosition: formData.canvas_fields_position || "bottom",
+        submissionBackupEnabled: Boolean(formData.submission_backup_enabled)
       })
     });
     const createPayload = await createRes.json().catch(() => null);
@@ -11886,7 +12349,8 @@ function BuilderPage({
           reminderEnabled: formBuilderReminderEnabled,
           reminderFrequency: `${formBuilderReminderValue}:${formBuilderReminderUnit}`,
           reminderUntil: localInputToUtcWithZone(formBuilderReminderUntil, formBuilderAvailabilityTimezone) || null,
-          saveAllVersions: formBuilderSaveAllVersions
+          saveAllVersions: formBuilderSaveAllVersions,
+          submissionBackupEnabled: formBuilderSubmissionBackupEnabled
         })
       });
       payload = await response.json().catch(() => null);
@@ -12234,6 +12698,7 @@ function BuilderPage({
           : {}),
         canvasFieldsPosition: formCreateCanvasPosition,
         saveAllVersions: formCreateSaveAllVersions,
+        submissionBackupEnabled: formCreateSubmissionBackupEnabled,
         reminderEnabled: formCreateReminderEnabled,
         reminderFrequency: `${formCreateReminderValue}:${formCreateReminderUnit}`,
         reminderUntil: localInputToUtcWithZone(formCreateReminderUntil, formCreateAvailabilityTimezone) || null
@@ -12271,6 +12736,7 @@ function BuilderPage({
     setFormCreateReminderValue(1);
     setFormCreateReminderUnit("weeks");
     setFormCreateReminderUntil("");
+    setFormCreateSubmissionBackupEnabled(false);
     await loadBuilder();
   }
 
@@ -12512,6 +12978,7 @@ function BuilderPage({
                     setFormCreateCanvasPosition("bottom");
                     setFormCreateAvailabilityTimezone(getAppDefaultTimezone());
                     setFormCreateSaveAllVersions(false);
+                    setFormCreateSubmissionBackupEnabled(false);
                     setFormDateShowTimezone(true);
                   }}
                 >
@@ -12670,6 +13137,22 @@ function BuilderPage({
                       Yes
                     </label>
                   </div>
+                </div>
+                <div className="col-md-3">
+                  <label className="form-label">Submission backup</label>
+                  <div className="form-check mt-2">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      checked={formCreateSubmissionBackupEnabled}
+                      onChange={(event) => setFormCreateSubmissionBackupEnabled(event.target.checked)}
+                      id="formCreateSubmissionBackupEnabled"
+                    />
+                    <label className="form-check-label" htmlFor="formCreateSubmissionBackupEnabled">
+                      Enable routine backups
+                    </label>
+                  </div>
+                  <div className="muted mt-1">Saves submissions to Google Drive.</div>
                 </div>
                 <div className="col-md-4">
                   <label className="form-label">Available from</label>
@@ -12994,6 +13477,23 @@ function BuilderPage({
                         Yes
                       </label>
                     </div>
+                  </div>
+                  <div className="col-md-3">
+                    <label className="form-label">Submission backup</label>
+                    <div className="form-check mt-2">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formBuilderSubmissionBackupEnabled}
+                        onChange={(event) => setFormBuilderSubmissionBackupEnabled(event.target.checked)}
+                        disabled={!formBuilderSlug}
+                        id="formBuilderSubmissionBackupEnabled"
+                      />
+                      <label className="form-check-label" htmlFor="formBuilderSubmissionBackupEnabled">
+                        Enable routine backups
+                      </label>
+                    </div>
+                    <div className="muted mt-1">Saves submissions to Google Drive.</div>
                   </div>
                   <div className="col-md-4">
                     <label className="form-label">Available from</label>

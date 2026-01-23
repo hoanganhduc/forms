@@ -79,6 +79,7 @@ type FormDetailRow = {
   reminder_frequency?: string | null;
   reminder_until?: string | null;
   save_all_versions?: number | null;
+  submission_backup_enabled?: number | null;
 };
 
 type FormSubmissionRow = {
@@ -1736,6 +1737,223 @@ async function runPeriodicReminders(env: Env) {
   }
 }
 
+const SUBMISSION_BACKUP_TASK_PREFIX = "backup_submissions:";
+const DEFAULT_SUBMISSION_BACKUP_CRON = "0 3 * * 0";
+
+function getSubmissionBackupTaskId(formSlug: string) {
+  return `${SUBMISSION_BACKUP_TASK_PREFIX}${formSlug}`;
+}
+
+function getSubmissionBackupTaskName(formSlug: string, formTitle?: string | null) {
+  const label = formTitle && formTitle.trim() ? formTitle.trim() : formSlug;
+  return `Backup submissions: ${label} (${formSlug})`;
+}
+
+async function ensureSubmissionBackupTask(
+  env: Env,
+  formSlug: string,
+  formTitle: string | null,
+  enabled: boolean
+) {
+  const taskId = getSubmissionBackupTaskId(formSlug);
+  const name = getSubmissionBackupTaskName(formSlug, formTitle);
+  const existing = await env.DB.prepare("SELECT id, cron FROM routine_tasks WHERE id=?")
+    .bind(taskId)
+    .first<{ id: string; cron: string }>();
+  if (!existing?.id) {
+    if (!enabled) return;
+    await env.DB.prepare(
+      "INSERT INTO routine_tasks (id, name, cron, enabled) VALUES (?, ?, ?, ?)"
+    )
+      .bind(taskId, name, DEFAULT_SUBMISSION_BACKUP_CRON, enabled ? 1 : 0)
+      .run();
+    return;
+  }
+  await env.DB.prepare(
+    "UPDATE routine_tasks SET name=?, enabled=?, updated_at=datetime('now') WHERE id=?"
+  )
+    .bind(name, enabled ? 1 : 0, taskId)
+    .run();
+}
+
+async function renameSubmissionBackupTask(
+  env: Env,
+  oldSlug: string,
+  newSlug: string,
+  formTitle: string | null
+) {
+  const oldId = getSubmissionBackupTaskId(oldSlug);
+  const newId = getSubmissionBackupTaskId(newSlug);
+  if (oldId === newId) return;
+  const existing = await env.DB.prepare("SELECT id FROM routine_tasks WHERE id=?")
+    .bind(oldId)
+    .first<{ id: string }>();
+  if (!existing?.id) return;
+  const newExisting = await env.DB.prepare("SELECT id FROM routine_tasks WHERE id=?")
+    .bind(newId)
+    .first<{ id: string }>();
+  if (newExisting?.id) {
+    await env.DB.prepare("DELETE FROM routine_tasks WHERE id=?")
+      .bind(oldId)
+      .run();
+    return;
+  }
+  const name = getSubmissionBackupTaskName(newSlug, formTitle);
+  await env.DB.prepare(
+    "UPDATE routine_tasks SET id=?, name=?, updated_at=datetime('now') WHERE id=?"
+  )
+    .bind(newId, name, oldId)
+    .run();
+}
+
+async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
+  if (!env.DRIVE_PARENT_FOLDER_ID || !getDriveCredentials(env)) {
+    throw new Error("drive_not_configured");
+  }
+  const accessToken = await getDriveAccessToken(env);
+  if (!accessToken) {
+    throw new Error("drive_access_failed");
+  }
+
+  const form = await env.DB.prepare(
+    "SELECT id, slug, title, description, is_locked, is_public, auth_policy FROM forms WHERE slug=? AND deleted_at IS NULL"
+  )
+    .bind(formSlug)
+    .first<{
+      id: string;
+      slug: string;
+      title: string;
+      description: string | null;
+      is_locked: number;
+      is_public: number;
+      auth_policy: string | null;
+    }>();
+  if (!form) {
+    throw new Error("form_not_found");
+  }
+
+  const createdIpSelect = (await hasColumn(env, "submissions", "created_ip"))
+    ? "s.created_ip as created_ip"
+    : "NULL as created_ip";
+  const createdUserAgentSelect = (await hasColumn(env, "submissions", "created_user_agent"))
+    ? "s.created_user_agent as created_user_agent"
+    : "NULL as created_user_agent";
+  const submitterProviderSelect = (await hasColumn(env, "submissions", "submitter_provider"))
+    ? "COALESCE(s.submitter_provider,(SELECT provider FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_provider"
+    : "(SELECT provider FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1) as submitter_provider";
+  const submitterEmailSelect = (await hasColumn(env, "submissions", "submitter_email"))
+    ? "COALESCE(s.submitter_email,(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_email"
+    : "(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1) as submitter_email";
+  const submitterGithubSelect = (await hasColumn(env, "submissions", "submitter_github_username"))
+    ? "COALESCE(s.submitter_github_username,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_github_username"
+    : "(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1) as submitter_github_username";
+
+  const { results: submissions } = await env.DB.prepare(
+    `SELECT s.id,s.user_id,s.payload_json,s.created_at,s.updated_at,${createdIpSelect},${createdUserAgentSelect},${submitterProviderSelect},${submitterEmailSelect},${submitterGithubSelect},s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name FROM submissions s WHERE s.form_id=? AND s.deleted_at IS NULL ORDER BY s.created_at ASC`
+  )
+    .bind(form.id)
+    .all<any>();
+
+  const submissionIds = submissions.map((row) => row.id).filter(Boolean) as string[];
+  const filesBySubmission = new Map<string, any[]>();
+  if (submissionIds.length > 0) {
+    const placeholders = submissionIds.map(() => "?").join(",");
+    const { results: files } = await env.DB.prepare(
+      `SELECT submission_id, field_id, original_name, size_bytes, mime_type, sha256, vt_status, vt_verdict, vt_malicious, vt_suspicious, vt_undetected, vt_timeout, vt_error, final_drive_file_id, finalized_at, drive_web_view_link FROM submission_file_items WHERE submission_id IN (${placeholders}) AND deleted_at IS NULL ORDER BY uploaded_at DESC`
+    )
+      .bind(...submissionIds)
+      .all<any>();
+    files.forEach((file) => {
+      const bucket = filesBySubmission.get(file.submission_id) || [];
+      bucket.push(file);
+      filesBySubmission.set(file.submission_id, bucket);
+    });
+  }
+
+  const normalized = submissions.map((row) => {
+    let dataJson: unknown = null;
+    try {
+      const payload = JSON.parse(row.payload_json);
+      dataJson = payload?.data ?? null;
+    } catch (error) {
+      dataJson = null;
+    }
+    return {
+      id: row.id,
+      user_id: row.user_id ?? null,
+      submitter: {
+        provider: row.submitter_provider ?? null,
+        email: row.submitter_email ?? null,
+        github_username: row.submitter_github_username ?? null
+      },
+      created_at: row.created_at ?? null,
+      updated_at: row.updated_at ?? null,
+      created_ip: row.created_ip ?? null,
+      created_user_agent: row.created_user_agent ?? null,
+      canvas: {
+        status: row.canvas_enroll_status ?? null,
+        error: row.canvas_enroll_error ?? null,
+        course_id: row.canvas_course_id ?? null,
+        section_id: row.canvas_section_id ?? null,
+        enrolled_at: row.canvas_enrolled_at ?? null,
+        user_id: row.canvas_user_id ?? null,
+        user_name: row.canvas_user_name ?? null
+      },
+      data_json: dataJson,
+      files: filesBySubmission.get(row.id) || []
+    };
+  });
+
+  const timestamp = new Date().toISOString();
+  const safeTimestamp = timestamp.replace(/[:.]/g, "-");
+  const payload = {
+    type: "submission_backup",
+    generated_at: timestamp,
+    form: {
+      slug: form.slug,
+      title: form.title,
+      description: form.description ?? null,
+      is_locked: Boolean(form.is_locked),
+      is_public: Boolean(form.is_public),
+      auth_policy: form.auth_policy ?? "optional"
+    },
+    submissions: normalized
+  };
+  const body = JSON.stringify(payload, null, 2);
+  const buffer = new TextEncoder().encode(body);
+
+  const backupsFolder = await getOrCreateFolder(env, accessToken, env.DRIVE_PARENT_FOLDER_ID, "backups");
+  if (!backupsFolder.id) {
+    throw new Error("drive_backups_folder_failed");
+  }
+  const submissionsFolder = await getOrCreateFolder(env, accessToken, backupsFolder.id, "submissions");
+  if (!submissionsFolder.id) {
+    throw new Error("drive_backups_subfolder_failed");
+  }
+  const formFolder = await getOrCreateFolder(
+    env,
+    accessToken,
+    submissionsFolder.id,
+    sanitizeDriveName(form.slug)
+  );
+  if (!formFolder.id) {
+    throw new Error("drive_backups_subfolder_failed");
+  }
+  const fileName = `submissions-${form.slug}-${safeTimestamp}.json`;
+  const uploaded = await uploadFileToDrive(
+    env,
+    accessToken,
+    formFolder.id,
+    fileName,
+    "application/json",
+    buffer
+  );
+  if (!uploaded?.id) {
+    throw new Error("drive_upload_failed");
+  }
+  return { id: uploaded.id, name: fileName };
+}
+
 async function runRoutineTaskById(env: Env, taskId: string) {
   if (taskId === "periodic_reminders") {
     await runPeriodicReminders(env);
@@ -1818,6 +2036,28 @@ async function runRoutineTaskById(env: Env, taskId: string) {
     }
     return;
   }
+  if (taskId.startsWith(SUBMISSION_BACKUP_TASK_PREFIX)) {
+    const slug = taskId.slice(SUBMISSION_BACKUP_TASK_PREFIX.length).trim();
+    if (!slug) {
+      await updateRoutineStatus(env, taskId, "skipped", "missing_slug");
+      await recordRoutineRun(env, taskId, "skipped", "missing_slug");
+      await recordHealthStatus(env, taskId, "skipped", "missing_slug");
+      return;
+    }
+    try {
+      const result = await backupFormSubmissionsToDrive(env, slug);
+      const message = `saved:${result.name}`;
+      await updateRoutineStatus(env, taskId, "ok", message);
+      await recordRoutineRun(env, taskId, "ok", message);
+      await recordHealthStatus(env, taskId, "ok", message);
+    } catch (error) {
+      const message = String((error as Error | undefined)?.message || error);
+      await updateRoutineStatus(env, taskId, "error", message);
+      await recordRoutineRun(env, taskId, "error", message);
+      await recordHealthStatus(env, taskId, "error", message);
+    }
+    return;
+  }
   if (taskId === "empty_trash") {
     const counts = await emptyAllTrash(env);
     const message = `forms ${counts.forms}, templates ${counts.templates}, users ${counts.users}, submissions ${counts.submissions}, files ${counts.files}, emails ${counts.emails}`;
@@ -1848,8 +2088,11 @@ async function backupFormsAndTemplates(env: Env) {
   if (!accessToken) {
     throw new Error("drive_access_failed");
   }
+  const submissionBackupSelect = (await hasColumn(env, "forms", "submission_backup_enabled"))
+    ? "f.submission_backup_enabled as submission_backup_enabled"
+    : "NULL as submission_backup_enabled";
   const { results: formRows } = await env.DB.prepare(
-    "SELECT f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.template_id,t.key as templateKey,f.file_rules_json,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.deleted_at IS NULL"
+    `SELECT f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.template_id,t.key as templateKey,f.file_rules_json,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,${submissionBackupSelect},fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.deleted_at IS NULL`
   ).all<Record<string, unknown>>();
   const { results: templateRows } = await env.DB.prepare(
     "SELECT key,name,schema_json,file_rules_json FROM templates WHERE deleted_at IS NULL"
@@ -1875,6 +2118,7 @@ async function backupFormsAndTemplates(env: Env) {
       available_from: row.available_from ?? null,
       available_until: row.available_until ?? null,
       password_required: Boolean(row.password_required),
+      submission_backup_enabled: Boolean((row as any).submission_backup_enabled ?? 0),
       password_salt: row.password_salt ?? null,
       password_hash: row.password_hash ?? null
     }))
@@ -7971,8 +8215,11 @@ export default {
         const reminderUntilSelect = (await hasColumn(env, "forms", "reminder_until"))
           ? "f.reminder_until"
           : "NULL as reminder_until";
+        const submissionBackupSelect = (await hasColumn(env, "forms", "submission_backup_enabled"))
+          ? "f.submission_backup_enabled as submission_backup_enabled"
+          : "NULL as submission_backup_enabled";
         const { results } = await env.DB.prepare(
-          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},${submissionBackupSelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
         ).all<AdminFormRow & { submission_count?: number; updated_at?: string | null; created_at?: string | null }>();
 
         const data = results.map((row) => ({
@@ -7999,7 +8246,8 @@ export default {
           save_all_versions: toBoolean(row.save_all_versions ?? 0),
           reminder_enabled: toBoolean((row as any).reminder_enabled ?? 0),
           reminder_frequency: (row as any).reminder_frequency ?? null,
-          reminder_until: (row as any).reminder_until ?? null
+          reminder_until: (row as any).reminder_until ?? null,
+          submission_backup_enabled: toBoolean((row as any).submission_backup_enabled ?? 0)
         }));
 
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -8008,8 +8256,11 @@ export default {
       const formBackupMatch = url.pathname.match(/^\/api\/admin\/forms\/([^/]+)\/backup$/);
       if (request.method === "GET" && formBackupMatch) {
         const slug = decodeURIComponent(formBackupMatch[1]);
+        const submissionBackupSelect = (await hasColumn(env, "forms", "submission_backup_enabled"))
+          ? "f.submission_backup_enabled as submission_backup_enabled"
+          : "NULL as submission_backup_enabled";
         const formRow = await env.DB.prepare(
-          "SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL"
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,${submissionBackupSelect},t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL`
         )
           .bind(slug)
           .first<{
@@ -8034,6 +8285,7 @@ export default {
             file_rules_json: string | null;
             reminder_enabled: number;
             reminder_frequency: string | null;
+            submission_backup_enabled: number | null;
             template_key: string | null;
             template_name: string | null;
             template_schema_json: string | null;
@@ -8057,6 +8309,7 @@ export default {
             slug: formRow.slug,
             reminder_enabled: toBoolean(formRow.reminder_enabled),
             reminder_frequency: formRow.reminder_frequency,
+            submission_backup_enabled: toBoolean(formRow.submission_backup_enabled ?? 0),
             title: formRow.title,
             description: formRow.description ?? null,
             is_locked: toBoolean(formRow.is_locked),
@@ -8959,6 +9212,7 @@ export default {
             : form.file_rules_json
               ? JSON.stringify(form.file_rules_json)
               : null;
+        const submissionBackupEnabled = Boolean(form.submission_backup_enabled);
         const formVersionSchema = formSchemaJson || templateSchemaJson;
 
         if (existingForm?.id && existingForm.deleted_at !== null && body?.restoreTrash !== true) {
@@ -8968,7 +9222,7 @@ export default {
         }
         if (existingForm?.id) {
           await env.DB.prepare(
-            "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_require_access=?, password_require_submit=?, password_salt=?, password_hash=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+            "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_require_access=?, password_require_submit=?, password_salt=?, password_hash=?, submission_backup_enabled=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
           )
             .bind(
               form.title,
@@ -8989,6 +9243,7 @@ export default {
               passwordRequireSubmit ? 1 : 0,
               passwordRequired ? passwordSalt : null,
               passwordRequired ? passwordHash : null,
+              submissionBackupEnabled ? 1 : 0,
               existingForm.id
             )
             .run();
@@ -9010,6 +9265,9 @@ export default {
                 .run();
             }
           }
+          if (await hasColumn(env, "forms", "submission_backup_enabled")) {
+            await ensureSubmissionBackupTask(env, form.slug, form.title, submissionBackupEnabled);
+          }
           return jsonResponse(
             200,
             { ok: true, updated: true, restored: existingForm.deleted_at !== null, requestId },
@@ -9020,7 +9278,7 @@ export default {
 
         const formId = crypto.randomUUID();
         await env.DB.prepare(
-          "INSERT INTO forms (id, slug, title, description, template_id, is_public, is_locked, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, reminder_enabled, reminder_frequency, reminder_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO forms (id, slug, title, description, template_id, is_public, is_locked, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, reminder_enabled, reminder_frequency, reminder_until, submission_backup_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
           .bind(
             formId,
@@ -9045,7 +9303,8 @@ export default {
             passwordRequired ? passwordHash : null,
             body.reminderEnabled ? 1 : 0,
             body.reminderFrequency || "weekly",
-            body.reminderUntil || null
+            body.reminderUntil || null,
+            submissionBackupEnabled ? 1 : 0
           )
           .run();
 
@@ -9055,6 +9314,9 @@ export default {
           )
             .bind(crypto.randomUUID(), formId, formVersionSchema)
             .run();
+        }
+        if (await hasColumn(env, "forms", "submission_backup_enabled")) {
+          await ensureSubmissionBackupTask(env, form.slug, form.title, submissionBackupEnabled);
         }
 
         return jsonResponse(201, { ok: true, created: true, requestId }, requestId, corsHeaders);
@@ -9169,6 +9431,7 @@ export default {
           reminderFrequency?: string;
           reminderUntil?: string | null;
           saveAllVersions?: boolean | number;
+          submissionBackupEnabled?: boolean;
         } | null = null;
         try {
           body = await parseJsonBody(request);
@@ -9365,6 +9628,12 @@ export default {
             message: "expected_boolean"
           });
         }
+        if (body.submissionBackupEnabled !== undefined && typeof body.submissionBackupEnabled !== "boolean") {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "submissionBackupEnabled",
+            message: "expected_boolean"
+          });
+        }
 
         if (body.reminderFrequency !== undefined && body.reminderFrequency !== null) {
           if (!["daily", "weekly", "monthly"].includes(body.reminderFrequency) && !/^\d+:(days|weeks|months)$/.test(body.reminderFrequency)) {
@@ -9468,7 +9737,8 @@ export default {
           { name: "save_all_versions", value: body?.saveAllVersions ? 1 : 0 },
           { name: "reminder_enabled", value: body.reminderEnabled ? 1 : 0 },
           { name: "reminder_frequency", value: body.reminderFrequency || "weekly" },
-          { name: "reminder_until", value: body.reminderUntil || null }
+          { name: "reminder_until", value: body.reminderUntil || null },
+          { name: "submission_backup_enabled", value: body.submissionBackupEnabled ? 1 : 0 }
         ];
         const formInsertColumns = formInsertBase.map((item) => item.name);
         const formInsertValues = formInsertBase.map((item) => item.value);
@@ -9535,6 +9805,15 @@ export default {
           }
         }
 
+        if (createdFormId && await hasColumn(env, "forms", "submission_backup_enabled")) {
+          await ensureSubmissionBackupTask(
+            env,
+            body.slug.trim(),
+            body.title.trim(),
+            Boolean(body.submissionBackupEnabled)
+          );
+        }
+
         return jsonResponse(
           201,
           {
@@ -9593,6 +9872,7 @@ export default {
             reminderFrequency?: string;
             reminderUntil?: string | null;
             saveAllVersions?: boolean | number;
+            submissionBackupEnabled?: boolean;
           } | null = null;
           try {
             body = await parseJsonBody(request);
@@ -9620,6 +9900,7 @@ export default {
             "reminder_frequency",
             "reminder_until",
             "save_all_versions",
+            "submission_backup_enabled",
             "file_rules_json",
             "template_id"
           ];
@@ -9627,7 +9908,7 @@ export default {
           for (const column of optionalColumns) {
             supportedColumns.set(column, await hasColumn(env, "forms", column));
           }
-          const formRowColumns = ["id", "slug"];
+          const formRowColumns = ["id", "slug", "title"];
           const formRowOptionalColumns = [
             "password_required",
             "password_require_access",
@@ -9637,7 +9918,8 @@ export default {
             "available_from",
             "available_until",
             "reminder_until",
-            "canvas_course_id"
+            "canvas_course_id",
+            "submission_backup_enabled"
           ];
           for (const column of formRowOptionalColumns) {
             const select = (await hasColumn(env, "forms", column)) ? column : `NULL as ${column}`;
@@ -9650,6 +9932,7 @@ export default {
             .first<{
               id: string;
               slug: string;
+              title: string;
               password_required: number | null;
               password_require_access: number | null;
               password_require_submit: number | null;
@@ -9659,6 +9942,7 @@ export default {
               available_until: string | null;
               reminder_until: string | null;
               canvas_course_id: string | null;
+              submission_backup_enabled: number | null;
             }>();
           if (!formRow) {
             return errorResponse(404, "not_found", requestId, corsHeaders);
@@ -9833,6 +10117,16 @@ export default {
             }
             updates.push("auth_policy=?");
             params.push(body.auth_policy);
+          }
+
+          if (body?.submissionBackupEnabled !== undefined) {
+            if (typeof body.submissionBackupEnabled !== "boolean") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "submissionBackupEnabled",
+                message: "expected_boolean"
+              });
+            }
+            pushOptionalUpdate("submission_backup_enabled", body.submissionBackupEnabled ? 1 : 0, true);
           }
 
           if (body?.canvasEnabled !== undefined) {
@@ -10100,6 +10394,19 @@ export default {
           )
             .bind(...params)
             .run();
+          const nextSlug = newSlug ?? slug;
+          if (await hasColumn(env, "forms", "submission_backup_enabled")) {
+            const nextTitle = body?.title ? body.title.trim() : formRow.title;
+            const currentBackupEnabled = toBoolean(formRow.submission_backup_enabled ?? 0);
+            const nextBackupEnabled =
+              body?.submissionBackupEnabled !== undefined
+                ? Boolean(body.submissionBackupEnabled)
+                : currentBackupEnabled;
+            if (newSlug) {
+              await renameSubmissionBackupTask(env, slug, nextSlug, nextTitle);
+            }
+            await ensureSubmissionBackupTask(env, nextSlug, nextTitle, nextBackupEnabled);
+          }
           if (newSlug) {
             if (await hasColumn(env, "submissions", "form_slug")) {
               try {
@@ -12328,8 +12635,23 @@ export default {
       const reminderUntilSelect = (await hasColumn(env, "forms", "reminder_until"))
         ? "f.reminder_until as reminder_until"
         : "NULL as reminder_until";
+      const createdIpSelect = (await hasColumn(env, "submissions", "created_ip"))
+        ? "s.created_ip as created_ip"
+        : "NULL as created_ip";
+      const createdUserAgentSelect = (await hasColumn(env, "submissions", "created_user_agent"))
+        ? "s.created_user_agent as created_user_agent"
+        : "NULL as created_user_agent";
+      const submitterProviderSelect = (await hasColumn(env, "submissions", "submitter_provider"))
+        ? "COALESCE(s.submitter_provider,(SELECT provider FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_provider"
+        : "(SELECT provider FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1) as submitter_provider";
+      const submitterEmailSelect = (await hasColumn(env, "submissions", "submitter_email"))
+        ? "COALESCE(s.submitter_email,(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_email"
+        : "(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1) as submitter_email";
+      const submitterGithubSelect = (await hasColumn(env, "submissions", "submitter_github_username"))
+        ? "COALESCE(s.submitter_github_username,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_github_username"
+        : "(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1) as submitter_github_username";
       const submission = await env.DB.prepare(
-        `SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect} FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL`
+        `SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,${createdIpSelect},${createdUserAgentSelect},${submitterProviderSelect},${submitterEmailSelect},${submitterGithubSelect},s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect} FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL`
       )
         .bind(submissionId)
         .first<{
@@ -12339,6 +12661,11 @@ export default {
           payload_json: string;
           created_at: string | null;
           updated_at: string | null;
+          created_ip: string | null;
+          created_user_agent: string | null;
+          submitter_provider: string | null;
+          submitter_email: string | null;
+          submitter_github_username: string | null;
           canvas_enroll_status: string | null;
           canvas_enroll_error: string | null;
           canvas_course_id: string | null;
@@ -12405,6 +12732,14 @@ export default {
         {
           data: {
             submissionId: submission.id,
+            user_id: submission.user_id ?? null,
+            submitter: {
+              provider: submission.submitter_provider ?? null,
+              email: submission.submitter_email ?? null,
+              github_username: submission.submitter_github_username ?? null
+            },
+            created_ip: submission.created_ip ?? null,
+            created_user_agent: submission.created_user_agent ?? null,
             data_json: payload?.data ?? null,
             files: Array.isArray(filesResult?.results) ? filesResult.results : [],
             created_at: submission.created_at,
