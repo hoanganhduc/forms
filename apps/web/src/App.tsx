@@ -11401,6 +11401,9 @@ function BuilderPage({
   const [formBuilderSaveAllVersions, setFormBuilderSaveAllVersions] = useState(false);
   const [formBuilderSubmissionBackupEnabled, setFormBuilderSubmissionBackupEnabled] =
     useState(false);
+  const [formBuilderSubmissionBackupFormats, setFormBuilderSubmissionBackupFormats] = useState<string[]>(
+    ["json"]
+  );
   const [formCreateReminderEnabled, setFormCreateReminderEnabled] = useState(false);
   const [formCreateReminderValue, setFormCreateReminderValue] = useState(1);
   const [formCreateReminderUnit, setFormCreateReminderUnit] = useState("weeks");
@@ -11408,6 +11411,9 @@ function BuilderPage({
   const [formCreateSaveAllVersions, setFormCreateSaveAllVersions] = useState(false);
   const [formCreateSubmissionBackupEnabled, setFormCreateSubmissionBackupEnabled] =
     useState(false);
+  const [formCreateSubmissionBackupFormats, setFormCreateSubmissionBackupFormats] = useState<string[]>(
+    ["json"]
+  );
 
   const prevDefaultTimezoneRef = useRef(appDefaultTimezone);
   useEffect(() => {
@@ -12019,6 +12025,7 @@ function BuilderPage({
       setFormBuilderReminderUnit("weeks");
       setFormBuilderReminderUntil("");
       setFormBuilderSubmissionBackupEnabled(false);
+      setFormBuilderSubmissionBackupFormats(["json"]);
       setFormCreateReminderEnabled(false);
       setFormCreateReminderValue(1);
       setFormCreateReminderUnit("weeks");
@@ -12090,6 +12097,11 @@ function BuilderPage({
       );
       setFormBuilderSaveAllVersions(Boolean(selected.save_all_versions));
       setFormBuilderSubmissionBackupEnabled(Boolean(selected.submission_backup_enabled));
+      setFormBuilderSubmissionBackupFormats(
+        Array.isArray(selected.submission_backup_formats) && selected.submission_backup_formats.length > 0
+          ? selected.submission_backup_formats
+          : ["json"]
+      );
       if (selected.canvas_allowed_section_ids_json) {
         try {
           const parsed = JSON.parse(String(selected.canvas_allowed_section_ids_json));
@@ -12263,7 +12275,11 @@ function BuilderPage({
         canvasCourseId: formData.canvas_course_id ?? null,
         canvasAllowedSectionIds,
         canvasFieldsPosition: formData.canvas_fields_position || "bottom",
-        submissionBackupEnabled: Boolean(formData.submission_backup_enabled)
+        submissionBackupEnabled: Boolean(formData.submission_backup_enabled),
+        submissionBackupFormats:
+          Array.isArray(formData.submission_backup_formats) && formData.submission_backup_formats.length > 0
+            ? formData.submission_backup_formats
+            : ["json"]
       })
     });
     const createPayload = await createRes.json().catch(() => null);
@@ -12350,7 +12366,8 @@ function BuilderPage({
           reminderFrequency: `${formBuilderReminderValue}:${formBuilderReminderUnit}`,
           reminderUntil: localInputToUtcWithZone(formBuilderReminderUntil, formBuilderAvailabilityTimezone) || null,
           saveAllVersions: formBuilderSaveAllVersions,
-          submissionBackupEnabled: formBuilderSubmissionBackupEnabled
+          submissionBackupEnabled: formBuilderSubmissionBackupEnabled,
+          submissionBackupFormats: formBuilderSubmissionBackupFormats
         })
       });
       payload = await response.json().catch(() => null);
@@ -12699,6 +12716,7 @@ function BuilderPage({
         canvasFieldsPosition: formCreateCanvasPosition,
         saveAllVersions: formCreateSaveAllVersions,
         submissionBackupEnabled: formCreateSubmissionBackupEnabled,
+        submissionBackupFormats: formCreateSubmissionBackupFormats,
         reminderEnabled: formCreateReminderEnabled,
         reminderFrequency: `${formCreateReminderValue}:${formCreateReminderUnit}`,
         reminderUntil: localInputToUtcWithZone(formCreateReminderUntil, formCreateAvailabilityTimezone) || null
@@ -12737,6 +12755,7 @@ function BuilderPage({
     setFormCreateReminderUnit("weeks");
     setFormCreateReminderUntil("");
     setFormCreateSubmissionBackupEnabled(false);
+    setFormCreateSubmissionBackupFormats(["json"]);
     await loadBuilder();
   }
 
@@ -12979,6 +12998,7 @@ function BuilderPage({
                     setFormCreateAvailabilityTimezone(getAppDefaultTimezone());
                     setFormCreateSaveAllVersions(false);
                     setFormCreateSubmissionBackupEnabled(false);
+                    setFormCreateSubmissionBackupFormats(["json"]);
                     setFormDateShowTimezone(true);
                   }}
                 >
@@ -13153,6 +13173,34 @@ function BuilderPage({
                     </label>
                   </div>
                   <div className="muted mt-1">Saves submissions to Google Drive.</div>
+                  <div className="mt-2">
+                    {["json", "markdown", "csv"].map((format) => {
+                      const id = `formCreateSubmissionBackupFormat-${format}`;
+                      return (
+                        <div key={format} className="form-check form-check-inline">
+                          <input
+                            className="form-check-input"
+                            type="checkbox"
+                            id={id}
+                            disabled={!formCreateSubmissionBackupEnabled}
+                            checked={formCreateSubmissionBackupFormats.includes(format)}
+                            onChange={(event) => {
+                              const checked = event.target.checked;
+                              setFormCreateSubmissionBackupFormats((prev) => {
+                                const next = new Set(prev);
+                                if (checked) next.add(format);
+                                else next.delete(format);
+                                return next.size > 0 ? Array.from(next) : ["json"];
+                              });
+                            }}
+                          />
+                          <label className="form-check-label" htmlFor={id}>
+                            {format.toUpperCase()}
+                          </label>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
                 <div className="col-md-4">
                   <label className="form-label">Available from</label>
@@ -13494,6 +13542,34 @@ function BuilderPage({
                       </label>
                     </div>
                     <div className="muted mt-1">Saves submissions to Google Drive.</div>
+                    <div className="mt-2">
+                      {["json", "markdown", "csv"].map((format) => {
+                        const id = `formBuilderSubmissionBackupFormat-${format}`;
+                        return (
+                          <div key={format} className="form-check form-check-inline">
+                            <input
+                              className="form-check-input"
+                              type="checkbox"
+                              id={id}
+                              disabled={!formBuilderSlug || !formBuilderSubmissionBackupEnabled}
+                              checked={formBuilderSubmissionBackupFormats.includes(format)}
+                              onChange={(event) => {
+                                const checked = event.target.checked;
+                                setFormBuilderSubmissionBackupFormats((prev) => {
+                                  const next = new Set(prev);
+                                  if (checked) next.add(format);
+                                  else next.delete(format);
+                                  return next.size > 0 ? Array.from(next) : ["json"];
+                                });
+                              }}
+                            />
+                            <label className="form-check-label" htmlFor={id}>
+                              {format.toUpperCase()}
+                            </label>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                   <div className="col-md-4">
                     <label className="form-label">Available from</label>

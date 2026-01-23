@@ -80,6 +80,7 @@ type FormDetailRow = {
   reminder_until?: string | null;
   save_all_versions?: number | null;
   submission_backup_enabled?: number | null;
+  submission_backup_formats?: string | null;
 };
 
 type FormSubmissionRow = {
@@ -1739,6 +1740,8 @@ async function runPeriodicReminders(env: Env) {
 
 const SUBMISSION_BACKUP_TASK_PREFIX = "backup_submissions:";
 const DEFAULT_SUBMISSION_BACKUP_CRON = "0 3 * * 0";
+const SUBMISSION_BACKUP_FORMATS = ["json", "markdown", "csv"] as const;
+type SubmissionBackupFormat = (typeof SUBMISSION_BACKUP_FORMATS)[number];
 
 function getSubmissionBackupTaskId(formSlug: string) {
   return `${SUBMISSION_BACKUP_TASK_PREFIX}${formSlug}`;
@@ -1747,6 +1750,41 @@ function getSubmissionBackupTaskId(formSlug: string) {
 function getSubmissionBackupTaskName(formSlug: string, formTitle?: string | null) {
   const label = formTitle && formTitle.trim() ? formTitle.trim() : formSlug;
   return `Backup submissions: ${label} (${formSlug})`;
+}
+
+function parseSubmissionBackupFormats(value: unknown): SubmissionBackupFormat[] {
+  if (Array.isArray(value)) {
+    const formats = value
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry): entry is SubmissionBackupFormat =>
+        SUBMISSION_BACKUP_FORMATS.includes(entry as SubmissionBackupFormat)
+      );
+    return formats.length > 0 ? formats : ["json"];
+  }
+  if (typeof value === "string" && value.trim()) {
+    try {
+      const parsed = JSON.parse(value);
+      return parseSubmissionBackupFormats(parsed);
+    } catch (error) {
+      const parts = value.split(",").map((entry) => entry.trim().toLowerCase());
+      const formats = parts.filter((entry): entry is SubmissionBackupFormat =>
+        SUBMISSION_BACKUP_FORMATS.includes(entry as SubmissionBackupFormat)
+      );
+      return formats.length > 0 ? formats : ["json"];
+    }
+  }
+  return ["json"];
+}
+
+function serializeSubmissionBackupFormats(formats: SubmissionBackupFormat[]) {
+  const normalized = formats
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry): entry is SubmissionBackupFormat =>
+      SUBMISSION_BACKUP_FORMATS.includes(entry as SubmissionBackupFormat)
+    );
+  const finalFormats = normalized.length > 0 ? Array.from(new Set(normalized)) : ["json"];
+  return JSON.stringify(finalFormats);
 }
 
 async function ensureSubmissionBackupTask(
@@ -1815,8 +1853,11 @@ async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
     throw new Error("drive_access_failed");
   }
 
+  const submissionBackupFormatsSelect = (await hasColumn(env, "forms", "submission_backup_formats"))
+    ? "submission_backup_formats"
+    : "NULL as submission_backup_formats";
   const form = await env.DB.prepare(
-    "SELECT id, slug, title, description, is_locked, is_public, auth_policy FROM forms WHERE slug=? AND deleted_at IS NULL"
+    `SELECT id, slug, title, description, is_locked, is_public, auth_policy, ${submissionBackupFormatsSelect} FROM forms WHERE slug=? AND deleted_at IS NULL`
   )
     .bind(formSlug)
     .first<{
@@ -1827,10 +1868,12 @@ async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
       is_locked: number;
       is_public: number;
       auth_policy: string | null;
+      submission_backup_formats: string | null;
     }>();
   if (!form) {
     throw new Error("form_not_found");
   }
+  const formats = parseSubmissionBackupFormats(form.submission_backup_formats);
 
   const createdIpSelect = (await hasColumn(env, "submissions", "created_ip"))
     ? "s.created_ip as created_ip"
@@ -1904,11 +1947,12 @@ async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
     };
   });
 
-  const timestamp = new Date().toISOString();
-  const safeTimestamp = timestamp.replace(/[:.]/g, "-");
+  const timestamp = new Date();
+  const timestampIso = timestamp.toISOString();
+  const safeTimestamp = timestampIso.replace(/[:.]/g, "-");
   const payload = {
     type: "submission_backup",
-    generated_at: timestamp,
+    generated_at: timestampIso,
     form: {
       slug: form.slug,
       title: form.title,
@@ -1919,8 +1963,6 @@ async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
     },
     submissions: normalized
   };
-  const body = JSON.stringify(payload, null, 2);
-  const buffer = new TextEncoder().encode(body);
 
   const backupsFolder = await getOrCreateFolder(env, accessToken, env.DRIVE_PARENT_FOLDER_ID, "backups");
   if (!backupsFolder.id) {
@@ -1939,19 +1981,158 @@ async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
   if (!formFolder.id) {
     throw new Error("drive_backups_subfolder_failed");
   }
-  const fileName = `submissions-${form.slug}-${safeTimestamp}.json`;
-  const uploaded = await uploadFileToDrive(
-    env,
-    accessToken,
-    formFolder.id,
-    fileName,
-    "application/json",
-    buffer
-  );
-  if (!uploaded?.id) {
-    throw new Error("drive_upload_failed");
+  const uploads: Array<{ id: string; name: string }> = [];
+
+  if (formats.includes("json")) {
+    const body = JSON.stringify(payload, null, 2);
+    const buffer = new TextEncoder().encode(body);
+    const fileName = `submissions-${form.slug}-${safeTimestamp}.json`;
+    const uploaded = await uploadFileToDrive(
+      env,
+      accessToken,
+      formFolder.id,
+      fileName,
+      "application/json",
+      buffer
+    );
+    if (!uploaded?.id) {
+      throw new Error("drive_upload_failed");
+    }
+    uploads.push({ id: uploaded.id, name: fileName });
   }
-  return { id: uploaded.id, name: fileName };
+
+  if (formats.includes("markdown")) {
+    const lines: string[] = [
+      "# Submission backup",
+      "",
+      `Generated at: ${payload.generated_at}`,
+      `Form: ${payload.form.title} (${payload.form.slug})`,
+      ""
+    ];
+    if (payload.form.description) {
+      lines.push(payload.form.description, "");
+    }
+    lines.push(`Total submissions: ${payload.submissions.length}`, "");
+    payload.submissions.forEach((submission) => {
+      lines.push(`## Submission ${submission.id}`);
+      lines.push(`- User ID: ${submission.user_id ?? "n/a"}`);
+      lines.push(`- Submitter email: ${submission.submitter?.email ?? "n/a"}`);
+      lines.push(`- Submitter provider: ${submission.submitter?.provider ?? "n/a"}`);
+      lines.push(`- Submitter GitHub: ${submission.submitter?.github_username ?? "n/a"}`);
+      lines.push(`- Created: ${submission.created_at ?? "n/a"}`);
+      lines.push(`- Updated: ${submission.updated_at ?? "n/a"}`);
+      if (submission.created_ip) lines.push(`- Created IP: ${submission.created_ip}`);
+      if (submission.created_user_agent) lines.push(`- User agent: ${submission.created_user_agent}`);
+      if (submission.canvas?.status) {
+        lines.push(`- Canvas status: ${submission.canvas.status}`);
+        if (submission.canvas.error) lines.push(`- Canvas error: ${submission.canvas.error}`);
+      }
+      lines.push("", "### Data");
+      const data = submission.data_json && typeof submission.data_json === "object" ? submission.data_json : {};
+      const dataEntries = Object.entries(data as Record<string, unknown>);
+      if (dataEntries.length === 0) {
+        lines.push("_No data_", "");
+      } else {
+        lines.push("| Field | Value |", "| --- | --- |");
+        dataEntries.forEach(([key, value]) => {
+          lines.push(`| ${key} | ${stringifyCsvValue(value).replace(/\r?\n/g, "<br>")} |`);
+        });
+        lines.push("");
+      }
+      lines.push("### Files");
+      if (!submission.files || submission.files.length === 0) {
+        lines.push("_No files_", "");
+      } else {
+        lines.push("| Field | File | Size | VirusTotal | Drive |", "| --- | --- | --- | --- | --- |");
+        submission.files.forEach((file: any) => {
+          const driveLink = file.drive_web_view_link ? file.drive_web_view_link : file.final_drive_file_id || "";
+          const vt = file.vt_verdict
+            ? `${file.vt_status || "pending"} (${file.vt_verdict})`
+            : file.vt_status || "pending";
+          lines.push(
+            `| ${file.field_id || ""} | ${file.original_name || ""} | ${file.size_bytes ?? ""} | ${vt} | ${driveLink} |`
+          );
+        });
+        lines.push("");
+      }
+    });
+    const body = lines.join("\n");
+    const buffer = new TextEncoder().encode(body);
+    const fileName = `submissions-${form.slug}-${safeTimestamp}.md`;
+    const uploaded = await uploadFileToDrive(
+      env,
+      accessToken,
+      formFolder.id,
+      fileName,
+      "text/markdown",
+      buffer
+    );
+    if (!uploaded?.id) {
+      throw new Error("drive_upload_failed");
+    }
+    uploads.push({ id: uploaded.id, name: fileName });
+  }
+
+  if (formats.includes("csv")) {
+    const headers = [
+      "submission_id",
+      "user_id",
+      "submitter_email",
+      "submitter_provider",
+      "submitter_github_username",
+      "created_at",
+      "updated_at",
+      "created_ip",
+      "created_user_agent",
+      "canvas_status",
+      "canvas_error",
+      "canvas_course_id",
+      "canvas_section_id",
+      "canvas_user_id",
+      "canvas_user_name",
+      "data_json",
+      "files_json"
+    ];
+    const lines = [headers.join(",")];
+    normalized.forEach((row) => {
+      const values = [
+        row.id,
+        row.user_id ?? "",
+        row.submitter?.email ?? "",
+        row.submitter?.provider ?? "",
+        row.submitter?.github_username ?? "",
+        row.created_at ?? "",
+        row.updated_at ?? "",
+        row.created_ip ?? "",
+        row.created_user_agent ?? "",
+        row.canvas?.status ?? "",
+        row.canvas?.error ?? "",
+        row.canvas?.course_id ?? "",
+        row.canvas?.section_id ?? "",
+        row.canvas?.user_id ?? "",
+        row.canvas?.user_name ?? "",
+        JSON.stringify(row.data_json ?? {}),
+        JSON.stringify(row.files ?? [])
+      ].map((value) => csvEscape(String(value ?? "")));
+      lines.push(values.join(","));
+    });
+    const body = `\ufeff${lines.join("\n")}`;
+    const buffer = new TextEncoder().encode(body);
+    const fileName = `submissions-${form.slug}-${safeTimestamp}.csv`;
+    const uploaded = await uploadFileToDrive(
+      env,
+      accessToken,
+      formFolder.id,
+      fileName,
+      "text/csv; charset=utf-8",
+      buffer
+    );
+    if (!uploaded?.id) {
+      throw new Error("drive_upload_failed");
+    }
+    uploads.push({ id: uploaded.id, name: fileName });
+  }
+  return { uploads };
 }
 
 async function runRoutineTaskById(env: Env, taskId: string) {
@@ -2046,7 +2227,8 @@ async function runRoutineTaskById(env: Env, taskId: string) {
     }
     try {
       const result = await backupFormSubmissionsToDrive(env, slug);
-      const message = `saved:${result.name}`;
+      const names = result.uploads.map((item) => item.name).join(",");
+      const message = names ? `saved:${names}` : "saved";
       await updateRoutineStatus(env, taskId, "ok", message);
       await recordRoutineRun(env, taskId, "ok", message);
       await recordHealthStatus(env, taskId, "ok", message);
@@ -2091,8 +2273,11 @@ async function backupFormsAndTemplates(env: Env) {
   const submissionBackupSelect = (await hasColumn(env, "forms", "submission_backup_enabled"))
     ? "f.submission_backup_enabled as submission_backup_enabled"
     : "NULL as submission_backup_enabled";
+  const submissionBackupFormatsSelect = (await hasColumn(env, "forms", "submission_backup_formats"))
+    ? "f.submission_backup_formats as submission_backup_formats"
+    : "NULL as submission_backup_formats";
   const { results: formRows } = await env.DB.prepare(
-    `SELECT f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.template_id,t.key as templateKey,f.file_rules_json,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,${submissionBackupSelect},fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.deleted_at IS NULL`
+    `SELECT f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.template_id,t.key as templateKey,f.file_rules_json,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,${submissionBackupSelect},${submissionBackupFormatsSelect},fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.deleted_at IS NULL`
   ).all<Record<string, unknown>>();
   const { results: templateRows } = await env.DB.prepare(
     "SELECT key,name,schema_json,file_rules_json FROM templates WHERE deleted_at IS NULL"
@@ -2119,6 +2304,7 @@ async function backupFormsAndTemplates(env: Env) {
       available_until: row.available_until ?? null,
       password_required: Boolean(row.password_required),
       submission_backup_enabled: Boolean((row as any).submission_backup_enabled ?? 0),
+      submission_backup_formats: parseSubmissionBackupFormats((row as any).submission_backup_formats),
       password_salt: row.password_salt ?? null,
       password_hash: row.password_hash ?? null
     }))
@@ -8218,8 +8404,11 @@ export default {
         const submissionBackupSelect = (await hasColumn(env, "forms", "submission_backup_enabled"))
           ? "f.submission_backup_enabled as submission_backup_enabled"
           : "NULL as submission_backup_enabled";
+        const submissionBackupFormatsSelect = (await hasColumn(env, "forms", "submission_backup_formats"))
+          ? "f.submission_backup_formats as submission_backup_formats"
+          : "NULL as submission_backup_formats";
         const { results } = await env.DB.prepare(
-          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},${submissionBackupSelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},${submissionBackupSelect},${submissionBackupFormatsSelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
         ).all<AdminFormRow & { submission_count?: number; updated_at?: string | null; created_at?: string | null }>();
 
         const data = results.map((row) => ({
@@ -8247,7 +8436,8 @@ export default {
           reminder_enabled: toBoolean((row as any).reminder_enabled ?? 0),
           reminder_frequency: (row as any).reminder_frequency ?? null,
           reminder_until: (row as any).reminder_until ?? null,
-          submission_backup_enabled: toBoolean((row as any).submission_backup_enabled ?? 0)
+          submission_backup_enabled: toBoolean((row as any).submission_backup_enabled ?? 0),
+          submission_backup_formats: parseSubmissionBackupFormats((row as any).submission_backup_formats)
         }));
 
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -8259,8 +8449,11 @@ export default {
         const submissionBackupSelect = (await hasColumn(env, "forms", "submission_backup_enabled"))
           ? "f.submission_backup_enabled as submission_backup_enabled"
           : "NULL as submission_backup_enabled";
+        const submissionBackupFormatsSelect = (await hasColumn(env, "forms", "submission_backup_formats"))
+          ? "f.submission_backup_formats as submission_backup_formats"
+          : "NULL as submission_backup_formats";
         const formRow = await env.DB.prepare(
-          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,${submissionBackupSelect},t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL`
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,${submissionBackupSelect},${submissionBackupFormatsSelect},t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL`
         )
           .bind(slug)
           .first<{
@@ -8286,6 +8479,7 @@ export default {
             reminder_enabled: number;
             reminder_frequency: string | null;
             submission_backup_enabled: number | null;
+            submission_backup_formats: string | null;
             template_key: string | null;
             template_name: string | null;
             template_schema_json: string | null;
@@ -8310,6 +8504,7 @@ export default {
             reminder_enabled: toBoolean(formRow.reminder_enabled),
             reminder_frequency: formRow.reminder_frequency,
             submission_backup_enabled: toBoolean(formRow.submission_backup_enabled ?? 0),
+            submission_backup_formats: parseSubmissionBackupFormats(formRow.submission_backup_formats),
             title: formRow.title,
             description: formRow.description ?? null,
             is_locked: toBoolean(formRow.is_locked),
@@ -9213,6 +9408,7 @@ export default {
               ? JSON.stringify(form.file_rules_json)
               : null;
         const submissionBackupEnabled = Boolean(form.submission_backup_enabled);
+        const submissionBackupFormats = parseSubmissionBackupFormats(form.submission_backup_formats);
         const formVersionSchema = formSchemaJson || templateSchemaJson;
 
         if (existingForm?.id && existingForm.deleted_at !== null && body?.restoreTrash !== true) {
@@ -9222,7 +9418,7 @@ export default {
         }
         if (existingForm?.id) {
           await env.DB.prepare(
-            "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_require_access=?, password_require_submit=?, password_salt=?, password_hash=?, submission_backup_enabled=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+            "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_require_access=?, password_require_submit=?, password_salt=?, password_hash=?, submission_backup_enabled=?, submission_backup_formats=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
           )
             .bind(
               form.title,
@@ -9244,6 +9440,7 @@ export default {
               passwordRequired ? passwordSalt : null,
               passwordRequired ? passwordHash : null,
               submissionBackupEnabled ? 1 : 0,
+              serializeSubmissionBackupFormats(submissionBackupFormats),
               existingForm.id
             )
             .run();
@@ -9278,7 +9475,7 @@ export default {
 
         const formId = crypto.randomUUID();
         await env.DB.prepare(
-          "INSERT INTO forms (id, slug, title, description, template_id, is_public, is_locked, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, reminder_enabled, reminder_frequency, reminder_until, submission_backup_enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          "INSERT INTO forms (id, slug, title, description, template_id, is_public, is_locked, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, reminder_enabled, reminder_frequency, reminder_until, submission_backup_enabled, submission_backup_formats) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
           .bind(
             formId,
@@ -9304,7 +9501,8 @@ export default {
             body.reminderEnabled ? 1 : 0,
             body.reminderFrequency || "weekly",
             body.reminderUntil || null,
-            submissionBackupEnabled ? 1 : 0
+            submissionBackupEnabled ? 1 : 0,
+            serializeSubmissionBackupFormats(submissionBackupFormats)
           )
           .run();
 
@@ -9432,6 +9630,7 @@ export default {
           reminderUntil?: string | null;
           saveAllVersions?: boolean | number;
           submissionBackupEnabled?: boolean;
+          submissionBackupFormats?: string[];
         } | null = null;
         try {
           body = await parseJsonBody(request);
@@ -9634,6 +9833,19 @@ export default {
             message: "expected_boolean"
           });
         }
+        if (body.submissionBackupFormats !== undefined && !Array.isArray(body.submissionBackupFormats)) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "submissionBackupFormats",
+            message: "expected_array"
+          });
+        }
+        const submissionBackupFormats = parseSubmissionBackupFormats(body.submissionBackupFormats ?? ["json"]);
+        if (body.submissionBackupFormats !== undefined && submissionBackupFormats.length === 0) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "submissionBackupFormats",
+            message: "unsupported"
+          });
+        }
 
         if (body.reminderFrequency !== undefined && body.reminderFrequency !== null) {
           if (!["daily", "weekly", "monthly"].includes(body.reminderFrequency) && !/^\d+:(days|weeks|months)$/.test(body.reminderFrequency)) {
@@ -9738,7 +9950,8 @@ export default {
           { name: "reminder_enabled", value: body.reminderEnabled ? 1 : 0 },
           { name: "reminder_frequency", value: body.reminderFrequency || "weekly" },
           { name: "reminder_until", value: body.reminderUntil || null },
-          { name: "submission_backup_enabled", value: body.submissionBackupEnabled ? 1 : 0 }
+          { name: "submission_backup_enabled", value: body.submissionBackupEnabled ? 1 : 0 },
+          { name: "submission_backup_formats", value: serializeSubmissionBackupFormats(submissionBackupFormats) }
         ];
         const formInsertColumns = formInsertBase.map((item) => item.name);
         const formInsertValues = formInsertBase.map((item) => item.value);
@@ -9873,6 +10086,7 @@ export default {
             reminderUntil?: string | null;
             saveAllVersions?: boolean | number;
             submissionBackupEnabled?: boolean;
+            submissionBackupFormats?: string[];
           } | null = null;
           try {
             body = await parseJsonBody(request);
@@ -9901,6 +10115,7 @@ export default {
             "reminder_until",
             "save_all_versions",
             "submission_backup_enabled",
+            "submission_backup_formats",
             "file_rules_json",
             "template_id"
           ];
@@ -10127,6 +10342,22 @@ export default {
               });
             }
             pushOptionalUpdate("submission_backup_enabled", body.submissionBackupEnabled ? 1 : 0, true);
+          }
+          if (body?.submissionBackupFormats !== undefined) {
+            if (!Array.isArray(body.submissionBackupFormats)) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "submissionBackupFormats",
+                message: "expected_array"
+              });
+            }
+            const formats = parseSubmissionBackupFormats(body.submissionBackupFormats);
+            if (formats.length === 0) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "submissionBackupFormats",
+                message: "unsupported"
+              });
+            }
+            pushOptionalUpdate("submission_backup_formats", serializeSubmissionBackupFormats(formats), true);
           }
 
           if (body?.canvasEnabled !== undefined) {
