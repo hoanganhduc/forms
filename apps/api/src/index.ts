@@ -12920,8 +12920,8 @@ export default {
         return errorResponse(404, "not_found", requestId, corsHeaders);
       }
 
-      // Verify user owns this submission
-      if (submission.user_id !== authPayload.userId) {
+      // Verify user owns this submission (admin can view all)
+      if (!authPayload.isAdmin && submission.user_id !== authPayload.userId) {
         return errorResponse(403, "forbidden", requestId, corsHeaders);
       }
 
@@ -12959,8 +12959,8 @@ export default {
         return errorResponse(404, "not_found", requestId, corsHeaders);
       }
 
-      // Verify user owns this submission
-      if (submission.user_id !== authPayload.userId) {
+      // Verify user owns this submission (admin can view all)
+      if (!authPayload.isAdmin && submission.user_id !== authPayload.userId) {
         return errorResponse(403, "forbidden", requestId, corsHeaders);
       }
 
