@@ -1,6 +1,6 @@
 import React, { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { HashRouter, Link, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
-import { marked } from "marked";
+import { Marked, marked } from "marked";
 import DOMPurify from "dompurify";
 import { APP_INFO } from "./config";
 import { apiFetch, clearToken, setToken } from "./auth";
@@ -99,6 +99,8 @@ const RICH_ALLOWED_ATTR = [
 const RICH_FORBID_TAGS = ["style", "script", "iframe", "object", "embed", "svg", "math"];
 const RICH_URI_ALLOWLIST = /^(?:(?:https?|mailto):|\/|#)/i;
 let markedConfigured = false;
+let markedHtmlConfigured = false;
+const markedHtmlInstance = new Marked();
 
 function ensureMarkedConfigured() {
   if (markedConfigured) return;
@@ -111,6 +113,12 @@ function ensureMarkedConfigured() {
   markedConfigured = true;
 }
 
+function ensureMarkedHtmlConfigured() {
+  if (markedHtmlConfigured) return;
+  markedHtmlInstance.setOptions({ gfm: true, breaks: true });
+  markedHtmlConfigured = true;
+}
+
 function sanitizeRichHtml(input: string) {
   return DOMPurify.sanitize(input, {
     ALLOWED_TAGS: RICH_ALLOWED_TAGS,
@@ -121,11 +129,25 @@ function sanitizeRichHtml(input: string) {
   });
 }
 
-function renderRichTextHtml(text: string, markdownEnabled: boolean, inline: boolean) {
+function renderRichTextHtml(
+  text: string,
+  markdownEnabled: boolean,
+  inline: boolean,
+  allowHtml = false
+) {
   if (!text) return "";
   if (!markdownEnabled) {
+    if (allowHtml) {
+      const withBreaks = text.replace(/\n/g, "<br />");
+      return sanitizeRichHtml(withBreaks);
+    }
     const escaped = escapeHtml(text);
     return inline ? escaped.replace(/\n/g, "<br />") : escaped.replace(/\n/g, "<br />");
+  }
+  if (allowHtml) {
+    ensureMarkedHtmlConfigured();
+    const html = inline ? markedHtmlInstance.parseInline(text) : markedHtmlInstance.parse(text);
+    return sanitizeRichHtml(String(html));
   }
   ensureMarkedConfigured();
   const html = inline ? marked.parseInline(text) : marked.parse(text);
@@ -205,18 +227,20 @@ function RichText({
   markdownEnabled,
   mathjaxEnabled,
   className,
+  allowHtml = false,
   inline = false
 }: {
   text?: string | null;
   markdownEnabled: boolean;
   mathjaxEnabled: boolean;
   className?: string;
+  allowHtml?: boolean;
   inline?: boolean;
 }) {
   const ref = useRef<HTMLDivElement | HTMLSpanElement | null>(null);
   const html = useMemo(
-    () => renderRichTextHtml(text ? String(text) : "", markdownEnabled, inline),
-    [text, markdownEnabled, inline]
+    () => renderRichTextHtml(text ? String(text) : "", markdownEnabled, inline, allowHtml),
+    [text, markdownEnabled, inline, allowHtml]
   );
 
   useEffect(() => {
@@ -578,6 +602,10 @@ type FormSummary = {
   password_require_access?: boolean;
   password_require_submit?: boolean;
   is_open?: boolean;
+  discussion_enabled?: boolean;
+  discussion_markdown_enabled?: boolean;
+  discussion_html_enabled?: boolean;
+  discussion_mathjax_enabled?: boolean;
 };
 
 type VisibilityMatchMode = "any" | "all";
@@ -619,6 +647,10 @@ type FormDetail = {
   reminder_enabled?: boolean;
   reminder_frequency?: string | null;
   is_open?: boolean;
+  discussion_enabled?: boolean;
+  discussion_markdown_enabled?: boolean;
+  discussion_html_enabled?: boolean;
+  discussion_mathjax_enabled?: boolean;
   canvas_enabled?: boolean;
   canvas_course_id?: string | null;
   canvas_course_name?: string | null;
@@ -660,6 +692,23 @@ type UploadedFile = {
   contentType?: string;
   r2Key: string;
   sha256: string;
+};
+
+type SubmissionComment = {
+  id: string;
+  submission_id: string;
+  author_user_id: string;
+  author_role: string;
+  body: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+  deleted_by: string | null;
+  deleted_reason: string | null;
+  can_edit?: boolean;
+  can_delete?: boolean;
+  can_restore?: boolean;
+  can_purge?: boolean;
 };
 
 type FieldRule = {
@@ -6485,6 +6534,14 @@ function SubmissionDetailPage({
     createdAt: string | null;
   }>({ selected: "latest", data: null, createdAt: null });
   const [versionError, setVersionError] = useState<string | null>(null);
+  const [commentList, setCommentList] = useState<SubmissionComment[]>([]);
+  const [commentLoading, setCommentLoading] = useState(false);
+  const [commentError, setCommentError] = useState<string | null>(null);
+  const [commentDraft, setCommentDraft] = useState("");
+  const [commentSaving, setCommentSaving] = useState(false);
+  const [commentEditId, setCommentEditId] = useState<string | null>(null);
+  const [commentEditDraft, setCommentEditDraft] = useState("");
+  const [commentActionError, setCommentActionError] = useState<string | null>(null);
   const renderLabel = (label: string) => (
     <RichText
       text={label}
@@ -6505,6 +6562,21 @@ function SubmissionDetailPage({
       ? `Reminder: resubmit ${freqText} until ${untilText}.`
       : `Reminder: resubmit ${freqText}.`;
   }, [data]);
+
+  const discussionEnabled = data?.form?.discussion_enabled === true;
+  const discussionMarkdownEnabled =
+    data?.form?.discussion_markdown_enabled === true || data?.form?.discussion_markdown_enabled == null;
+  const discussionHtmlEnabled = data?.form?.discussion_html_enabled === true;
+  const discussionMathjaxEnabled = data?.form?.discussion_mathjax_enabled === true;
+
+  const renderCommentBody = (body: string) => (
+    <RichText
+      text={body}
+      markdownEnabled={discussionMarkdownEnabled}
+      mathjaxEnabled={discussionMathjaxEnabled}
+      allowHtml={discussionHtmlEnabled}
+    />
+  );
 
   const renderSubmissionDataTable = (dataObject: Record<string, unknown>) => {
     const orderedKeys = fieldOrder.filter(
@@ -6643,6 +6715,37 @@ function SubmissionDetailPage({
     };
   }, [data?.submissionId, data?.form?.save_all_versions]);
 
+  useEffect(() => {
+    if (!data?.submissionId || !discussionEnabled) {
+      setCommentList([]);
+      setCommentLoading(false);
+      setCommentError(null);
+      return;
+    }
+    let active = true;
+    async function loadComments() {
+      setCommentLoading(true);
+      setCommentError(null);
+      const response = await apiFetch(
+        `${API_BASE}/api/me/submissions/${encodeURIComponent(data.submissionId)}/comments`
+      );
+      const payload = await response.json().catch(() => null);
+      if (!active) return;
+      if (!response.ok) {
+        setCommentError(payload?.error || "Failed to load comments.");
+        setCommentList([]);
+        setCommentLoading(false);
+        return;
+      }
+      setCommentList(Array.isArray(payload?.comments) ? payload.comments : []);
+      setCommentLoading(false);
+    }
+    loadComments();
+    return () => {
+      active = false;
+    };
+  }, [data?.submissionId, discussionEnabled]);
+
   async function handleVersionViewChange(value: string) {
     setVersionView({ selected: value, data: null, createdAt: null });
     setVersionError(null);
@@ -6666,6 +6769,118 @@ function SubmissionDetailPage({
       data: versionData && typeof versionData === "object" ? versionData : null,
       createdAt: payload?.version?.created_at || payload?.createdAt || null
     });
+  }
+
+  async function handleCommentSubmit() {
+    if (!data?.submissionId) return;
+    const body = commentDraft.trim();
+    if (!body) {
+      setCommentActionError("Comment cannot be empty.");
+      return;
+    }
+    setCommentActionError(null);
+    setCommentSaving(true);
+    const response = await apiFetch(
+      `${API_BASE}/api/me/submissions/${encodeURIComponent(data.submissionId)}/comments`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body })
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setCommentActionError(payload?.error || "Failed to post comment.");
+      setCommentSaving(false);
+      return;
+    }
+    setCommentDraft("");
+    setCommentList(Array.isArray(payload?.comments) ? payload.comments : commentList);
+    setCommentSaving(false);
+  }
+
+  async function handleCommentEditSave(commentId: string) {
+    if (!data?.submissionId) return;
+    const body = commentEditDraft.trim();
+    if (!body) {
+      setCommentActionError("Comment cannot be empty.");
+      return;
+    }
+    setCommentActionError(null);
+    setCommentSaving(true);
+    const response = await apiFetch(
+      `${API_BASE}/api/me/submissions/${encodeURIComponent(data.submissionId)}/comments/${encodeURIComponent(
+        commentId
+      )}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body })
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setCommentActionError(payload?.error || "Failed to update comment.");
+      setCommentSaving(false);
+      return;
+    }
+    setCommentEditId(null);
+    setCommentEditDraft("");
+    setCommentList(Array.isArray(payload?.comments) ? payload.comments : commentList);
+    setCommentSaving(false);
+  }
+
+  async function handleCommentDelete(commentId: string) {
+    if (!data?.submissionId) return;
+    if (!window.confirm("Delete this comment?")) return;
+    setCommentActionError(null);
+    const response = await apiFetch(
+      `${API_BASE}/api/me/submissions/${encodeURIComponent(data.submissionId)}/comments/${encodeURIComponent(
+        commentId
+      )}`,
+      { method: "DELETE" }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setCommentActionError(payload?.error || "Failed to delete comment.");
+      return;
+    }
+    setCommentList(Array.isArray(payload?.comments) ? payload.comments : commentList);
+  }
+
+  async function handleCommentRestore(commentId: string) {
+    if (!data?.submissionId) return;
+    setCommentActionError(null);
+    const response = await apiFetch(
+      `${API_BASE}/api/me/submissions/${encodeURIComponent(data.submissionId)}/comments/${encodeURIComponent(
+        commentId
+      )}/restore`,
+      { method: "POST" }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setCommentActionError(payload?.error || "Failed to restore comment.");
+      return;
+    }
+    setCommentList(Array.isArray(payload?.comments) ? payload.comments : commentList);
+  }
+
+  async function handleCommentPurge(commentId: string) {
+    if (!data?.submissionId) return;
+    if (!window.confirm("Permanently delete this comment? This cannot be undone.")) return;
+    setCommentActionError(null);
+    const response = await apiFetch(
+      `${API_BASE}/api/me/submissions/${encodeURIComponent(data.submissionId)}/comments/${encodeURIComponent(
+        commentId
+      )}/purge`,
+      { method: "POST" }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setCommentActionError(payload?.error || "Failed to purge comment.");
+      return;
+    }
+    setCommentList(Array.isArray(payload?.comments) ? payload.comments : commentList);
   }
 
   async function handleDeleteSubmission() {
@@ -7038,6 +7253,164 @@ function SubmissionDetailPage({
               manage uploaded files, open the form and update your submission.
             </div>
           </div>
+          {discussionEnabled ? (
+            <div className="mt-3">
+              <div className="muted mb-2">Discussion</div>
+              {commentError ? <div className="alert alert-danger">{commentError}</div> : null}
+              {commentActionError ? <div className="alert alert-danger">{commentActionError}</div> : null}
+              {commentLoading ? (
+                <div className="muted">Loading discussion...</div>
+              ) : commentList.length === 0 ? (
+                <div className="muted">No comments yet.</div>
+              ) : (
+                <div className="d-flex flex-column gap-3">
+                  {commentList.map((comment) => {
+                    const isDeleted = !!comment.deleted_at;
+                    const isEditing = commentEditId === comment.id;
+                    const authorLabel =
+                      comment.author_role === "admin"
+                        ? "Admin"
+                        : comment.author_user_id === user?.userId
+                          ? "You"
+                          : "User";
+                    return (
+                      <div key={comment.id} className={`card ${isDeleted ? "border-warning" : ""}`}>
+                        <div className="card-body">
+                          <div className="d-flex justify-content-between flex-wrap gap-2">
+                            <div>
+                              <div className="fw-semibold">
+                                {authorLabel}
+                              </div>
+                              <div className="muted">
+                                {formatTimeICT(comment.updated_at || comment.created_at)}
+                                {comment.updated_at && comment.updated_at !== comment.created_at ? " · edited" : ""}
+                                {isDeleted ? " · deleted" : ""}
+                              </div>
+                            </div>
+                            <div className="d-flex gap-2">
+                              {comment.can_edit && !isDeleted ? (
+                                <button
+                                  type="button"
+                                  className="btn btn-outline-secondary btn-sm"
+                                  disabled={commentSaving}
+                                  onClick={() => {
+                                    setCommentEditId(comment.id);
+                                    setCommentEditDraft(comment.body);
+                                  }}
+                                >
+                                  <i className="bi bi-pencil" aria-hidden="true" /> Edit
+                                </button>
+                              ) : null}
+                              {comment.can_delete && !isDeleted ? (
+                                <button
+                                  type="button"
+                                  className="btn btn-outline-danger btn-sm"
+                                  onClick={() => handleCommentDelete(comment.id)}
+                                >
+                                  <i className="bi bi-trash" aria-hidden="true" /> Delete
+                                </button>
+                              ) : null}
+                              {comment.can_restore && isDeleted ? (
+                                <button
+                                  type="button"
+                                  className="btn btn-outline-primary btn-sm"
+                                  onClick={() => handleCommentRestore(comment.id)}
+                                >
+                                  <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore
+                                </button>
+                              ) : null}
+                              {comment.can_purge && isDeleted ? (
+                                <button
+                                  type="button"
+                                  className="btn btn-outline-danger btn-sm"
+                                  onClick={() => handleCommentPurge(comment.id)}
+                                >
+                                  <i className="bi bi-x-circle" aria-hidden="true" /> Purge
+                                </button>
+                              ) : null}
+                            </div>
+                          </div>
+                          {isEditing ? (
+                            <div className="mt-3">
+                              <textarea
+                                className="form-control"
+                                rows={4}
+                                value={commentEditDraft}
+                                onChange={(event) => setCommentEditDraft(event.target.value)}
+                                disabled={commentSaving}
+                              />
+                              <div className="d-flex gap-2 mt-2">
+                                <button
+                                  type="button"
+                                  className="btn btn-primary btn-sm"
+                                  disabled={commentSaving}
+                                  onClick={() => handleCommentEditSave(comment.id)}
+                                >
+                                  <i className="bi bi-check-lg" aria-hidden="true" /> Save
+                                </button>
+                                <button
+                                  type="button"
+                                  className="btn btn-outline-secondary btn-sm"
+                                  disabled={commentSaving}
+                                  onClick={() => {
+                                    setCommentEditId(null);
+                                    setCommentEditDraft("");
+                                  }}
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="mt-2">{renderCommentBody(comment.body)}</div>
+                          )}
+                          {isDeleted ? (
+                            <div className="muted mt-2">
+                              Deleted{" "}
+                              {comment.deleted_by ? `by ${comment.deleted_by} ` : ""}at{" "}
+                              {comment.deleted_at ? formatTimeICT(comment.deleted_at) : "n/a"}.
+                              {comment.deleted_reason ? ` ${comment.deleted_reason}` : ""}
+                            </div>
+                          ) : null}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <div className="mt-3">
+                <label htmlFor="comment-editor" className="form-label">
+                  Add a comment
+                </label>
+                <textarea
+                  id="comment-editor"
+                  className="form-control"
+                  rows={4}
+                  value={commentDraft}
+                  onChange={(event) => setCommentDraft(event.target.value)}
+                  disabled={commentSaving}
+                />
+                <div className="d-flex gap-2 mt-2">
+                  <button
+                    type="button"
+                    className="btn btn-primary btn-sm"
+                    disabled={commentSaving || !commentDraft.trim()}
+                    onClick={handleCommentSubmit}
+                  >
+                    <i className="bi bi-chat-dots" aria-hidden="true" /> Post
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary btn-sm"
+                    disabled={commentSaving || !commentDraft.trim()}
+                    onClick={() => setCommentDraft("")}
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
         </div>
       ) : null}
     </section>
@@ -11624,6 +11997,12 @@ function BuilderPage({
   >(null);
   const [formBuilderCanvasPosition, setFormBuilderCanvasPosition] = useState("bottom");
   const [formBuilderMode, setFormBuilderMode] = useState<"create" | "edit">("edit");
+  const [formBuilderDiscussionEnabled, setFormBuilderDiscussionEnabled] = useState(false);
+  const [formBuilderDiscussionMarkdownEnabled, setFormBuilderDiscussionMarkdownEnabled] =
+    useState(true);
+  const [formBuilderDiscussionHtmlEnabled, setFormBuilderDiscussionHtmlEnabled] = useState(false);
+  const [formBuilderDiscussionMathjaxEnabled, setFormBuilderDiscussionMathjaxEnabled] =
+    useState(false);
   const [formFieldType, setFormFieldType] = useState("text");
   const [formFieldCustomType, setFormFieldCustomType] = useState("");
   const [formFieldId, setFormFieldId] = useState("");
@@ -11682,6 +12061,12 @@ function BuilderPage({
   >(null);
   const [formCreateCanvasPosition, setFormCreateCanvasPosition] = useState("bottom");
   const [formCreateStatus, setFormCreateStatus] = useState<string | null>(null);
+  const [formCreateDiscussionEnabled, setFormCreateDiscussionEnabled] = useState(false);
+  const [formCreateDiscussionMarkdownEnabled, setFormCreateDiscussionMarkdownEnabled] =
+    useState(true);
+  const [formCreateDiscussionHtmlEnabled, setFormCreateDiscussionHtmlEnabled] = useState(false);
+  const [formCreateDiscussionMathjaxEnabled, setFormCreateDiscussionMathjaxEnabled] =
+    useState(false);
   const [canvasCourses, setCanvasCourses] = useState<any[]>([]);
   const [canvasCourseQuery, setCanvasCourseQuery] = useState("");
   const [canvasCoursesLoading, setCanvasCoursesLoading] = useState(false);
@@ -12364,6 +12749,10 @@ function BuilderPage({
       setFormCreateReminderValue(1);
       setFormCreateReminderUnit("weeks");
       setFormCreateReminderUntil("");
+      setFormBuilderDiscussionEnabled(false);
+      setFormBuilderDiscussionMarkdownEnabled(true);
+      setFormBuilderDiscussionHtmlEnabled(false);
+      setFormBuilderDiscussionMathjaxEnabled(false);
       setFormBuilderTemplateKey("");
       setFormBuilderSlugEdit("");
       return;
@@ -12436,6 +12825,12 @@ function BuilderPage({
           ? selected.submission_backup_formats
           : ["json"]
       );
+      setFormBuilderDiscussionEnabled(Boolean(selected.discussion_enabled));
+      setFormBuilderDiscussionMarkdownEnabled(
+        selected.discussion_markdown_enabled == null ? true : Boolean(selected.discussion_markdown_enabled)
+      );
+      setFormBuilderDiscussionHtmlEnabled(Boolean(selected.discussion_html_enabled));
+      setFormBuilderDiscussionMathjaxEnabled(Boolean(selected.discussion_mathjax_enabled));
       if (selected.canvas_allowed_section_ids_json) {
         try {
           const parsed = JSON.parse(String(selected.canvas_allowed_section_ids_json));
@@ -12618,7 +13013,14 @@ function BuilderPage({
         submissionBackupFormats:
           Array.isArray(formData.submission_backup_formats) && formData.submission_backup_formats.length > 0
             ? formData.submission_backup_formats
-            : ["json"]
+            : ["json"],
+        discussionEnabled: Boolean(formData.discussion_enabled),
+        discussionMarkdownEnabled:
+          formData.discussion_markdown_enabled == null
+            ? true
+            : Boolean(formData.discussion_markdown_enabled),
+        discussionHtmlEnabled: Boolean(formData.discussion_html_enabled),
+        discussionMathjaxEnabled: Boolean(formData.discussion_mathjax_enabled)
       })
     });
     const createPayload = await createRes.json().catch(() => null);
@@ -12706,7 +13108,11 @@ function BuilderPage({
           reminderUntil: localInputToUtcWithZone(formBuilderReminderUntil, formBuilderAvailabilityTimezone) || null,
           saveAllVersions: formBuilderSaveAllVersions,
           submissionBackupEnabled: formBuilderSubmissionBackupEnabled,
-          submissionBackupFormats: formBuilderSubmissionBackupFormats
+          submissionBackupFormats: formBuilderSubmissionBackupFormats,
+          discussionEnabled: formBuilderDiscussionEnabled,
+          discussionMarkdownEnabled: formBuilderDiscussionMarkdownEnabled,
+          discussionHtmlEnabled: formBuilderDiscussionHtmlEnabled,
+          discussionMathjaxEnabled: formBuilderDiscussionMathjaxEnabled
         })
       });
       payload = await response.json().catch(() => null);
@@ -13082,7 +13488,11 @@ function BuilderPage({
         submissionBackupFormats: formCreateSubmissionBackupFormats,
         reminderEnabled: formCreateReminderEnabled,
         reminderFrequency: `${formCreateReminderValue}:${formCreateReminderUnit}`,
-        reminderUntil: localInputToUtcWithZone(formCreateReminderUntil, formCreateAvailabilityTimezone) || null
+        reminderUntil: localInputToUtcWithZone(formCreateReminderUntil, formCreateAvailabilityTimezone) || null,
+        discussionEnabled: formCreateDiscussionEnabled,
+        discussionMarkdownEnabled: formCreateDiscussionMarkdownEnabled,
+        discussionHtmlEnabled: formCreateDiscussionHtmlEnabled,
+        discussionMathjaxEnabled: formCreateDiscussionMathjaxEnabled
       })
     });
     const payload = await response.json().catch(() => null);
@@ -13119,6 +13529,10 @@ function BuilderPage({
     setFormCreateReminderUntil("");
     setFormCreateSubmissionBackupEnabled(false);
     setFormCreateSubmissionBackupFormats(["json"]);
+    setFormCreateDiscussionEnabled(false);
+    setFormCreateDiscussionMarkdownEnabled(true);
+    setFormCreateDiscussionHtmlEnabled(false);
+    setFormCreateDiscussionMathjaxEnabled(false);
     await loadBuilder();
   }
 
@@ -13751,6 +14165,62 @@ function BuilderPage({
                     />
                   </div>
                 )}
+                <div className="col-md-4">
+                  <label className="form-label">Discussion</label>
+                  <div className="form-check mt-2">
+                    <input
+                      className="form-check-input"
+                      type="checkbox"
+                      checked={formCreateDiscussionEnabled}
+                      onChange={(event) => setFormCreateDiscussionEnabled(event.target.checked)}
+                      id="formCreateDiscussionEnabled"
+                    />
+                    <label className="form-check-label" htmlFor="formCreateDiscussionEnabled">
+                      Enable discussion
+                    </label>
+                  </div>
+                  <div className="d-flex flex-column gap-1 mt-2">
+                    <div className="form-check">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formCreateDiscussionMarkdownEnabled}
+                        onChange={(event) => setFormCreateDiscussionMarkdownEnabled(event.target.checked)}
+                        id="formCreateDiscussionMarkdownEnabled"
+                        disabled={!formCreateDiscussionEnabled}
+                      />
+                      <label className="form-check-label" htmlFor="formCreateDiscussionMarkdownEnabled">
+                        Allow Markdown
+                      </label>
+                    </div>
+                    <div className="form-check">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formCreateDiscussionMathjaxEnabled}
+                        onChange={(event) => setFormCreateDiscussionMathjaxEnabled(event.target.checked)}
+                        id="formCreateDiscussionMathjaxEnabled"
+                        disabled={!formCreateDiscussionEnabled}
+                      />
+                      <label className="form-check-label" htmlFor="formCreateDiscussionMathjaxEnabled">
+                        Allow MathJax
+                      </label>
+                    </div>
+                    <div className="form-check">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formCreateDiscussionHtmlEnabled}
+                        onChange={(event) => setFormCreateDiscussionHtmlEnabled(event.target.checked)}
+                        id="formCreateDiscussionHtmlEnabled"
+                        disabled={!formCreateDiscussionEnabled}
+                      />
+                      <label className="form-check-label" htmlFor="formCreateDiscussionHtmlEnabled">
+                        Allow HTML
+                      </label>
+                    </div>
+                  </div>
+                </div>
                 <div className="col-12">
                   {renderCanvasConfig({
                     enabled: formCreateCanvasEnabled,
@@ -14045,6 +14515,63 @@ function BuilderPage({
                       </div>
                     </div>
                   )}
+                  <div className="col-md-4">
+                    <label className="form-label">Discussion</label>
+                    <div className="form-check mt-2">
+                      <input
+                        className="form-check-input"
+                        type="checkbox"
+                        checked={formBuilderDiscussionEnabled}
+                        onChange={(event) => setFormBuilderDiscussionEnabled(event.target.checked)}
+                        disabled={!formBuilderSlug}
+                        id="formBuilderDiscussionEnabled"
+                      />
+                      <label className="form-check-label" htmlFor="formBuilderDiscussionEnabled">
+                        Enable discussion
+                      </label>
+                    </div>
+                    <div className="d-flex flex-column gap-1 mt-2">
+                      <div className="form-check">
+                        <input
+                          className="form-check-input"
+                          type="checkbox"
+                          checked={formBuilderDiscussionMarkdownEnabled}
+                          onChange={(event) => setFormBuilderDiscussionMarkdownEnabled(event.target.checked)}
+                          id="formBuilderDiscussionMarkdownEnabled"
+                          disabled={!formBuilderSlug || !formBuilderDiscussionEnabled}
+                        />
+                        <label className="form-check-label" htmlFor="formBuilderDiscussionMarkdownEnabled">
+                          Allow Markdown
+                        </label>
+                      </div>
+                      <div className="form-check">
+                        <input
+                          className="form-check-input"
+                          type="checkbox"
+                          checked={formBuilderDiscussionMathjaxEnabled}
+                          onChange={(event) => setFormBuilderDiscussionMathjaxEnabled(event.target.checked)}
+                          id="formBuilderDiscussionMathjaxEnabled"
+                          disabled={!formBuilderSlug || !formBuilderDiscussionEnabled}
+                        />
+                        <label className="form-check-label" htmlFor="formBuilderDiscussionMathjaxEnabled">
+                          Allow MathJax
+                        </label>
+                      </div>
+                      <div className="form-check">
+                        <input
+                          className="form-check-input"
+                          type="checkbox"
+                          checked={formBuilderDiscussionHtmlEnabled}
+                          onChange={(event) => setFormBuilderDiscussionHtmlEnabled(event.target.checked)}
+                          id="formBuilderDiscussionHtmlEnabled"
+                          disabled={!formBuilderSlug || !formBuilderDiscussionEnabled}
+                        />
+                        <label className="form-check-label" htmlFor="formBuilderDiscussionHtmlEnabled">
+                          Allow HTML
+                        </label>
+                      </div>
+                    </div>
+                  </div>
                   <div className="col-md-4">
                     <label className="form-label">Password requirements</label>
                     <div className="form-check mt-2">

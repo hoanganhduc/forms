@@ -81,6 +81,10 @@ type FormDetailRow = {
   save_all_versions?: number | null;
   submission_backup_enabled?: number | null;
   submission_backup_formats?: string | null;
+  discussion_enabled?: number | null;
+  discussion_markdown_enabled?: number | null;
+  discussion_html_enabled?: number | null;
+  discussion_mathjax_enabled?: number | null;
 };
 
 type FormSubmissionRow = {
@@ -112,6 +116,10 @@ type AdminFormRow = {
   reminder_frequency?: string | null;
   reminder_until?: string | null;
   save_all_versions?: number | null;
+  discussion_enabled?: number | null;
+  discussion_markdown_enabled?: number | null;
+  discussion_html_enabled?: number | null;
+  discussion_mathjax_enabled?: number | null;
 };
 
 type TemplateRow = {
@@ -148,6 +156,19 @@ type SubmissionVersionRow = {
   version_number: number;
   created_at: string;
   created_by: string | null;
+};
+
+type SubmissionCommentRow = {
+  id: string;
+  submission_id: string;
+  author_user_id: string;
+  author_role: string;
+  body: string;
+  created_at: string;
+  updated_at: string;
+  deleted_at: string | null;
+  deleted_by: string | null;
+  deleted_reason: string | null;
 };
 
 type FileRules = {
@@ -1171,7 +1192,11 @@ async function getFormWithRules(env: Env, slug: string) {
     "password_hash",
     "reminder_enabled",
     "reminder_frequency",
-    "save_all_versions"
+    "save_all_versions",
+    "discussion_enabled",
+    "discussion_markdown_enabled",
+    "discussion_html_enabled",
+    "discussion_mathjax_enabled"
   ];
   const columnSelects = baseColumns.map((column) => `f.${column}`);
   for (const column of optionalColumns) {
@@ -1284,7 +1309,11 @@ async function buildFormDetailPayload(env: Env, row: FormDetailRow) {
       canvas_fields_position: row.canvas_fields_position ?? "bottom",
       reminder_enabled: toBoolean(row.reminder_enabled ?? 0),
       reminder_frequency: row.reminder_frequency ?? "weekly",
-      save_all_versions: toBoolean(row.save_all_versions ?? 0)
+      save_all_versions: toBoolean(row.save_all_versions ?? 0),
+      discussion_enabled: toBoolean(row.discussion_enabled ?? 0),
+      discussion_markdown_enabled: toBoolean(row.discussion_markdown_enabled ?? 1),
+      discussion_html_enabled: toBoolean(row.discussion_html_enabled ?? 0),
+      discussion_mathjax_enabled: toBoolean(row.discussion_mathjax_enabled ?? 0)
     }
   };
 }
@@ -4332,6 +4361,50 @@ async function updateRestoreTable(
   }
 }
 
+async function updateSoftDeleteComments(
+  env: Env,
+  whereClause: string,
+  bindings: Array<string | null>,
+  deletedBy: string | null,
+  reason: string
+) {
+  const sqlWithReason = `UPDATE submission_comments SET deleted_at=datetime('now'), deleted_by=?, deleted_reason=? WHERE ${whereClause} AND deleted_at IS NULL`;
+  const sqlWithoutReason = `UPDATE submission_comments SET deleted_at=datetime('now'), deleted_by=? WHERE ${whereClause} AND deleted_at IS NULL`;
+  try {
+    await env.DB.prepare(sqlWithReason)
+      .bind(deletedBy, reason, ...bindings)
+      .run();
+  } catch (error) {
+    if (!isMissingDeletedReasonColumn(error)) {
+      throw error;
+    }
+    await env.DB.prepare(sqlWithoutReason)
+      .bind(deletedBy, ...bindings)
+      .run();
+  }
+}
+
+async function updateRestoreComments(
+  env: Env,
+  whereClause: string,
+  bindings: Array<string | null>
+) {
+  const sqlWithReason = `UPDATE submission_comments SET deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE ${whereClause}`;
+  const sqlWithoutReason = `UPDATE submission_comments SET deleted_at=NULL, deleted_by=NULL WHERE ${whereClause}`;
+  try {
+    await env.DB.prepare(sqlWithReason)
+      .bind(...bindings)
+      .run();
+  } catch (error) {
+    if (!isMissingDeletedReasonColumn(error)) {
+      throw error;
+    }
+    await env.DB.prepare(sqlWithoutReason)
+      .bind(...bindings)
+      .run();
+  }
+}
+
 function hasFileFields(schemaJson: string | null | undefined): boolean {
   if (!schemaJson) return false;
   try {
@@ -5215,6 +5288,14 @@ function checkAuthPolicy(authPolicy: string, authPayload: JwtPayload | null) {
     return { ok: false, status: 403, code: "auth_forbidden" };
   }
   return { ok: true };
+}
+
+function normalizeCommentBody(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > 5000) return null;
+  return trimmed;
 }
 
 function isVtStrict(env: Env) {
@@ -8472,8 +8553,20 @@ export default {
         const submissionBackupFormatsSelect = (await hasColumn(env, "forms", "submission_backup_formats"))
           ? "f.submission_backup_formats as submission_backup_formats"
           : "NULL as submission_backup_formats";
+        const discussionEnabledSelect = (await hasColumn(env, "forms", "discussion_enabled"))
+          ? "f.discussion_enabled as discussion_enabled"
+          : "NULL as discussion_enabled";
+        const discussionMarkdownSelect = (await hasColumn(env, "forms", "discussion_markdown_enabled"))
+          ? "f.discussion_markdown_enabled as discussion_markdown_enabled"
+          : "NULL as discussion_markdown_enabled";
+        const discussionHtmlSelect = (await hasColumn(env, "forms", "discussion_html_enabled"))
+          ? "f.discussion_html_enabled as discussion_html_enabled"
+          : "NULL as discussion_html_enabled";
+        const discussionMathjaxSelect = (await hasColumn(env, "forms", "discussion_mathjax_enabled"))
+          ? "f.discussion_mathjax_enabled as discussion_mathjax_enabled"
+          : "NULL as discussion_mathjax_enabled";
         const { results } = await env.DB.prepare(
-          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},${submissionBackupSelect},${submissionBackupFormatsSelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},${submissionBackupSelect},${submissionBackupFormatsSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
         ).all<AdminFormRow & { submission_count?: number; updated_at?: string | null; created_at?: string | null }>();
 
         const data = results.map((row) => ({
@@ -8502,7 +8595,11 @@ export default {
           reminder_frequency: (row as any).reminder_frequency ?? null,
           reminder_until: (row as any).reminder_until ?? null,
           submission_backup_enabled: toBoolean((row as any).submission_backup_enabled ?? 0),
-          submission_backup_formats: parseSubmissionBackupFormats((row as any).submission_backup_formats)
+          submission_backup_formats: parseSubmissionBackupFormats((row as any).submission_backup_formats),
+          discussion_enabled: toBoolean((row as any).discussion_enabled ?? 0),
+          discussion_markdown_enabled: toBoolean((row as any).discussion_markdown_enabled ?? 1),
+          discussion_html_enabled: toBoolean((row as any).discussion_html_enabled ?? 0),
+          discussion_mathjax_enabled: toBoolean((row as any).discussion_mathjax_enabled ?? 0)
         }));
 
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -8517,8 +8614,20 @@ export default {
         const submissionBackupFormatsSelect = (await hasColumn(env, "forms", "submission_backup_formats"))
           ? "f.submission_backup_formats as submission_backup_formats"
           : "NULL as submission_backup_formats";
+        const discussionEnabledSelect = (await hasColumn(env, "forms", "discussion_enabled"))
+          ? "f.discussion_enabled as discussion_enabled"
+          : "NULL as discussion_enabled";
+        const discussionMarkdownSelect = (await hasColumn(env, "forms", "discussion_markdown_enabled"))
+          ? "f.discussion_markdown_enabled as discussion_markdown_enabled"
+          : "NULL as discussion_markdown_enabled";
+        const discussionHtmlSelect = (await hasColumn(env, "forms", "discussion_html_enabled"))
+          ? "f.discussion_html_enabled as discussion_html_enabled"
+          : "NULL as discussion_html_enabled";
+        const discussionMathjaxSelect = (await hasColumn(env, "forms", "discussion_mathjax_enabled"))
+          ? "f.discussion_mathjax_enabled as discussion_mathjax_enabled"
+          : "NULL as discussion_mathjax_enabled";
         const formRow = await env.DB.prepare(
-          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,${submissionBackupSelect},${submissionBackupFormatsSelect},t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL`
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,f.reminder_until,${submissionBackupSelect},${submissionBackupFormatsSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect},t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL`
         )
           .bind(slug)
           .first<{
@@ -8543,8 +8652,13 @@ export default {
             file_rules_json: string | null;
             reminder_enabled: number;
             reminder_frequency: string | null;
+            reminder_until: string | null;
             submission_backup_enabled: number | null;
             submission_backup_formats: string | null;
+            discussion_enabled: number | null;
+            discussion_markdown_enabled: number | null;
+            discussion_html_enabled: number | null;
+            discussion_mathjax_enabled: number | null;
             template_key: string | null;
             template_name: string | null;
             template_schema_json: string | null;
@@ -8568,8 +8682,13 @@ export default {
             slug: formRow.slug,
             reminder_enabled: toBoolean(formRow.reminder_enabled),
             reminder_frequency: formRow.reminder_frequency,
+            reminder_until: formRow.reminder_until ?? null,
             submission_backup_enabled: toBoolean(formRow.submission_backup_enabled ?? 0),
             submission_backup_formats: parseSubmissionBackupFormats(formRow.submission_backup_formats),
+            discussion_enabled: toBoolean(formRow.discussion_enabled ?? 0),
+            discussion_markdown_enabled: toBoolean(formRow.discussion_markdown_enabled ?? 1),
+            discussion_html_enabled: toBoolean(formRow.discussion_html_enabled ?? 0),
+            discussion_mathjax_enabled: toBoolean(formRow.discussion_mathjax_enabled ?? 0),
             title: formRow.title,
             description: formRow.description ?? null,
             is_locked: toBoolean(formRow.is_locked),
@@ -9736,6 +9855,10 @@ export default {
           saveAllVersions?: boolean | number;
           submissionBackupEnabled?: boolean;
           submissionBackupFormats?: string[];
+          discussionEnabled?: boolean;
+          discussionMarkdownEnabled?: boolean;
+          discussionHtmlEnabled?: boolean;
+          discussionMathjaxEnabled?: boolean;
         } | null = null;
         try {
           body = await parseJsonBody(request);
@@ -10072,7 +10195,11 @@ export default {
           { name: "reminder_frequency", value: body.reminderFrequency || "weekly" },
           { name: "reminder_until", value: body.reminderUntil || null },
           { name: "submission_backup_enabled", value: body.submissionBackupEnabled ? 1 : 0 },
-          { name: "submission_backup_formats", value: serializeSubmissionBackupFormats(submissionBackupFormats) }
+          { name: "submission_backup_formats", value: serializeSubmissionBackupFormats(submissionBackupFormats) },
+          { name: "discussion_enabled", value: body.discussionEnabled ? 1 : 0 },
+          { name: "discussion_markdown_enabled", value: body.discussionMarkdownEnabled !== false ? 1 : 0 },
+          { name: "discussion_html_enabled", value: body.discussionHtmlEnabled ? 1 : 0 },
+          { name: "discussion_mathjax_enabled", value: body.discussionMathjaxEnabled ? 1 : 0 }
         ];
         const formInsertColumns = formInsertBase.map((item) => item.name);
         const formInsertValues = formInsertBase.map((item) => item.value);
@@ -10208,6 +10335,10 @@ export default {
             saveAllVersions?: boolean | number;
             submissionBackupEnabled?: boolean;
             submissionBackupFormats?: string[];
+            discussionEnabled?: boolean;
+            discussionMarkdownEnabled?: boolean;
+            discussionHtmlEnabled?: boolean;
+            discussionMathjaxEnabled?: boolean;
           } | null = null;
           try {
             body = await parseJsonBody(request);
@@ -10237,6 +10368,10 @@ export default {
             "save_all_versions",
             "submission_backup_enabled",
             "submission_backup_formats",
+            "discussion_enabled",
+            "discussion_markdown_enabled",
+            "discussion_html_enabled",
+            "discussion_mathjax_enabled",
             "file_rules_json",
             "template_id"
           ];
@@ -10479,6 +10614,43 @@ export default {
               });
             }
             pushOptionalUpdate("submission_backup_formats", serializeSubmissionBackupFormats(formats), true);
+          }
+
+          if (body?.discussionEnabled !== undefined) {
+            if (typeof body.discussionEnabled !== "boolean") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "discussionEnabled",
+                message: "expected_boolean"
+              });
+            }
+            pushOptionalUpdate("discussion_enabled", body.discussionEnabled ? 1 : 0, true);
+          }
+          if (body?.discussionMarkdownEnabled !== undefined) {
+            if (typeof body.discussionMarkdownEnabled !== "boolean") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "discussionMarkdownEnabled",
+                message: "expected_boolean"
+              });
+            }
+            pushOptionalUpdate("discussion_markdown_enabled", body.discussionMarkdownEnabled ? 1 : 0, true);
+          }
+          if (body?.discussionHtmlEnabled !== undefined) {
+            if (typeof body.discussionHtmlEnabled !== "boolean") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "discussionHtmlEnabled",
+                message: "expected_boolean"
+              });
+            }
+            pushOptionalUpdate("discussion_html_enabled", body.discussionHtmlEnabled ? 1 : 0, true);
+          }
+          if (body?.discussionMathjaxEnabled !== undefined) {
+            if (typeof body.discussionMathjaxEnabled !== "boolean") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "discussionMathjaxEnabled",
+                message: "expected_boolean"
+              });
+            }
+            pushOptionalUpdate("discussion_mathjax_enabled", body.discussionMathjaxEnabled ? 1 : 0, true);
           }
 
           if (body?.canvasEnabled !== undefined) {
@@ -13003,6 +13175,18 @@ export default {
       const reminderUntilSelect = (await hasColumn(env, "forms", "reminder_until"))
         ? "f.reminder_until as reminder_until"
         : "NULL as reminder_until";
+      const discussionEnabledSelect = (await hasColumn(env, "forms", "discussion_enabled"))
+        ? "f.discussion_enabled as discussion_enabled"
+        : "NULL as discussion_enabled";
+      const discussionMarkdownSelect = (await hasColumn(env, "forms", "discussion_markdown_enabled"))
+        ? "f.discussion_markdown_enabled as discussion_markdown_enabled"
+        : "NULL as discussion_markdown_enabled";
+      const discussionHtmlSelect = (await hasColumn(env, "forms", "discussion_html_enabled"))
+        ? "f.discussion_html_enabled as discussion_html_enabled"
+        : "NULL as discussion_html_enabled";
+      const discussionMathjaxSelect = (await hasColumn(env, "forms", "discussion_mathjax_enabled"))
+        ? "f.discussion_mathjax_enabled as discussion_mathjax_enabled"
+        : "NULL as discussion_mathjax_enabled";
       const createdIpSelect = (await hasColumn(env, "submissions", "created_ip"))
         ? "s.created_ip as created_ip"
         : "NULL as created_ip";
@@ -13019,7 +13203,7 @@ export default {
         ? "COALESCE(s.submitter_github_username,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_github_username"
         : "(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1) as submitter_github_username";
       const submission = await env.DB.prepare(
-        `SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,${createdIpSelect},${createdUserAgentSelect},${submitterProviderSelect},${submitterEmailSelect},${submitterGithubSelect},s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect} FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL`
+        `SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,${createdIpSelect},${createdUserAgentSelect},${submitterProviderSelect},${submitterEmailSelect},${submitterGithubSelect},s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect} FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL`
       )
         .bind(submissionId)
         .first<{
@@ -13050,6 +13234,10 @@ export default {
           reminder_enabled: number | null;
           reminder_frequency: string | null;
           reminder_until: string | null;
+          discussion_enabled: number | null;
+          discussion_markdown_enabled: number | null;
+          discussion_html_enabled: number | null;
+          discussion_mathjax_enabled: number | null;
         }>();
 
       if (!submission) {
@@ -13132,7 +13320,11 @@ export default {
               save_all_versions: toBoolean(submission.save_all_versions ?? 0),
               reminder_enabled: toBoolean(submission.reminder_enabled ?? 0),
               reminder_frequency: submission.reminder_frequency ?? null,
-              reminder_until: submission.reminder_until ?? null
+              reminder_until: submission.reminder_until ?? null,
+              discussion_enabled: toBoolean(submission.discussion_enabled ?? 0),
+              discussion_markdown_enabled: toBoolean(submission.discussion_markdown_enabled ?? 1),
+              discussion_html_enabled: toBoolean(submission.discussion_html_enabled ?? 0),
+              discussion_mathjax_enabled: toBoolean(submission.discussion_mathjax_enabled ?? 0)
             }
           },
           requestId
@@ -13140,6 +13332,347 @@ export default {
         requestId,
         corsHeaders
       );
+    }
+
+    if (request.method === "GET" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments$/)) {
+      const match = url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments$/);
+      const submissionId = decodeURIComponent(match![1]);
+      const authPayload = await getAuthPayload(request, env);
+      if (!authPayload) {
+        return errorResponse(401, "auth_required", requestId, corsHeaders);
+      }
+      const submission = await env.DB.prepare(
+        "SELECT s.id,s.user_id,f.discussion_enabled,f.discussion_markdown_enabled,f.discussion_html_enabled,f.discussion_mathjax_enabled FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL AND f.deleted_at IS NULL"
+      )
+        .bind(submissionId)
+        .first<{
+          id: string;
+          user_id: string | null;
+          discussion_enabled: number | null;
+          discussion_markdown_enabled: number | null;
+          discussion_html_enabled: number | null;
+          discussion_mathjax_enabled: number | null;
+        }>();
+      if (!submission) {
+        return errorResponse(404, "not_found", requestId, corsHeaders);
+      }
+      if (!toBoolean(submission.discussion_enabled ?? 0)) {
+        return errorResponse(403, "discussion_disabled", requestId, corsHeaders);
+      }
+      if (!authPayload.isAdmin && submission.user_id !== authPayload.userId) {
+        return errorResponse(403, "forbidden", requestId, corsHeaders);
+      }
+      const { results } = await env.DB.prepare(
+        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
+      )
+        .bind(submissionId)
+        .all<SubmissionCommentRow>();
+      const data = results.map((row) => ({
+        id: row.id,
+        submission_id: row.submission_id,
+        author_user_id: row.author_user_id,
+        author_role: row.author_role,
+        body: row.body,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at,
+        deleted_by: row.deleted_by,
+        deleted_reason: row.deleted_reason,
+        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_restore: authPayload.isAdmin,
+        can_purge: authPayload.isAdmin
+      }));
+      return jsonResponse(
+        200,
+        {
+          comments: data,
+          settings: {
+            enabled: true,
+            markdown_enabled: toBoolean(submission.discussion_markdown_enabled ?? 1),
+            html_enabled: toBoolean(submission.discussion_html_enabled ?? 0),
+            mathjax_enabled: toBoolean(submission.discussion_mathjax_enabled ?? 0)
+          },
+          requestId
+        },
+        requestId,
+        corsHeaders
+      );
+    }
+
+    if (request.method === "POST" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments$/)) {
+      const match = url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments$/);
+      const submissionId = decodeURIComponent(match![1]);
+      const authPayload = await getAuthPayload(request, env);
+      if (!authPayload) {
+        return errorResponse(401, "auth_required", requestId, corsHeaders);
+      }
+      let body: { body?: string } | null = null;
+      try {
+        body = await parseJsonBody(request);
+      } catch (error) {
+        return errorResponse(400, "invalid_json", requestId, corsHeaders);
+      }
+      const normalized = normalizeCommentBody(body?.body);
+      if (!normalized) {
+        return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+          field: "body",
+          message: "required"
+        });
+      }
+      const submission = await env.DB.prepare(
+        "SELECT s.id,s.user_id,f.discussion_enabled FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL AND f.deleted_at IS NULL"
+      )
+        .bind(submissionId)
+        .first<{ id: string; user_id: string | null; discussion_enabled: number | null }>();
+      if (!submission) {
+        return errorResponse(404, "not_found", requestId, corsHeaders);
+      }
+      if (!toBoolean(submission.discussion_enabled ?? 0)) {
+        return errorResponse(403, "discussion_disabled", requestId, corsHeaders);
+      }
+      if (!authPayload.isAdmin && submission.user_id !== authPayload.userId) {
+        return errorResponse(403, "forbidden", requestId, corsHeaders);
+      }
+      const commentId = crypto.randomUUID();
+      const role = authPayload.isAdmin ? "admin" : "user";
+      await env.DB.prepare(
+        "INSERT INTO submission_comments (id, submission_id, author_user_id, author_role, body) VALUES (?, ?, ?, ?, ?)"
+      )
+        .bind(commentId, submissionId, authPayload.userId, role, normalized)
+        .run();
+      const { results } = await env.DB.prepare(
+        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
+      )
+        .bind(submissionId)
+        .all<SubmissionCommentRow>();
+      const data = results.map((row) => ({
+        id: row.id,
+        submission_id: row.submission_id,
+        author_user_id: row.author_user_id,
+        author_role: row.author_role,
+        body: row.body,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at,
+        deleted_by: row.deleted_by,
+        deleted_reason: row.deleted_reason,
+        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_restore: authPayload.isAdmin,
+        can_purge: authPayload.isAdmin
+      }));
+      return jsonResponse(
+        201,
+        {
+          comments: data,
+          requestId
+        },
+        requestId,
+        corsHeaders
+      );
+    }
+
+    if (request.method === "PATCH" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)$/)) {
+      const match = url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)$/);
+      const submissionId = decodeURIComponent(match![1]);
+      const commentId = decodeURIComponent(match![2]);
+      const authPayload = await getAuthPayload(request, env);
+      if (!authPayload) {
+        return errorResponse(401, "auth_required", requestId, corsHeaders);
+      }
+      let body: { body?: string } | null = null;
+      try {
+        body = await parseJsonBody(request);
+      } catch (error) {
+        return errorResponse(400, "invalid_json", requestId, corsHeaders);
+      }
+      const normalized = normalizeCommentBody(body?.body);
+      if (!normalized) {
+        return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+          field: "body",
+          message: "required"
+        });
+      }
+      const comment = await env.DB.prepare(
+        "SELECT id, submission_id, author_user_id, deleted_at FROM submission_comments WHERE id=?"
+      )
+        .bind(commentId)
+        .first<{ id: string; submission_id: string; author_user_id: string; deleted_at: string | null }>();
+      if (!comment || comment.submission_id !== submissionId) {
+        return errorResponse(404, "not_found", requestId, corsHeaders);
+      }
+      if (!authPayload.isAdmin && comment.author_user_id !== authPayload.userId) {
+        return errorResponse(403, "forbidden", requestId, corsHeaders);
+      }
+      if (comment.deleted_at) {
+        return errorResponse(409, "comment_deleted", requestId, corsHeaders);
+      }
+      await env.DB.prepare("UPDATE submission_comments SET body=?, updated_at=datetime('now') WHERE id=?")
+        .bind(normalized, commentId)
+        .run();
+      const { results } = await env.DB.prepare(
+        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
+      )
+        .bind(submissionId)
+        .all<SubmissionCommentRow>();
+      const data = results.map((row) => ({
+        id: row.id,
+        submission_id: row.submission_id,
+        author_user_id: row.author_user_id,
+        author_role: row.author_role,
+        body: row.body,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at,
+        deleted_by: row.deleted_by,
+        deleted_reason: row.deleted_reason,
+        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_restore: authPayload.isAdmin,
+        can_purge: authPayload.isAdmin
+      }));
+      return jsonResponse(200, { comments: data, requestId }, requestId, corsHeaders);
+    }
+
+    if (request.method === "DELETE" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)$/)) {
+      const match = url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)$/);
+      const submissionId = decodeURIComponent(match![1]);
+      const commentId = decodeURIComponent(match![2]);
+      const authPayload = await getAuthPayload(request, env);
+      if (!authPayload) {
+        return errorResponse(401, "auth_required", requestId, corsHeaders);
+      }
+      const comment = await env.DB.prepare(
+        "SELECT id, submission_id, author_user_id, deleted_at FROM submission_comments WHERE id=?"
+      )
+        .bind(commentId)
+        .first<{ id: string; submission_id: string; author_user_id: string; deleted_at: string | null }>();
+      if (!comment || comment.submission_id !== submissionId) {
+        return errorResponse(404, "not_found", requestId, corsHeaders);
+      }
+      if (!authPayload.isAdmin && comment.author_user_id !== authPayload.userId) {
+        return errorResponse(403, "forbidden", requestId, corsHeaders);
+      }
+      await updateSoftDeleteComments(
+        env,
+        "id=?",
+        [commentId],
+        authPayload.userId,
+        authPayload.isAdmin ? "admin_deleted" : "user_deleted"
+      );
+      const { results } = await env.DB.prepare(
+        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
+      )
+        .bind(submissionId)
+        .all<SubmissionCommentRow>();
+      const data = results.map((row) => ({
+        id: row.id,
+        submission_id: row.submission_id,
+        author_user_id: row.author_user_id,
+        author_role: row.author_role,
+        body: row.body,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at,
+        deleted_by: row.deleted_by,
+        deleted_reason: row.deleted_reason,
+        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_restore: authPayload.isAdmin,
+        can_purge: authPayload.isAdmin
+      }));
+      return jsonResponse(200, { comments: data, requestId }, requestId, corsHeaders);
+    }
+
+    if (request.method === "POST" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)\/restore$/)) {
+      const match = url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)\/restore$/);
+      const submissionId = decodeURIComponent(match![1]);
+      const commentId = decodeURIComponent(match![2]);
+      const authPayload = await getAuthPayload(request, env);
+      if (!authPayload) {
+        return errorResponse(401, "auth_required", requestId, corsHeaders);
+      }
+      if (!authPayload.isAdmin) {
+        return errorResponse(403, "forbidden", requestId, corsHeaders);
+      }
+      const comment = await env.DB.prepare(
+        "SELECT id, submission_id FROM submission_comments WHERE id=?"
+      )
+        .bind(commentId)
+        .first<{ id: string; submission_id: string }>();
+      if (!comment || comment.submission_id !== submissionId) {
+        return errorResponse(404, "not_found", requestId, corsHeaders);
+      }
+      await updateRestoreComments(env, "id=?", [commentId]);
+      const { results } = await env.DB.prepare(
+        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
+      )
+        .bind(submissionId)
+        .all<SubmissionCommentRow>();
+      const data = results.map((row) => ({
+        id: row.id,
+        submission_id: row.submission_id,
+        author_user_id: row.author_user_id,
+        author_role: row.author_role,
+        body: row.body,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at,
+        deleted_by: row.deleted_by,
+        deleted_reason: row.deleted_reason,
+        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_restore: authPayload.isAdmin,
+        can_purge: authPayload.isAdmin
+      }));
+      return jsonResponse(200, { comments: data, requestId }, requestId, corsHeaders);
+    }
+
+    if (request.method === "POST" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)\/purge$/)) {
+      const match = url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)\/purge$/);
+      const submissionId = decodeURIComponent(match![1]);
+      const commentId = decodeURIComponent(match![2]);
+      const authPayload = await getAuthPayload(request, env);
+      if (!authPayload) {
+        return errorResponse(401, "auth_required", requestId, corsHeaders);
+      }
+      if (!authPayload.isAdmin) {
+        return errorResponse(403, "forbidden", requestId, corsHeaders);
+      }
+      const comment = await env.DB.prepare(
+        "SELECT id, submission_id FROM submission_comments WHERE id=?"
+      )
+        .bind(commentId)
+        .first<{ id: string; submission_id: string }>();
+      if (!comment || comment.submission_id !== submissionId) {
+        return errorResponse(404, "not_found", requestId, corsHeaders);
+      }
+      await env.DB.prepare("DELETE FROM submission_comments WHERE id=?")
+        .bind(commentId)
+        .run();
+      const { results } = await env.DB.prepare(
+        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
+      )
+        .bind(submissionId)
+        .all<SubmissionCommentRow>();
+      const data = results.map((row) => ({
+        id: row.id,
+        submission_id: row.submission_id,
+        author_user_id: row.author_user_id,
+        author_role: row.author_role,
+        body: row.body,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        deleted_at: row.deleted_at,
+        deleted_by: row.deleted_by,
+        deleted_reason: row.deleted_reason,
+        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+        can_restore: authPayload.isAdmin,
+        can_purge: authPayload.isAdmin
+      }));
+      return jsonResponse(200, { comments: data, requestId }, requestId, corsHeaders);
     }
 
     if (request.method === "GET" && url.pathname === "/api/me/trash") {
@@ -13274,7 +13807,7 @@ export default {
       }
 
       const submission = await env.DB.prepare(
-        "SELECT s.id,s.payload_json,s.created_at,s.updated_at,s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.user_id=? AND s.deleted_at IS NULL AND f.deleted_at IS NULL"
+        "SELECT s.id,s.payload_json,s.created_at,s.updated_at,s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy,f.discussion_enabled,f.discussion_markdown_enabled,f.discussion_html_enabled,f.discussion_mathjax_enabled FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.user_id=? AND s.deleted_at IS NULL AND f.deleted_at IS NULL"
       )
         .bind(submissionId, authPayload.userId)
         .first<{
@@ -13294,6 +13827,10 @@ export default {
           is_locked: number;
           is_public: number;
           auth_policy: string | null;
+          discussion_enabled: number | null;
+          discussion_markdown_enabled: number | null;
+          discussion_html_enabled: number | null;
+          discussion_mathjax_enabled: number | null;
         }>();
 
       if (!submission) {
@@ -13352,7 +13889,11 @@ export default {
               title: submission.form_title,
               is_locked: toBoolean(submission.is_locked),
               is_public: toBoolean(submission.is_public),
-              auth_policy: submission.auth_policy ?? "optional"
+              auth_policy: submission.auth_policy ?? "optional",
+              discussion_enabled: toBoolean(submission.discussion_enabled ?? 0),
+              discussion_markdown_enabled: toBoolean(submission.discussion_markdown_enabled ?? 1),
+              discussion_html_enabled: toBoolean(submission.discussion_html_enabled ?? 0),
+              discussion_mathjax_enabled: toBoolean(submission.discussion_mathjax_enabled ?? 0)
             }
           },
           requestId
