@@ -8710,22 +8710,6 @@ export default {
             detail: visibilityError
           });
         }
-        const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
-        if (visibilityError) {
-          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-            field: "schema_json",
-            message: "invalid_visibility_rules",
-            detail: visibilityError
-          });
-        }
-        const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
-        if (visibilityError) {
-          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-            field: "schema_json",
-            message: "invalid_visibility_rules",
-            detail: visibilityError
-          });
-        }
 
         const fileRulesJson = buildFileRulesJsonFromSchema(body.schema_json);
         const authPayload = await getAuthPayload(request, env);
