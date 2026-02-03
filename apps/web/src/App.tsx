@@ -7559,6 +7559,12 @@ function SubmissionDetailPage({
                   onChange={(event) => setCommentDraft(event.target.value)}
                   disabled={commentSaving}
                 />
+                {commentDraft.trim() ? (
+                  <div className="mt-2">
+                    <div className="muted">Preview</div>
+                    {renderCommentBody(commentDraft)}
+                  </div>
+                ) : null}
                 <div className="d-flex gap-2 mt-2">
                   <button
                     type="button"
