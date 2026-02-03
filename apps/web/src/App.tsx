@@ -699,12 +699,17 @@ type SubmissionComment = {
   submission_id: string;
   author_user_id: string;
   author_role: string;
+  author_email?: string | null;
+  author_login?: string | null;
   body: string;
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
   deleted_by: string | null;
   deleted_reason: string | null;
+  parent_comment_id?: string | null;
+  quote_comment_id?: string | null;
+  replies?: SubmissionComment[];
   can_edit?: boolean;
   can_delete?: boolean;
   can_restore?: boolean;
@@ -6542,6 +6547,10 @@ function SubmissionDetailPage({
   const [commentEditId, setCommentEditId] = useState<string | null>(null);
   const [commentEditDraft, setCommentEditDraft] = useState("");
   const [commentActionError, setCommentActionError] = useState<string | null>(null);
+  const [commentReplyToId, setCommentReplyToId] = useState<string | null>(null);
+  const [commentQuoteId, setCommentQuoteId] = useState<string | null>(null);
+  const [commentPage, setCommentPage] = useState(1);
+  const [commentHasMore, setCommentHasMore] = useState(false);
   const renderLabel = (label: string) => (
     <RichText
       text={label}
@@ -6577,6 +6586,36 @@ function SubmissionDetailPage({
       allowHtml={discussionHtmlEnabled}
     />
   );
+
+  const discussionSupportLabel =
+    discussionMarkdownEnabled || discussionHtmlEnabled || discussionMathjaxEnabled
+      ? `Supports${discussionMarkdownEnabled ? " Markdown" : ""}${discussionHtmlEnabled ? " + HTML" : ""}${
+          discussionMathjaxEnabled ? " + MathJax" : ""
+        }.`
+      : "Plain text only.";
+
+  const commentLookup = useMemo(() => {
+    const map = new Map<string, SubmissionComment>();
+    commentList.forEach((comment) => map.set(comment.id, comment));
+    return map;
+  }, [commentList]);
+
+  const threadedComments = useMemo(() => {
+    const sorted = [...commentList].sort(
+      (a, b) => Date.parse(a.created_at) - Date.parse(b.created_at)
+    );
+    const map = new Map<string, SubmissionComment>();
+    sorted.forEach((comment) => map.set(comment.id, { ...comment, replies: [] }));
+    const roots: SubmissionComment[] = [];
+    map.forEach((comment) => {
+      if (comment.parent_comment_id && map.has(comment.parent_comment_id)) {
+        map.get(comment.parent_comment_id)!.replies!.push(comment);
+      } else {
+        roots.push(comment);
+      }
+    });
+    return roots;
+  }, [commentList]);
 
   const renderSubmissionDataTable = (dataObject: Record<string, unknown>) => {
     const orderedKeys = fieldOrder.filter(
@@ -6720,6 +6759,8 @@ function SubmissionDetailPage({
       setCommentList([]);
       setCommentLoading(false);
       setCommentError(null);
+      setCommentHasMore(false);
+      setCommentPage(1);
       return;
     }
     let active = true;
@@ -6727,7 +6768,7 @@ function SubmissionDetailPage({
       setCommentLoading(true);
       setCommentError(null);
       const response = await apiFetch(
-        `${API_BASE}/api/me/submissions/${encodeURIComponent(data.submissionId)}/comments`
+        `${API_BASE}/api/me/submissions/${encodeURIComponent(data.submissionId)}/comments?page=${commentPage}&pageSize=20`
       );
       const payload = await response.json().catch(() => null);
       if (!active) return;
@@ -6737,14 +6778,26 @@ function SubmissionDetailPage({
         setCommentLoading(false);
         return;
       }
-      setCommentList(Array.isArray(payload?.comments) ? payload.comments : []);
+      const incoming = Array.isArray(payload?.comments) ? payload.comments : [];
+      setCommentList((prev) => {
+        const base = commentPage === 1 ? [] : prev;
+        const seen = new Set(base.map((item) => item.id));
+        const next = [...base];
+        for (const item of incoming) {
+          if (!item?.id || seen.has(item.id)) continue;
+          seen.add(item.id);
+          next.push(item);
+        }
+        return next;
+      });
+      setCommentHasMore(Boolean(payload?.hasMore));
       setCommentLoading(false);
     }
     loadComments();
     return () => {
       active = false;
     };
-  }, [data?.submissionId, discussionEnabled]);
+  }, [data?.submissionId, discussionEnabled, commentPage]);
 
   async function handleVersionViewChange(value: string) {
     setVersionView({ selected: value, data: null, createdAt: null });
@@ -6785,7 +6838,11 @@ function SubmissionDetailPage({
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body })
+        body: JSON.stringify({
+          body,
+          parentCommentId: commentReplyToId,
+          quoteCommentId: commentQuoteId
+        })
       }
     );
     const payload = await response.json().catch(() => null);
@@ -6795,6 +6852,11 @@ function SubmissionDetailPage({
       return;
     }
     setCommentDraft("");
+    setCommentReplyToId(null);
+    setCommentQuoteId(null);
+    if (commentPage !== 1) {
+      setCommentPage(1);
+    }
     setCommentList(Array.isArray(payload?.comments) ? payload.comments : commentList);
     setCommentSaving(false);
   }
@@ -6826,6 +6888,9 @@ function SubmissionDetailPage({
     }
     setCommentEditId(null);
     setCommentEditDraft("");
+    if (commentPage !== 1) {
+      setCommentPage(1);
+    }
     setCommentList(Array.isArray(payload?.comments) ? payload.comments : commentList);
     setCommentSaving(false);
   }
@@ -6845,6 +6910,9 @@ function SubmissionDetailPage({
       setCommentActionError(payload?.error || "Failed to delete comment.");
       return;
     }
+    if (commentPage !== 1) {
+      setCommentPage(1);
+    }
     setCommentList(Array.isArray(payload?.comments) ? payload.comments : commentList);
   }
 
@@ -6861,6 +6929,9 @@ function SubmissionDetailPage({
     if (!response.ok) {
       setCommentActionError(payload?.error || "Failed to restore comment.");
       return;
+    }
+    if (commentPage !== 1) {
+      setCommentPage(1);
     }
     setCommentList(Array.isArray(payload?.comments) ? payload.comments : commentList);
   }
@@ -6879,6 +6950,9 @@ function SubmissionDetailPage({
     if (!response.ok) {
       setCommentActionError(payload?.error || "Failed to purge comment.");
       return;
+    }
+    if (commentPage !== 1) {
+      setCommentPage(1);
     }
     setCommentList(Array.isArray(payload?.comments) ? payload.comments : commentList);
   }
@@ -7260,128 +7334,223 @@ function SubmissionDetailPage({
               {commentActionError ? <div className="alert alert-danger">{commentActionError}</div> : null}
               {commentLoading ? (
                 <div className="muted">Loading discussion...</div>
-              ) : commentList.length === 0 ? (
+              ) : threadedComments.length === 0 ? (
                 <div className="muted">No comments yet.</div>
               ) : (
                 <div className="d-flex flex-column gap-3">
-                  {commentList.map((comment) => {
-                    const isDeleted = !!comment.deleted_at;
-                    const isEditing = commentEditId === comment.id;
-                    const authorLabel =
-                      comment.author_role === "admin"
-                        ? "Admin"
-                        : comment.author_user_id === user?.userId
-                          ? "You"
-                          : "User";
-                    return (
-                      <div key={comment.id} className={`card ${isDeleted ? "border-warning" : ""}`}>
-                        <div className="card-body">
-                          <div className="d-flex justify-content-between flex-wrap gap-2">
-                            <div>
-                              <div className="fw-semibold">
-                                {authorLabel}
+                  {threadedComments.map((comment) => {
+                    const renderComment = (item: SubmissionComment, depth: number) => {
+                      const isDeleted = !!item.deleted_at;
+                      const isEditing = commentEditId === item.id;
+                      const authorLabel =
+                        item.author_role === "admin"
+                          ? "Admin"
+                          : item.author_user_id === user?.userId
+                            ? "You"
+                            : "User";
+                      const authorMeta =
+                        item.author_role === "admin" && (item.author_email || item.author_login)
+                          ? ` · ${item.author_email || item.author_login}`
+                          : "";
+                      const edited = item.updated_at && item.updated_at !== item.created_at;
+                      const editedLabel = edited ? " · edited" : "";
+                          const editedTitle = edited ? `Edited at ${formatTimeICT(item.updated_at)}` : "";
+                      const quote =
+                        item.quote_comment_id && commentLookup.has(item.quote_comment_id)
+                          ? commentLookup.get(item.quote_comment_id)!
+                          : null;
+                      const quoteLabel = quote
+                        ? quote.author_role === "admin"
+                          ? "Admin"
+                          : quote.author_user_id === user?.userId
+                            ? "You"
+                            : "User"
+                        : "";
+                      return (
+                        <div
+                          key={item.id}
+                          className={`card ${isDeleted ? "border-warning" : ""}`}
+                          style={depth > 0 ? { marginLeft: `${depth * 1.5}rem` } : undefined}
+                        >
+                          <div className="card-body">
+                            <div className="d-flex justify-content-between flex-wrap gap-2">
+                              <div>
+                                <div className="fw-semibold">
+                                  {authorLabel}
+                                  {authorMeta}
+                                </div>
+                                <div className="muted" title={editedTitle}>
+                                  {formatTimeICT(item.created_at)}
+                                  {editedLabel}
+                                  {isDeleted ? " · deleted" : ""}
+                                </div>
                               </div>
-                              <div className="muted">
-                                {formatTimeICT(comment.updated_at || comment.created_at)}
-                                {comment.updated_at && comment.updated_at !== comment.created_at ? " · edited" : ""}
-                                {isDeleted ? " · deleted" : ""}
+                              <div className="d-flex gap-2 flex-wrap">
+                                {!isDeleted ? (
+                                  <button
+                                    type="button"
+                                    className="btn btn-outline-secondary btn-sm"
+                                    onClick={() => {
+                                      setCommentReplyToId(item.id);
+                                      setCommentQuoteId(null);
+                                      setCommentDraft("");
+                                    }}
+                                  >
+                                    <i className="bi bi-reply" aria-hidden="true" /> Reply
+                                  </button>
+                                ) : null}
+                                {!isDeleted ? (
+                                  <button
+                                    type="button"
+                                    className="btn btn-outline-secondary btn-sm"
+                                    onClick={() => {
+                                      setCommentReplyToId(item.id);
+                                      setCommentQuoteId(item.id);
+                                      setCommentDraft("");
+                                    }}
+                                  >
+                                    <i className="bi bi-quote" aria-hidden="true" /> Quote
+                                  </button>
+                                ) : null}
+                                {item.can_edit && !isDeleted ? (
+                                  <button
+                                    type="button"
+                                    className="btn btn-outline-secondary btn-sm"
+                                    disabled={commentSaving}
+                                    onClick={() => {
+                                      setCommentEditId(item.id);
+                                      setCommentEditDraft(item.body);
+                                    }}
+                                  >
+                                    <i className="bi bi-pencil" aria-hidden="true" /> Edit
+                                  </button>
+                                ) : null}
+                                {item.can_delete && !isDeleted ? (
+                                  <button
+                                    type="button"
+                                    className="btn btn-outline-danger btn-sm"
+                                    onClick={() => handleCommentDelete(item.id)}
+                                  >
+                                    <i className="bi bi-trash" aria-hidden="true" /> Delete
+                                  </button>
+                                ) : null}
+                                {item.can_restore && isDeleted ? (
+                                  <button
+                                    type="button"
+                                    className="btn btn-outline-primary btn-sm"
+                                    onClick={() => handleCommentRestore(item.id)}
+                                  >
+                                    <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore
+                                  </button>
+                                ) : null}
+                                {item.can_purge && isDeleted ? (
+                                  <button
+                                    type="button"
+                                    className="btn btn-outline-danger btn-sm"
+                                    onClick={() => handleCommentPurge(item.id)}
+                                  >
+                                    <i className="bi bi-x-circle" aria-hidden="true" /> Purge
+                                  </button>
+                                ) : null}
                               </div>
                             </div>
-                            <div className="d-flex gap-2">
-                              {comment.can_edit && !isDeleted ? (
-                                <button
-                                  type="button"
-                                  className="btn btn-outline-secondary btn-sm"
+                            {quote ? (
+                              <div className="alert alert-light mt-2 mb-2">
+                                <div className="muted mb-1">Quoted from {quoteLabel}</div>
+                                {renderCommentBody(quote.body)}
+                              </div>
+                            ) : null}
+                            {isEditing ? (
+                              <div className="mt-3">
+                                <textarea
+                                  className="form-control"
+                                  rows={4}
+                                  value={commentEditDraft}
+                                  onChange={(event) => setCommentEditDraft(event.target.value)}
                                   disabled={commentSaving}
-                                  onClick={() => {
-                                    setCommentEditId(comment.id);
-                                    setCommentEditDraft(comment.body);
-                                  }}
-                                >
-                                  <i className="bi bi-pencil" aria-hidden="true" /> Edit
-                                </button>
-                              ) : null}
-                              {comment.can_delete && !isDeleted ? (
-                                <button
-                                  type="button"
-                                  className="btn btn-outline-danger btn-sm"
-                                  onClick={() => handleCommentDelete(comment.id)}
-                                >
-                                  <i className="bi bi-trash" aria-hidden="true" /> Delete
-                                </button>
-                              ) : null}
-                              {comment.can_restore && isDeleted ? (
-                                <button
-                                  type="button"
-                                  className="btn btn-outline-primary btn-sm"
-                                  onClick={() => handleCommentRestore(comment.id)}
-                                >
-                                  <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore
-                                </button>
-                              ) : null}
-                              {comment.can_purge && isDeleted ? (
-                                <button
-                                  type="button"
-                                  className="btn btn-outline-danger btn-sm"
-                                  onClick={() => handleCommentPurge(comment.id)}
-                                >
-                                  <i className="bi bi-x-circle" aria-hidden="true" /> Purge
-                                </button>
-                              ) : null}
-                            </div>
+                                />
+                                <div className="d-flex gap-2 mt-2">
+                                  <button
+                                    type="button"
+                                    className="btn btn-primary btn-sm"
+                                    disabled={commentSaving}
+                                    onClick={() => handleCommentEditSave(item.id)}
+                                  >
+                                    <i className="bi bi-check-lg" aria-hidden="true" /> Save
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn btn-outline-secondary btn-sm"
+                                    disabled={commentSaving}
+                                    onClick={() => {
+                                      setCommentEditId(null);
+                                      setCommentEditDraft("");
+                                    }}
+                                  >
+                                    Cancel
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="mt-2">{renderCommentBody(item.body)}</div>
+                            )}
+                            {isDeleted ? (
+                              <div className="muted mt-2">
+                                Deleted{" "}
+                                {item.deleted_by ? `by ${item.deleted_by} ` : ""}at{" "}
+                                {item.deleted_at ? formatTimeICT(item.deleted_at) : "n/a"}.
+                                {item.deleted_reason ? ` ${item.deleted_reason}` : ""}
+                              </div>
+                            ) : null}
                           </div>
-                          {isEditing ? (
-                            <div className="mt-3">
-                              <textarea
-                                className="form-control"
-                                rows={4}
-                                value={commentEditDraft}
-                                onChange={(event) => setCommentEditDraft(event.target.value)}
-                                disabled={commentSaving}
-                              />
-                              <div className="d-flex gap-2 mt-2">
-                                <button
-                                  type="button"
-                                  className="btn btn-primary btn-sm"
-                                  disabled={commentSaving}
-                                  onClick={() => handleCommentEditSave(comment.id)}
-                                >
-                                  <i className="bi bi-check-lg" aria-hidden="true" /> Save
-                                </button>
-                                <button
-                                  type="button"
-                                  className="btn btn-outline-secondary btn-sm"
-                                  disabled={commentSaving}
-                                  onClick={() => {
-                                    setCommentEditId(null);
-                                    setCommentEditDraft("");
-                                  }}
-                                >
-                                  Cancel
-                                </button>
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="mt-2">{renderCommentBody(comment.body)}</div>
-                          )}
-                          {isDeleted ? (
-                            <div className="muted mt-2">
-                              Deleted{" "}
-                              {comment.deleted_by ? `by ${comment.deleted_by} ` : ""}at{" "}
-                              {comment.deleted_at ? formatTimeICT(comment.deleted_at) : "n/a"}.
-                              {comment.deleted_reason ? ` ${comment.deleted_reason}` : ""}
+                          {item.replies && item.replies.length > 0 ? (
+                            <div className="mt-2">
+                              {item.replies.map((child) => renderComment(child, depth + 1))}
                             </div>
                           ) : null}
                         </div>
-                      </div>
-                    );
+                      );
+                    };
+                    return renderComment(comment, 0);
                   })}
                 </div>
               )}
+              {commentHasMore ? (
+                <button
+                  type="button"
+                  className="btn btn-outline-secondary btn-sm mt-2"
+                  disabled={commentLoading}
+                  onClick={() => setCommentPage((prev) => prev + 1)}
+                >
+                  Load more
+                </button>
+              ) : null}
               <div className="mt-3">
                 <label htmlFor="comment-editor" className="form-label">
                   Add a comment
                 </label>
+                <div className="muted mb-2">{discussionSupportLabel}</div>
+                {commentReplyToId ? (
+                  <div className="alert alert-light py-2">
+                    Replying to{" "}
+                    {commentLookup.get(commentReplyToId)?.author_role === "admin"
+                      ? "Admin"
+                      : commentLookup.get(commentReplyToId)?.author_user_id === user?.userId
+                        ? "You"
+                        : "User"}
+                    {commentQuoteId ? " (quoted)" : ""}
+                    <button
+                      type="button"
+                      className="btn btn-link btn-sm ms-2"
+                      onClick={() => {
+                        setCommentReplyToId(null);
+                        setCommentQuoteId(null);
+                      }}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                ) : null}
                 <textarea
                   id="comment-editor"
                   className="form-control"

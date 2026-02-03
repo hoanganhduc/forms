@@ -169,6 +169,8 @@ type SubmissionCommentRow = {
   deleted_at: string | null;
   deleted_by: string | null;
   deleted_reason: string | null;
+  parent_comment_id: string | null;
+  quote_comment_id: string | null;
 };
 
 type FileRules = {
@@ -4403,6 +4405,104 @@ async function updateRestoreComments(
       .bind(...bindings)
       .run();
   }
+}
+
+type SubmissionCommentListRow = SubmissionCommentRow & {
+  author_email?: string | null;
+  author_login?: string | null;
+};
+
+type CommentPageResult = {
+  comments: Array<Record<string, unknown>>;
+  page: number;
+  pageSize: number;
+  total: number;
+  hasMore: boolean;
+};
+
+async function loadSubmissionCommentsPage(
+  env: Env,
+  submissionId: string,
+  authPayload: JwtPayload,
+  page: number,
+  pageSize: number
+): Promise<CommentPageResult> {
+  const parentSelect = (await hasColumn(env, "submission_comments", "parent_comment_id"))
+    ? "parent_comment_id"
+    : "NULL as parent_comment_id";
+  const quoteSelect = (await hasColumn(env, "submission_comments", "quote_comment_id"))
+    ? "quote_comment_id"
+    : "NULL as quote_comment_id";
+  const identitySelect = authPayload.isAdmin
+    ? ",(SELECT email FROM user_identities ui WHERE ui.user_id=submission_comments.author_user_id ORDER BY ui.created_at DESC LIMIT 1) as author_email,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=submission_comments.author_user_id ORDER BY ui.created_at DESC LIMIT 1) as author_login"
+    : ",NULL as author_email,NULL as author_login";
+  const offset = (page - 1) * pageSize;
+  const baseSelect = `SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason,${parentSelect},${quoteSelect}${identitySelect} FROM submission_comments WHERE submission_id=?`;
+  const { results } = await env.DB.prepare(
+    `${baseSelect} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  )
+    .bind(submissionId, pageSize, offset)
+    .all<SubmissionCommentListRow>();
+  const rows = [...results];
+  const knownIds = new Set(rows.map((row) => row.id));
+  let pendingIds = new Set<string>();
+  for (const row of rows) {
+    if (row.parent_comment_id && !knownIds.has(row.parent_comment_id)) {
+      pendingIds.add(row.parent_comment_id);
+    }
+    if (row.quote_comment_id && !knownIds.has(row.quote_comment_id)) {
+      pendingIds.add(row.quote_comment_id);
+    }
+  }
+  while (pendingIds.size > 0) {
+    const ids = Array.from(pendingIds);
+    pendingIds = new Set<string>();
+    const placeholders = ids.map(() => "?").join(",");
+    const { results: extra } = await env.DB.prepare(
+      `${baseSelect} AND id IN (${placeholders})`
+    )
+      .bind(submissionId, ...ids)
+      .all<SubmissionCommentListRow>();
+    for (const row of extra) {
+      if (knownIds.has(row.id)) continue;
+      knownIds.add(row.id);
+      rows.push(row);
+      if (row.parent_comment_id && !knownIds.has(row.parent_comment_id)) {
+        pendingIds.add(row.parent_comment_id);
+      }
+      if (row.quote_comment_id && !knownIds.has(row.quote_comment_id)) {
+        pendingIds.add(row.quote_comment_id);
+      }
+    }
+  }
+  const totalRow = await env.DB.prepare(
+    "SELECT COUNT(1) as total FROM submission_comments WHERE submission_id=?"
+  )
+    .bind(submissionId)
+    .first<{ total: number }>();
+  const total = totalRow?.total ?? 0;
+  const hasMore = offset + pageSize < total;
+  const comments = rows.map((row) => ({
+    id: row.id,
+    submission_id: row.submission_id,
+    author_user_id: row.author_user_id,
+    author_role: row.author_role,
+    author_email: authPayload.isAdmin ? row.author_email ?? null : null,
+    author_login: authPayload.isAdmin ? row.author_login ?? null : null,
+    body: row.body,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    deleted_at: row.deleted_at,
+    deleted_by: row.deleted_by,
+    deleted_reason: row.deleted_reason,
+    parent_comment_id: row.parent_comment_id ?? null,
+    quote_comment_id: row.quote_comment_id ?? null,
+    can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+    can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
+    can_restore: authPayload.isAdmin,
+    can_purge: authPayload.isAdmin
+  }));
+  return { comments, page, pageSize, total, hasMore };
 }
 
 function hasFileFields(schemaJson: string | null | undefined): boolean {
@@ -13337,6 +13437,9 @@ export default {
     if (request.method === "GET" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments$/)) {
       const match = url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments$/);
       const submissionId = decodeURIComponent(match![1]);
+      const page = Math.max(toNumber(url.searchParams.get("page"), 1), 1);
+      const pageSize = Math.min(Math.max(toNumber(url.searchParams.get("pageSize"), 20), 1), 200);
+      const offset = (page - 1) * pageSize;
       const authPayload = await getAuthPayload(request, env);
       if (!authPayload) {
         return errorResponse(401, "auth_required", requestId, corsHeaders);
@@ -13362,31 +13465,21 @@ export default {
       if (!authPayload.isAdmin && submission.user_id !== authPayload.userId) {
         return errorResponse(403, "forbidden", requestId, corsHeaders);
       }
-      const { results } = await env.DB.prepare(
-        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
-      )
-        .bind(submissionId)
-        .all<SubmissionCommentRow>();
-      const data = results.map((row) => ({
-        id: row.id,
-        submission_id: row.submission_id,
-        author_user_id: row.author_user_id,
-        author_role: row.author_role,
-        body: row.body,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        deleted_at: row.deleted_at,
-        deleted_by: row.deleted_by,
-        deleted_reason: row.deleted_reason,
-        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_restore: authPayload.isAdmin,
-        can_purge: authPayload.isAdmin
-      }));
+      const pageData = await loadSubmissionCommentsPage(
+        env,
+        submissionId,
+        authPayload,
+        page,
+        pageSize
+      );
       return jsonResponse(
         200,
         {
-          comments: data,
+          comments: pageData.comments,
+          page: pageData.page,
+          pageSize: pageData.pageSize,
+          total: pageData.total,
+          hasMore: pageData.hasMore,
           settings: {
             enabled: true,
             markdown_enabled: toBoolean(submission.discussion_markdown_enabled ?? 1),
@@ -13407,7 +13500,7 @@ export default {
       if (!authPayload) {
         return errorResponse(401, "auth_required", requestId, corsHeaders);
       }
-      let body: { body?: string } | null = null;
+      let body: { body?: string; parentCommentId?: string | null; quoteCommentId?: string | null } | null = null;
       try {
         body = await parseJsonBody(request);
       } catch (error) {
@@ -13434,38 +13527,72 @@ export default {
       if (!authPayload.isAdmin && submission.user_id !== authPayload.userId) {
         return errorResponse(403, "forbidden", requestId, corsHeaders);
       }
+      const parentCommentId =
+        body?.parentCommentId && String(body.parentCommentId).trim()
+          ? String(body.parentCommentId).trim()
+          : null;
+      const quoteCommentId =
+        body?.quoteCommentId && String(body.quoteCommentId).trim()
+          ? String(body.quoteCommentId).trim()
+          : null;
+      const hasParentColumn = await hasColumn(env, "submission_comments", "parent_comment_id");
+      const hasQuoteColumn = await hasColumn(env, "submission_comments", "quote_comment_id");
+      const normalizedParent = hasParentColumn ? parentCommentId : null;
+      const normalizedQuote = hasQuoteColumn ? quoteCommentId : null;
+      if ((normalizedParent || normalizedQuote) && (hasParentColumn || hasQuoteColumn)) {
+        const ids = [parentCommentId, quoteCommentId].filter(Boolean);
+        const placeholders = ids.map(() => "?").join(",");
+        const { results } = await env.DB.prepare(
+          `SELECT id FROM submission_comments WHERE submission_id=? AND id IN (${placeholders})`
+        )
+          .bind(submissionId, ...ids)
+          .all<{ id: string }>();
+        const found = new Set(results.map((row) => row.id));
+        if (normalizedParent && !found.has(normalizedParent)) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "parentCommentId",
+            message: "invalid"
+          });
+        }
+        if (normalizedQuote && !found.has(normalizedQuote)) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "quoteCommentId",
+            message: "invalid"
+          });
+        }
+      }
       const commentId = crypto.randomUUID();
       const role = authPayload.isAdmin ? "admin" : "user";
-      await env.DB.prepare(
-        "INSERT INTO submission_comments (id, submission_id, author_user_id, author_role, body) VALUES (?, ?, ?, ?, ?)"
-      )
-        .bind(commentId, submissionId, authPayload.userId, role, normalized)
-        .run();
-      const { results } = await env.DB.prepare(
-        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
-      )
-        .bind(submissionId)
-        .all<SubmissionCommentRow>();
-      const data = results.map((row) => ({
-        id: row.id,
-        submission_id: row.submission_id,
-        author_user_id: row.author_user_id,
-        author_role: row.author_role,
-        body: row.body,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        deleted_at: row.deleted_at,
-        deleted_by: row.deleted_by,
-        deleted_reason: row.deleted_reason,
-        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_restore: authPayload.isAdmin,
-        can_purge: authPayload.isAdmin
-      }));
+      if (hasParentColumn && hasQuoteColumn) {
+        await env.DB.prepare(
+          "INSERT INTO submission_comments (id, submission_id, author_user_id, author_role, body, parent_comment_id, quote_comment_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+          .bind(commentId, submissionId, authPayload.userId, role, normalized, normalizedParent, normalizedQuote)
+          .run();
+      } else if (hasParentColumn) {
+        await env.DB.prepare(
+          "INSERT INTO submission_comments (id, submission_id, author_user_id, author_role, body, parent_comment_id) VALUES (?, ?, ?, ?, ?, ?)"
+        )
+          .bind(commentId, submissionId, authPayload.userId, role, normalized, normalizedParent)
+          .run();
+      } else if (hasQuoteColumn) {
+        await env.DB.prepare(
+          "INSERT INTO submission_comments (id, submission_id, author_user_id, author_role, body, quote_comment_id) VALUES (?, ?, ?, ?, ?, ?)"
+        )
+          .bind(commentId, submissionId, authPayload.userId, role, normalized, normalizedQuote)
+          .run();
+      } else {
+        await env.DB.prepare(
+          "INSERT INTO submission_comments (id, submission_id, author_user_id, author_role, body) VALUES (?, ?, ?, ?, ?)"
+        )
+          .bind(commentId, submissionId, authPayload.userId, role, normalized)
+          .run();
+      }
+      const data = await loadSubmissionCommentsPage(env, submissionId, authPayload, 1, 20);
       return jsonResponse(
         201,
         {
-          comments: data,
+          comments: data.comments,
           requestId
         },
         requestId,
@@ -13511,28 +13638,8 @@ export default {
       await env.DB.prepare("UPDATE submission_comments SET body=?, updated_at=datetime('now') WHERE id=?")
         .bind(normalized, commentId)
         .run();
-      const { results } = await env.DB.prepare(
-        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
-      )
-        .bind(submissionId)
-        .all<SubmissionCommentRow>();
-      const data = results.map((row) => ({
-        id: row.id,
-        submission_id: row.submission_id,
-        author_user_id: row.author_user_id,
-        author_role: row.author_role,
-        body: row.body,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        deleted_at: row.deleted_at,
-        deleted_by: row.deleted_by,
-        deleted_reason: row.deleted_reason,
-        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_restore: authPayload.isAdmin,
-        can_purge: authPayload.isAdmin
-      }));
-      return jsonResponse(200, { comments: data, requestId }, requestId, corsHeaders);
+      const data = await loadSubmissionCommentsPage(env, submissionId, authPayload, 1, 20);
+      return jsonResponse(200, { comments: data.comments, requestId }, requestId, corsHeaders);
     }
 
     if (request.method === "DELETE" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)$/)) {
@@ -13561,28 +13668,8 @@ export default {
         authPayload.userId,
         authPayload.isAdmin ? "admin_deleted" : "user_deleted"
       );
-      const { results } = await env.DB.prepare(
-        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
-      )
-        .bind(submissionId)
-        .all<SubmissionCommentRow>();
-      const data = results.map((row) => ({
-        id: row.id,
-        submission_id: row.submission_id,
-        author_user_id: row.author_user_id,
-        author_role: row.author_role,
-        body: row.body,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        deleted_at: row.deleted_at,
-        deleted_by: row.deleted_by,
-        deleted_reason: row.deleted_reason,
-        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_restore: authPayload.isAdmin,
-        can_purge: authPayload.isAdmin
-      }));
-      return jsonResponse(200, { comments: data, requestId }, requestId, corsHeaders);
+      const data = await loadSubmissionCommentsPage(env, submissionId, authPayload, 1, 20);
+      return jsonResponse(200, { comments: data.comments, requestId }, requestId, corsHeaders);
     }
 
     if (request.method === "POST" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)\/restore$/)) {
@@ -13605,28 +13692,8 @@ export default {
         return errorResponse(404, "not_found", requestId, corsHeaders);
       }
       await updateRestoreComments(env, "id=?", [commentId]);
-      const { results } = await env.DB.prepare(
-        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
-      )
-        .bind(submissionId)
-        .all<SubmissionCommentRow>();
-      const data = results.map((row) => ({
-        id: row.id,
-        submission_id: row.submission_id,
-        author_user_id: row.author_user_id,
-        author_role: row.author_role,
-        body: row.body,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        deleted_at: row.deleted_at,
-        deleted_by: row.deleted_by,
-        deleted_reason: row.deleted_reason,
-        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_restore: authPayload.isAdmin,
-        can_purge: authPayload.isAdmin
-      }));
-      return jsonResponse(200, { comments: data, requestId }, requestId, corsHeaders);
+      const data = await loadSubmissionCommentsPage(env, submissionId, authPayload, 1, 20);
+      return jsonResponse(200, { comments: data.comments, requestId }, requestId, corsHeaders);
     }
 
     if (request.method === "POST" && url.pathname.match(/^\/api\/me\/submissions\/([^/]+)\/comments\/([^/]+)\/purge$/)) {
@@ -13651,28 +13718,8 @@ export default {
       await env.DB.prepare("DELETE FROM submission_comments WHERE id=?")
         .bind(commentId)
         .run();
-      const { results } = await env.DB.prepare(
-        "SELECT id,submission_id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason FROM submission_comments WHERE submission_id=? ORDER BY created_at ASC"
-      )
-        .bind(submissionId)
-        .all<SubmissionCommentRow>();
-      const data = results.map((row) => ({
-        id: row.id,
-        submission_id: row.submission_id,
-        author_user_id: row.author_user_id,
-        author_role: row.author_role,
-        body: row.body,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        deleted_at: row.deleted_at,
-        deleted_by: row.deleted_by,
-        deleted_reason: row.deleted_reason,
-        can_edit: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_delete: authPayload.isAdmin || row.author_user_id === authPayload.userId,
-        can_restore: authPayload.isAdmin,
-        can_purge: authPayload.isAdmin
-      }));
-      return jsonResponse(200, { comments: data, requestId }, requestId, corsHeaders);
+      const data = await loadSubmissionCommentsPage(env, submissionId, authPayload, 1, 20);
+      return jsonResponse(200, { comments: data.comments, requestId }, requestId, corsHeaders);
     }
 
     if (request.method === "GET" && url.pathname === "/api/me/trash") {
