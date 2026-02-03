@@ -580,6 +580,14 @@ type FormSummary = {
   is_open?: boolean;
 };
 
+type VisibilityMatchMode = "any" | "all";
+
+type FieldVisibilityRule = {
+  dependsOn: string;
+  values: string[];
+  mode?: VisibilityMatchMode;
+};
+
 type FormField = {
   id: string;
   label: string;
@@ -590,6 +598,7 @@ type FormField = {
   options?: string[];
   multiple?: boolean;
   rules?: Record<string, unknown>;
+  visibility?: FieldVisibilityRule;
 };
 
 type FormDetail = {
@@ -785,6 +794,73 @@ function formatReminderFrequency(value: string | null | undefined) {
   const unit = match[2];
   const label = count === 1 ? unit.replace(/s$/, "") : unit;
   return `every ${count} ${label}`;
+}
+
+function parseSelectionValues(field: FormField, rawValue: string) {
+  const trimmed = rawValue.trim();
+  if (!trimmed) return [];
+  if (field.type === "checkbox" && field.multiple) {
+    return trimmed
+      .split(",")
+      .map((item) => item.trim())
+      .filter((item) => item.length > 0);
+  }
+  return [trimmed];
+}
+
+function buildVisibilityMap(fields: FormField[], values: Record<string, string>) {
+  const fieldById = new Map(fields.map((field) => [field.id, field]));
+  const memo = new Map<string, boolean>();
+  const compute = (field: FormField, stack: Set<string>): boolean => {
+    if (memo.has(field.id)) {
+      return memo.get(field.id)!;
+    }
+    if (stack.has(field.id)) {
+      memo.set(field.id, true);
+      return true;
+    }
+    const rule = field.visibility;
+    if (!rule || typeof rule !== "object") {
+      memo.set(field.id, true);
+      return true;
+    }
+    const dependsOn = typeof rule.dependsOn === "string" ? rule.dependsOn.trim() : "";
+    if (!dependsOn) {
+      memo.set(field.id, true);
+      return true;
+    }
+    const controller = fieldById.get(dependsOn);
+    if (!controller || !VISIBILITY_CONTROLLER_TYPES.has(controller.type)) {
+      memo.set(field.id, true);
+      return true;
+    }
+    const nextStack = new Set(stack);
+    nextStack.add(field.id);
+    if (!compute(controller, nextStack)) {
+      memo.set(field.id, false);
+      return false;
+    }
+    const selected = parseSelectionValues(controller, values[controller.id] || "");
+    const ruleValues = Array.isArray(rule.values)
+      ? rule.values.map((value) => String(value)).filter((value) => value.length > 0)
+      : [];
+    if (ruleValues.length === 0) {
+      memo.set(field.id, true);
+      return true;
+    }
+    const mode = rule.mode === "all" ? "all" : "any";
+    const matches =
+      mode === "all"
+        ? ruleValues.every((value) => selected.includes(value))
+        : ruleValues.some((value) => selected.includes(value));
+    memo.set(field.id, matches);
+    return matches;
+  };
+  const map: Record<string, boolean> = {};
+  fields.forEach((field) => {
+    map[field.id] = compute(field, new Set());
+  });
+  return map;
 }
 
 function zonedTimeToUtcIso(localValue: string, timeZone: string) {
@@ -1034,6 +1110,19 @@ function parseSchemaText(text: string) {
   return { schema: { fields: [] as Array<Record<string, unknown>> }, fields: [] as Array<Record<string, unknown>> };
 }
 
+function parseVisibilityRule(input: unknown) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const record = input as Record<string, unknown>;
+  const dependsOn = typeof record.dependsOn === "string" ? record.dependsOn.trim() : "";
+  if (!dependsOn) return null;
+  const values = Array.isArray(record.values)
+    ? record.values.map((value) => String(value).trim()).filter((value) => value.length > 0)
+    : [];
+  if (values.length === 0) return null;
+  const mode = record.mode === "all" ? "all" : "any";
+  return { dependsOn, values, mode } as FieldVisibilityRule;
+}
+
 function validateFileRulesInSchema(schema: unknown): string | null {
   if (!schema || typeof schema !== "object") return null;
   const fields = Array.isArray((schema as any).fields) ? (schema as any).fields : [];
@@ -1068,6 +1157,43 @@ function validateFileRulesInSchema(schema: unknown): string | null {
     const maxFiles = (rules as any).maxFiles ?? (rules as any).maxCount;
     if (maxFiles !== undefined && (typeof maxFiles !== "number" || maxFiles <= 0)) {
       return `File field "${fieldId || "unknown"}" max files must be a positive number.`;
+    }
+  }
+  return null;
+}
+
+function validateVisibilityRulesInSchema(schema: unknown): string | null {
+  if (!schema || typeof schema !== "object") return null;
+  const fields = Array.isArray((schema as any).fields) ? (schema as any).fields : [];
+  if (fields.length === 0) return null;
+  const fieldIds = new Set<string>();
+  const controllers = new Set<string>();
+  fields.forEach((field: any) => {
+    const id = typeof field?.id === "string" ? field.id : "";
+    if (id) {
+      fieldIds.add(id);
+    }
+    if (VISIBILITY_CONTROLLER_TYPES.has(String(field?.type || "")) && id) {
+      controllers.add(id);
+    }
+  });
+  for (const field of fields) {
+    if (!field || typeof field !== "object") continue;
+    const id = typeof (field as any).id === "string" ? (field as any).id : "";
+    const visibility = (field as any).visibility;
+    if (!visibility) continue;
+    const parsed = parseVisibilityRule(visibility);
+    if (!parsed) {
+      return `Field "${id || "unknown"}" visibility is invalid.`;
+    }
+    if (!fieldIds.has(parsed.dependsOn)) {
+      return `Field "${id || "unknown"}" depends on missing field "${parsed.dependsOn}".`;
+    }
+    if (!controllers.has(parsed.dependsOn)) {
+      return `Field "${id || "unknown"}" depends on non-choice field "${parsed.dependsOn}".`;
+    }
+    if (parsed.dependsOn === id) {
+      return `Field "${id || "unknown"}" cannot depend on itself.`;
     }
   }
   return null;
@@ -1146,6 +1272,10 @@ type FieldBuilderConfig = {
   dateTimezone: string;
   dateMode: string;
   dateShowTimezone: boolean;
+  visibilityEnabled: boolean;
+  visibilityDependsOn: string;
+  visibilityValues: string;
+  visibilityMode: VisibilityMatchMode;
 };
 
 type FileFieldBuilderConfig = {
@@ -1156,6 +1286,8 @@ type FileFieldBuilderConfig = {
   maxSizeMb: number;
   maxFiles: number;
 };
+
+const VISIBILITY_CONTROLLER_TYPES = new Set(["select", "checkbox", "radio"]);
 
 function buildFieldPayload(config: FieldBuilderConfig) {
   if (!config.id.trim()) {
@@ -1230,6 +1362,28 @@ function buildFieldPayload(config: FieldBuilderConfig) {
     if (Object.keys(rules).length > 0) {
       field.rules = rules;
     }
+  }
+  if (config.visibilityEnabled) {
+    const dependsOn = config.visibilityDependsOn.trim();
+    if (!dependsOn) {
+      return { error: "Visibility depends-on field is required." };
+    }
+    if (dependsOn === config.id.trim()) {
+      return { error: "Visibility depends-on field cannot be the same as the field id." };
+    }
+    const values = config.visibilityValues
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+    if (values.length === 0) {
+      return { error: "Visibility requires at least one match value." };
+    }
+    const mode = config.visibilityMode === "all" ? "all" : "any";
+    field.visibility = {
+      dependsOn,
+      values,
+      mode
+    };
   }
   return { field };
 }
@@ -1318,8 +1472,8 @@ function updateFieldInSchemaText(
   ) {
     return { error: "Field id already exists in schema." };
   }
-  const currentField = parsed.fields[targetIndex] || {};
-  const nextField = { ...currentField, ...payload.field };
+    const currentField = parsed.fields[targetIndex] || {};
+    const nextField = { ...currentField, ...payload.field };
   if (
     payload.field?.type !== "email" &&
     payload.field?.type !== "github_username" &&
@@ -1328,9 +1482,12 @@ function updateFieldInSchemaText(
   ) {
     delete (nextField as any).rules;
   }
-  if (payload.field?.type === "textarea" && !(payload.field as any).rules) {
-    delete (nextField as any).rules;
-  }
+    if (payload.field?.type === "textarea" && !(payload.field as any).rules) {
+      delete (nextField as any).rules;
+    }
+    if (payload.field && !("visibility" in payload.field) && "visibility" in nextField) {
+      delete (nextField as any).visibility;
+    }
   if (!payload.field?.description && "description" in nextField) {
     delete (nextField as any).description;
   }
@@ -1414,6 +1571,11 @@ function FieldBuilderPanel({
   builderDateTimezone,
   builderDateMode,
   builderDateShowTimezone,
+  builderVisibilityEnabled,
+  builderVisibilityDependsOn,
+  builderVisibilityValues,
+  builderVisibilityMode,
+  visibilityControllers,
   markdownEnabled,
   mathjaxEnabled,
   onTypeChange,
@@ -1433,6 +1595,10 @@ function FieldBuilderPanel({
   onDateTimezoneChange,
   onDateModeChange,
   onDateShowTimezoneChange,
+  onVisibilityEnabledChange,
+  onVisibilityDependsOnChange,
+  onVisibilityValuesChange,
+  onVisibilityModeChange,
   onAddField,
   fields,
   onRemoveField,
@@ -1459,6 +1625,11 @@ function FieldBuilderPanel({
   builderDateTimezone: string;
   builderDateMode: string;
   builderDateShowTimezone: boolean;
+  builderVisibilityEnabled: boolean;
+  builderVisibilityDependsOn: string;
+  builderVisibilityValues: string;
+  builderVisibilityMode: VisibilityMatchMode;
+  visibilityControllers: Array<{ id: string; label: string; options: string[] }>;
   markdownEnabled: boolean;
   mathjaxEnabled: boolean;
   onTypeChange: (value: string) => void;
@@ -1478,6 +1649,10 @@ function FieldBuilderPanel({
   onDateTimezoneChange: (value: string) => void;
   onDateModeChange: (value: string) => void;
   onDateShowTimezoneChange: (value: boolean) => void;
+  onVisibilityEnabledChange: (value: boolean) => void;
+  onVisibilityDependsOnChange: (value: string) => void;
+  onVisibilityValuesChange: (value: string) => void;
+  onVisibilityModeChange: (value: VisibilityMatchMode) => void;
   onAddField: () => void;
   fields: Array<Record<string, unknown>>;
   onRemoveField: (id: string) => void;
@@ -1488,6 +1663,14 @@ function FieldBuilderPanel({
   const [dragOverId, setDragOverId] = useState<string | null>(null);
   const requiredId = `${idPrefix}-required`;
   const multipleId = `${idPrefix}-multiple`;
+  const visibilityId = `${idPrefix}-visibility`;
+  const availableVisibilityControllers = visibilityControllers.filter(
+    (controller) => controller.id !== builderId
+  );
+  const visibilityOptions = (
+    availableVisibilityControllers.find((controller) => controller.id === builderVisibilityDependsOn)
+      ?.options ?? []
+  ).join(", ");
   return (
     <div className="panel panel--compact">
       <div className="panel-header">
@@ -1735,6 +1918,70 @@ function FieldBuilderPanel({
             </div>
           </div>
         ) : null}
+        <div className="col-12">
+          <label className="form-label">Conditional visibility</label>
+          <div className="form-check mt-2">
+            <input
+              className="form-check-input"
+              type="checkbox"
+              checked={builderVisibilityEnabled}
+              onChange={(event) => onVisibilityEnabledChange(event.target.checked)}
+              id={visibilityId}
+              disabled={availableVisibilityControllers.length === 0}
+            />
+            <label className="form-check-label" htmlFor={visibilityId}>
+              Show only when another field matches
+            </label>
+          </div>
+          {availableVisibilityControllers.length === 0 ? (
+            <div className="muted mt-1">Add a dropdown/checkbox field first to enable conditions.</div>
+          ) : builderVisibilityEnabled ? (
+            <div className="row g-3 mt-1">
+              <div className="col-md-4">
+                <label className="form-label">Depends on</label>
+                <select
+                  className="form-select"
+                  value={builderVisibilityDependsOn}
+                  onChange={(event) => onVisibilityDependsOnChange(event.target.value)}
+                >
+                  <option value="">Select field</option>
+                  {availableVisibilityControllers.map((controller) => (
+                    <option key={controller.id} value={controller.id}>
+                      {controller.label || controller.id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="col-md-3">
+                <label className="form-label">Match mode</label>
+                <select
+                  className="form-select"
+                  value={builderVisibilityMode}
+                  onChange={(event) =>
+                    onVisibilityModeChange(event.target.value === "all" ? "all" : "any")
+                  }
+                >
+                  <option value="any">Any selected</option>
+                  <option value="all">All selected</option>
+                </select>
+              </div>
+              <div className="col-md-5">
+                <label className="form-label">Values (comma separated)</label>
+                <input
+                  className="form-control"
+                  value={builderVisibilityValues}
+                  onChange={(event) => onVisibilityValuesChange(event.target.value)}
+                  placeholder="Option A, Option B"
+                />
+                {visibilityOptions ? (
+                  <div className="muted mt-1">Available: {visibilityOptions}</div>
+                ) : (
+                  <div className="muted mt-1">Select a controller field to see options.</div>
+                )}
+              </div>
+            </div>
+          ) : null}
+        </div>
       </div>
       <div className="d-flex gap-2 mt-3">
         <button type="button" className="btn btn-outline-primary" onClick={onAddField}>
@@ -3529,6 +3776,10 @@ function FormPage({
     () => parseFileRules(form?.file_rules_json ?? null),
     [form?.file_rules_json]
   );
+  const visibilityMap = useMemo(
+    () => buildVisibilityMap(form?.fields || [], values),
+    [form?.fields, values]
+  );
   const requiresAccessPassword = Boolean(form?.password_require_access);
   const requiresSubmitPassword =
     Boolean(form?.password_require_submit) ||
@@ -3554,6 +3805,9 @@ function FormPage({
       return { complete: false, reason: "" };
     }
     for (const field of form.fields) {
+      if (visibilityMap[field.id] === false) {
+        continue;
+      }
       if (field.type === "file") {
         const files = selectedFiles[field.id] || [];
         const existing = existingFilesByField[field.id] || [];
@@ -3582,7 +3836,7 @@ function FormPage({
       return { complete: false, reason: "Enter the form password." };
     }
     return { complete: true, reason: "" };
-  }, [form, values, selectedFiles, existingFilesByField, hasPassword, user]);
+  }, [form, values, selectedFiles, existingFilesByField, hasPassword, user, visibilityMap]);
   const isFormComplete = completionCheck.complete;
   const submitDisabledReason = !canSubmit
     ? "Please sign in to submit."
@@ -3678,6 +3932,9 @@ function FormPage({
     );
   };
   const fieldNodes = (form?.fields || []).map((field) => {
+    if (visibilityMap[field.id] === false) {
+      return null;
+    }
     if (field.type === "file") {
       const rules = getFieldRule(fileRules, field.id);
       const files = selectedFiles[field.id] || [];
@@ -4143,26 +4400,32 @@ function FormPage({
       </label>
     );
   });
+  const visibleFieldNodes = fieldNodes.filter(Boolean) as React.ReactNode[];
   if (canvasNodes.length > 0) {
     if (canvasFieldsPosition === "top") {
-      fieldNodes.unshift(...(canvasNodes as any[]));
+      visibleFieldNodes.unshift(...(canvasNodes as any[]));
     } else if (canvasFieldsPosition === "after_identity") {
       let insertAfter = -1;
-      form?.fields?.forEach((field, index) => {
+      let visibleIndex = -1;
+      form?.fields?.forEach((field) => {
+        if (visibilityMap[field.id] === false) {
+          return;
+        }
+        visibleIndex += 1;
         if (field.type === "email" || field.type === "full_name") {
-          insertAfter = index;
+          insertAfter = visibleIndex;
         }
       });
-      if (insertAfter < 0 && fieldNodes.length > 0) {
+      if (insertAfter < 0 && visibleFieldNodes.length > 0) {
         insertAfter = 0;
       }
       if (insertAfter < 0) {
-        fieldNodes.unshift(...(canvasNodes as any[]));
+        visibleFieldNodes.unshift(...(canvasNodes as any[]));
       } else {
-        fieldNodes.splice(insertAfter + 1, 0, ...(canvasNodes as any[]));
+        visibleFieldNodes.splice(insertAfter + 1, 0, ...(canvasNodes as any[]));
       }
     } else {
-      fieldNodes.push(...(canvasNodes as any[]));
+      visibleFieldNodes.push(...(canvasNodes as any[]));
     }
   }
 
@@ -4530,6 +4793,9 @@ function FormPage({
     const normalizedValues: Record<string, string> = {};
     const githubChecks: Array<Promise<void>> = [];
     form.fields.forEach((field) => {
+      if (visibilityMap[field.id] === false) {
+        return;
+      }
       const raw = values[field.id] || "";
       const autofillValue = getAutofillValue(field);
       const value = (raw.trim() || autofillValue).trim();
@@ -4604,6 +4870,9 @@ function FormPage({
     });
     const fileFields = form.fields.filter((field) => field.type === "file");
     fileFields.forEach((field) => {
+      if (visibilityMap[field.id] === false) {
+        return;
+      }
       const files = selectedFiles[field.id] || [];
       const uploaded = files.filter((file) => uploadedFiles[buildFileIdentity(field.id, file)]);
       if (field.required && uploaded.length === 0) {
@@ -4627,6 +4896,25 @@ function FormPage({
     if (requiresSubmitPassword && !formPassword.trim()) {
       errors.formPassword = "Required";
     }
+
+    Object.entries(values).forEach(([fieldId, rawValue]) => {
+      if (fieldId.endsWith("__tz")) {
+        return;
+      }
+      const field = form.fields.find((item) => item.id === fieldId);
+      if (!field) {
+        return;
+      }
+      if (visibilityMap[field.id] === false) {
+        return;
+      }
+      if (field.type === "date") {
+        return;
+      }
+      if (!(fieldId in normalizedValues)) {
+        normalizedValues[fieldId] = String(rawValue || "").trim();
+      }
+    });
 
     if (githubChecks.length > 0) {
       await Promise.all(githubChecks);
@@ -5011,7 +5299,7 @@ function FormPage({
       ) : null}
 
       <form className="form-grid" onSubmit={handleSubmit}>
-        {fieldNodes.length === 0 ? <p className="muted">No fields configured yet.</p> : fieldNodes}
+        {visibleFieldNodes.length === 0 ? <p className="muted">No fields configured yet.</p> : visibleFieldNodes}
         {uploading ? <p className="muted">Uploading files...</p> : null}
         <div className="form-actions form-actions--sticky">
           {!locked ? (
@@ -11296,6 +11584,10 @@ function BuilderPage({
   const [builderDateMode, setBuilderDateMode] = useState("datetime");
   const [builderDateShowTimezone, setBuilderDateShowTimezone] = useState(true);
   const [builderAutofillFromLogin, setBuilderAutofillFromLogin] = useState(false);
+  const [builderVisibilityEnabled, setBuilderVisibilityEnabled] = useState(false);
+  const [builderVisibilityDependsOn, setBuilderVisibilityDependsOn] = useState("");
+  const [builderVisibilityValues, setBuilderVisibilityValues] = useState("");
+  const [builderVisibilityMode, setBuilderVisibilityMode] = useState<VisibilityMatchMode>("any");
   const [templateFromFormSlug, setTemplateFromFormSlug] = useState("");
   const [templateFromFormStatus, setTemplateFromFormStatus] = useState<string | null>(null);
   const [templateFieldEditId, setTemplateFieldEditId] = useState("");
@@ -11349,6 +11641,11 @@ function BuilderPage({
   const [formDateMode, setFormDateMode] = useState("datetime");
   const [formDateShowTimezone, setFormDateShowTimezone] = useState(true);
   const [formAutofillFromLogin, setFormAutofillFromLogin] = useState(false);
+  const [formFieldVisibilityEnabled, setFormFieldVisibilityEnabled] = useState(false);
+  const [formFieldVisibilityDependsOn, setFormFieldVisibilityDependsOn] = useState("");
+  const [formFieldVisibilityValues, setFormFieldVisibilityValues] = useState("");
+  const [formFieldVisibilityMode, setFormFieldVisibilityMode] =
+    useState<VisibilityMatchMode>("any");
   const [formFieldEditId, setFormFieldEditId] = useState("");
   const [formFileFieldId, setFormFileFieldId] = useState("");
   const [formFileFieldLabel, setFormFileFieldLabel] = useState("");
@@ -11671,6 +11968,11 @@ function BuilderPage({
       setTemplateEditorStatus(rulesError);
       return;
     }
+    const visibilityError = validateVisibilityRulesInSchema(parsed.schema);
+    if (visibilityError) {
+      setTemplateEditorStatus(visibilityError);
+      return;
+    }
     const response = await apiFetch(`${API_BASE}/api/admin/templates`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -11707,6 +12009,11 @@ function BuilderPage({
     const rulesError = validateFileRulesInSchema(parsed.schema);
     if (rulesError) {
       setTemplateEditorStatus(rulesError);
+      return;
+    }
+    const visibilityError = validateVisibilityRulesInSchema(parsed.schema);
+    if (visibilityError) {
+      setTemplateEditorStatus(visibilityError);
       return;
     }
     const response = await apiFetch(
@@ -11762,6 +12069,11 @@ function BuilderPage({
       setTemplateEditorStatus(rulesError);
       return;
     }
+    const visibilityError = validateVisibilityRulesInSchema(parsed.schema);
+    if (visibilityError) {
+      setTemplateEditorStatus(visibilityError);
+      return;
+    }
     const response = await apiFetch(`${API_BASE}/api/admin/templates`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -11798,7 +12110,11 @@ function BuilderPage({
       autofillFromLogin: builderAutofillFromLogin,
       dateTimezone: builderDateTimezone,
       dateMode: builderDateMode,
-      dateShowTimezone: builderDateShowTimezone
+      dateShowTimezone: builderDateShowTimezone,
+      visibilityEnabled: builderVisibilityEnabled,
+      visibilityDependsOn: builderVisibilityDependsOn,
+      visibilityValues: builderVisibilityValues,
+      visibilityMode: builderVisibilityMode
     });
     if (nextSchema.error) {
       setTemplateEditorStatus(nextSchema.error);
@@ -11823,6 +12139,10 @@ function BuilderPage({
     setBuilderDateTimezone(getAppDefaultTimezone());
     setBuilderDateMode("datetime");
     setBuilderDateShowTimezone(true);
+    setBuilderVisibilityEnabled(false);
+    setBuilderVisibilityDependsOn("");
+    setBuilderVisibilityValues("");
+    setBuilderVisibilityMode("any");
   }
 
   function handleRemoveField(fieldId: string) {
@@ -11903,6 +12223,13 @@ function BuilderPage({
       type === "date" && typeof rules.mode === "string" ? String(rules.mode) : "datetime"
     );
     setBuilderDateShowTimezone(!(type === "date" && rules.timezoneOptional === true));
+    const visibility = (field as any).visibility || {};
+    setBuilderVisibilityEnabled(Boolean(visibility?.dependsOn));
+    setBuilderVisibilityDependsOn(typeof visibility?.dependsOn === "string" ? visibility.dependsOn : "");
+    setBuilderVisibilityValues(
+      Array.isArray(visibility?.values) ? visibility.values.join(",") : ""
+    );
+    setBuilderVisibilityMode(visibility?.mode === "all" ? "all" : "any");
   }
 
   function handleUpdateTemplateField() {
@@ -11923,7 +12250,11 @@ function BuilderPage({
       autofillFromLogin: builderAutofillFromLogin,
       dateTimezone: builderDateTimezone,
       dateMode: builderDateMode,
-      dateShowTimezone: builderDateShowTimezone
+      dateShowTimezone: builderDateShowTimezone,
+      visibilityEnabled: builderVisibilityEnabled,
+      visibilityDependsOn: builderVisibilityDependsOn,
+      visibilityValues: builderVisibilityValues,
+      visibilityMode: builderVisibilityMode
     });
     if (nextSchema.error) {
       setTemplateEditorStatus(nextSchema.error);
@@ -11933,6 +12264,9 @@ function BuilderPage({
       setTemplateEditorSchema(nextSchema.text);
     }
     setTemplateEditorStatus("Field updated.");
+    if (templateFieldEditId === builderId) {
+      setTemplateFieldEditId(builderId);
+    }
   }
 
   function handleAddFileField() {
@@ -12145,6 +12479,11 @@ function BuilderPage({
     const rulesError = validateFileRulesInSchema(parsed.schema);
     if (rulesError) {
       setFormBuilderStatus(rulesError);
+      return;
+    }
+    const visibilityError = validateVisibilityRulesInSchema(parsed.schema);
+    if (visibilityError) {
+      setFormBuilderStatus(visibilityError);
       return;
     }
     const response = await apiFetch(`${API_BASE}/api/admin/forms/${encodeURIComponent(formBuilderSlug)}`, {
@@ -12440,7 +12779,11 @@ function BuilderPage({
       autofillFromLogin: formAutofillFromLogin,
       dateTimezone: formDateTimezone,
       dateMode: formDateMode,
-      dateShowTimezone: formDateShowTimezone
+      dateShowTimezone: formDateShowTimezone,
+      visibilityEnabled: formFieldVisibilityEnabled,
+      visibilityDependsOn: formFieldVisibilityDependsOn,
+      visibilityValues: formFieldVisibilityValues,
+      visibilityMode: formFieldVisibilityMode
     });
     if (nextSchema.error) {
       setFormBuilderStatus(nextSchema.error);
@@ -12465,6 +12808,10 @@ function BuilderPage({
     setFormDateTimezone(getAppDefaultTimezone());
     setFormDateMode("datetime");
     setFormDateShowTimezone(true);
+    setFormFieldVisibilityEnabled(false);
+    setFormFieldVisibilityDependsOn("");
+    setFormFieldVisibilityValues("");
+    setFormFieldVisibilityMode("any");
   }
 
   function handleRemoveFormField(fieldId: string) {
@@ -12545,6 +12892,13 @@ function BuilderPage({
       type === "date" && typeof rules.mode === "string" ? String(rules.mode) : "datetime"
     );
     setFormDateShowTimezone(!(type === "date" && rules.timezoneOptional === true));
+    const visibility = (field as any).visibility || {};
+    setFormFieldVisibilityEnabled(Boolean(visibility?.dependsOn));
+    setFormFieldVisibilityDependsOn(typeof visibility?.dependsOn === "string" ? visibility.dependsOn : "");
+    setFormFieldVisibilityValues(
+      Array.isArray(visibility?.values) ? visibility.values.join(",") : ""
+    );
+    setFormFieldVisibilityMode(visibility?.mode === "all" ? "all" : "any");
   }
 
   function handleUpdateFormField() {
@@ -12565,7 +12919,11 @@ function BuilderPage({
       autofillFromLogin: formAutofillFromLogin,
       dateTimezone: formDateTimezone,
       dateMode: formDateMode,
-      dateShowTimezone: formDateShowTimezone
+      dateShowTimezone: formDateShowTimezone,
+      visibilityEnabled: formFieldVisibilityEnabled,
+      visibilityDependsOn: formFieldVisibilityDependsOn,
+      visibilityValues: formFieldVisibilityValues,
+      visibilityMode: formFieldVisibilityMode
     });
     if (nextSchema.error) {
       setFormBuilderStatus(nextSchema.error);
@@ -12660,6 +13018,11 @@ function BuilderPage({
       const rulesError = validateFileRulesInSchema(parsed.schema);
       if (rulesError) {
         setFormCreateStatus(rulesError);
+        return;
+      }
+      const visibilityError = validateVisibilityRulesInSchema(parsed.schema);
+      if (visibilityError) {
+        setFormCreateStatus(visibilityError);
         return;
       }
     }
@@ -12949,6 +13312,7 @@ function BuilderPage({
   const templateTextFields = schemaFields.filter((field) => field.type !== "file");
   const templateFileFields = schemaFields.filter((field) => field.type === "file");
   const templateRulesError = validateFileRulesInSchema(parsedTemplateSchema.schema);
+  const templateVisibilityError = validateVisibilityRulesInSchema(parsedTemplateSchema.schema);
   const parsedFormSchema = parseSchemaText(formBuilderSchema);
   const formSchemaFields = Array.isArray(parsedFormSchema.fields)
     ? (parsedFormSchema.fields as Array<Record<string, unknown>>)
@@ -12956,6 +13320,21 @@ function BuilderPage({
   const formTextFields = formSchemaFields.filter((field) => field.type !== "file");
   const formFileFields = formSchemaFields.filter((field) => field.type === "file");
   const formRulesError = validateFileRulesInSchema(parsedFormSchema.schema);
+  const formVisibilityError = validateVisibilityRulesInSchema(parsedFormSchema.schema);
+  const templateVisibilityControllers = schemaFields
+    .filter((field) => VISIBILITY_CONTROLLER_TYPES.has(String(field.type)))
+    .map((field) => {
+      const options = Array.isArray((field as any).options) ? (field as any).options : [];
+      return { id: String(field.id || ""), label: String(field.label || field.id || ""), options };
+    })
+    .filter((controller) => controller.id);
+  const formVisibilityControllers = formSchemaFields
+    .filter((field) => VISIBILITY_CONTROLLER_TYPES.has(String(field.type)))
+    .map((field) => {
+      const options = Array.isArray((field as any).options) ? (field as any).options : [];
+      return { id: String(field.id || ""), label: String(field.label || field.id || ""), options };
+    })
+    .filter((controller) => controller.id);
 
   return (
     <section className="panel admin-scope">
@@ -13779,6 +14158,9 @@ function BuilderPage({
                     {formRulesError ? (
                       <div className="alert alert-warning mt-2 py-2">{formRulesError}</div>
                     ) : null}
+                    {formVisibilityError ? (
+                      <div className="alert alert-warning mt-2 py-2">{formVisibilityError}</div>
+                    ) : null}
                   </div>
                   <div className="col-12">
                     <FieldBuilderPanel
@@ -13801,6 +14183,11 @@ function BuilderPage({
                       builderDateTimezone={formDateTimezone}
                       builderDateMode={formDateMode}
                       builderDateShowTimezone={formDateShowTimezone}
+                      builderVisibilityEnabled={formFieldVisibilityEnabled}
+                      builderVisibilityDependsOn={formFieldVisibilityDependsOn}
+                      builderVisibilityValues={formFieldVisibilityValues}
+                      builderVisibilityMode={formFieldVisibilityMode}
+                      visibilityControllers={formVisibilityControllers}
                       markdownEnabled={markdownEnabled}
                       mathjaxEnabled={mathjaxEnabled}
                       onTypeChange={setFormFieldType}
@@ -13820,6 +14207,10 @@ function BuilderPage({
                       onDateTimezoneChange={setFormDateTimezone}
                       onDateModeChange={setFormDateMode}
                       onDateShowTimezoneChange={setFormDateShowTimezone}
+                      onVisibilityEnabledChange={setFormFieldVisibilityEnabled}
+                      onVisibilityDependsOnChange={setFormFieldVisibilityDependsOn}
+                      onVisibilityValuesChange={setFormFieldVisibilityValues}
+                      onVisibilityModeChange={setFormFieldVisibilityMode}
                       onAddField={handleAddFormField}
                       fields={formTextFields}
                       onRemoveField={handleRemoveFormField}
@@ -14235,6 +14626,9 @@ function BuilderPage({
                 {templateRulesError ? (
                   <div className="alert alert-warning mt-2 py-2">{templateRulesError}</div>
                 ) : null}
+                {templateVisibilityError ? (
+                  <div className="alert alert-warning mt-2 py-2">{templateVisibilityError}</div>
+                ) : null}
               </div>
               <div className="col-12">
                 <FieldBuilderPanel
@@ -14257,6 +14651,11 @@ function BuilderPage({
                   builderDateTimezone={builderDateTimezone}
                   builderDateMode={builderDateMode}
                   builderDateShowTimezone={builderDateShowTimezone}
+                  builderVisibilityEnabled={builderVisibilityEnabled}
+                  builderVisibilityDependsOn={builderVisibilityDependsOn}
+                  builderVisibilityValues={builderVisibilityValues}
+                  builderVisibilityMode={builderVisibilityMode}
+                  visibilityControllers={templateVisibilityControllers}
                   markdownEnabled={markdownEnabled}
                   mathjaxEnabled={mathjaxEnabled}
                   onTypeChange={setBuilderType}
@@ -14276,6 +14675,10 @@ function BuilderPage({
                   onDateTimezoneChange={setBuilderDateTimezone}
                   onDateModeChange={setBuilderDateMode}
                   onDateShowTimezoneChange={setBuilderDateShowTimezone}
+                  onVisibilityEnabledChange={setBuilderVisibilityEnabled}
+                  onVisibilityDependsOnChange={setBuilderVisibilityDependsOn}
+                  onVisibilityValuesChange={setBuilderVisibilityValues}
+                  onVisibilityModeChange={setBuilderVisibilityMode}
                   onAddField={handleAddField}
                   fields={templateTextFields}
                   onRemoveField={handleRemoveField}

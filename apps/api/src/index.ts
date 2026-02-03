@@ -525,6 +525,11 @@ function extractFields(schema: unknown): Array<{
   options?: string[];
   multiple?: boolean;
   description?: string;
+  visibility?: {
+    dependsOn: string;
+    values: string[];
+    mode?: "any" | "all";
+  };
 }> {
   if (!schema || typeof schema !== "object") return [];
   const fields = (schema as { fields?: unknown }).fields;
@@ -547,8 +552,25 @@ function extractFields(schema: unknown): Array<{
         ? record.options.filter((option) => typeof option === "string")
         : undefined;
       const multiple = typeof record.multiple === "boolean" ? record.multiple : undefined;
+      const visibilityRaw = record.visibility;
+      let visibility: { dependsOn: string; values: string[]; mode?: "any" | "all" } | undefined = undefined;
+      if (visibilityRaw && typeof visibilityRaw === "object" && !Array.isArray(visibilityRaw)) {
+        const rawDependsOn = (visibilityRaw as any).dependsOn;
+        const dependsOn = typeof rawDependsOn === "string" ? rawDependsOn.trim() : "";
+        const rawValues = (visibilityRaw as any).values;
+        const values = Array.isArray(rawValues)
+          ? rawValues.map((value) => String(value).trim()).filter((value) => value.length > 0)
+          : [];
+        if (dependsOn && values.length > 0) {
+          visibility = {
+            dependsOn,
+            values,
+            mode: (visibilityRaw as any).mode === "all" ? "all" : "any"
+          };
+        }
+      }
       if (!id) return null;
-      return { id, label, type, required, rules, placeholder, options, multiple, description };
+      return { id, label, type, required, rules, placeholder, options, multiple, description, visibility };
     })
     .filter((field) => field !== null);
   return filtered as Array<{
@@ -780,6 +802,49 @@ function validateFileRulesFromSchema(schema: unknown): { fieldId: string; messag
     const maxFiles = ruleRecord.maxFiles ?? ruleRecord.maxCount;
     if (maxFiles !== undefined && (typeof maxFiles !== "number" || maxFiles <= 0)) {
       return { fieldId, message: "invalid_max_files" };
+    }
+  }
+  return null;
+}
+
+function validateVisibilityRulesFromSchema(schema: unknown): { fieldId: string; message: string } | null {
+  if (!schema || typeof schema !== "object") return null;
+  const list = (schema as { fields?: unknown }).fields;
+  if (!Array.isArray(list)) return null;
+  const fieldIds = new Set<string>();
+  const controllers = new Set<string>();
+  list.forEach((field) => {
+    if (!field || typeof field !== "object") return;
+    const record = field as Record<string, unknown>;
+    const id = typeof record.id === "string" ? record.id : "";
+    if (!id) return;
+    fieldIds.add(id);
+    const type = typeof record.type === "string" ? record.type : "";
+    if (type === "select" || type === "checkbox" || type === "radio") {
+      controllers.add(id);
+    }
+  });
+  for (const field of list) {
+    if (!field || typeof field !== "object") continue;
+    const record = field as Record<string, unknown>;
+    const fieldId = typeof record.id === "string" ? record.id : "";
+    const visibility = record.visibility;
+    if (!visibility || typeof visibility !== "object" || Array.isArray(visibility)) continue;
+    const dependsOn = typeof (visibility as any).dependsOn === "string" ? (visibility as any).dependsOn.trim() : "";
+    const values = Array.isArray((visibility as any).values)
+      ? (visibility as any).values.map((value: unknown) => String(value).trim()).filter(Boolean)
+      : [];
+    if (!dependsOn || values.length === 0) {
+      return { fieldId, message: "Visibility rule must include dependsOn and values." };
+    }
+    if (dependsOn === fieldId) {
+      return { fieldId, message: "Visibility cannot depend on itself." };
+    }
+    if (!fieldIds.has(dependsOn)) {
+      return { fieldId, message: `Visibility depends on missing field ${dependsOn}.` };
+    }
+    if (!controllers.has(dependsOn)) {
+      return { fieldId, message: `Visibility depends on non-choice field ${dependsOn}.` };
     }
   }
   return null;
@@ -8637,6 +8702,30 @@ export default {
             detail: ruleError
           });
         }
+        const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
+        if (visibilityError) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "schema_json",
+            message: "invalid_visibility_rules",
+            detail: visibilityError
+          });
+        }
+        const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
+        if (visibilityError) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "schema_json",
+            message: "invalid_visibility_rules",
+            detail: visibilityError
+          });
+        }
+        const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
+        if (visibilityError) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "schema_json",
+            message: "invalid_visibility_rules",
+            detail: visibilityError
+          });
+        }
 
         const fileRulesJson = buildFileRulesJsonFromSchema(body.schema_json);
         const authPayload = await getAuthPayload(request, env);
@@ -8753,6 +8842,14 @@ export default {
                 field: "schema_json",
                 message: "invalid_file_rules",
                 detail: ruleError
+              });
+            }
+            const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
+            if (visibilityError) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "schema_json",
+                message: "invalid_visibility_rules",
+                detail: visibilityError
               });
             }
             updates.push("schema_json=?");
@@ -9042,6 +9139,14 @@ export default {
             detail: ruleError
           });
         }
+        const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
+        if (visibilityError) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "schema_json",
+            message: "invalid_visibility_rules",
+            detail: visibilityError
+          });
+        }
         const fileRulesJson = buildFileRulesJsonFromSchema(JSON.stringify(parsedSchema));
         const existing = await env.DB.prepare(
           "SELECT id, deleted_at FROM templates WHERE key=?"
@@ -9261,6 +9366,14 @@ export default {
               detail: ruleError
             });
           }
+          const visibilityError = validateVisibilityRulesFromSchema(parsedFormSchema);
+          if (visibilityError) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "schema_json",
+              message: "invalid_visibility_rules",
+              detail: visibilityError
+            });
+          }
         }
         if (body.template?.key) {
           const tpl = body.template;
@@ -9280,6 +9393,14 @@ export default {
               field: "schema_json",
               message: "invalid_file_rules",
               detail: ruleError
+            });
+          }
+          const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
+          if (visibilityError) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "schema_json",
+              message: "invalid_visibility_rules",
+              detail: visibilityError
             });
           }
           const fileRulesJson = buildFileRulesJsonFromSchema(JSON.stringify(parsedSchema));
@@ -9783,6 +9904,14 @@ export default {
               detail: templateRuleError
             });
           }
+          const templateVisibilityError = validateVisibilityRulesFromSchema(parsedTemplateSchema);
+          if (templateVisibilityError) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "templateKey",
+              message: "invalid_visibility_rules",
+              detail: templateVisibilityError
+            });
+          }
           schemaJsonSource = template.schema_json;
         } else {
           let parsedSchema: unknown = null;
@@ -9800,6 +9929,14 @@ export default {
               field: "schema_json",
               message: "invalid_file_rules",
               detail: schemaRuleError
+            });
+          }
+          const schemaVisibilityError = validateVisibilityRulesFromSchema(parsedSchema);
+          if (schemaVisibilityError) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "schema_json",
+              message: "invalid_visibility_rules",
+              detail: schemaVisibilityError
             });
           }
           schemaJsonSource = JSON.stringify(parsedSchema);
@@ -10549,6 +10686,14 @@ export default {
                     detail: templateRuleError
                   });
                 }
+                const templateVisibilityError = validateVisibilityRulesFromSchema(parsedTemplateSchema);
+                if (templateVisibilityError) {
+                  return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                    field: "templateKey",
+                    message: "invalid_visibility_rules",
+                    detail: templateVisibilityError
+                  });
+                }
                 pushOptionalUpdate("template_id", template.id, true);
                 if (refreshTemplate) {
                   const formRow = await env.DB.prepare("SELECT id FROM forms WHERE slug=? AND deleted_at IS NULL")
@@ -10591,6 +10736,14 @@ export default {
                 field: "schema_json",
                 message: "invalid_file_rules",
                 detail: ruleError
+              });
+            }
+            const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
+            if (visibilityError) {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "schema_json",
+                message: "invalid_visibility_rules",
+                detail: visibilityError
               });
             }
             const formRow = await env.DB.prepare("SELECT id FROM forms WHERE slug=? AND deleted_at IS NULL")
