@@ -1995,6 +1995,7 @@ async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
 
   const submissionIds = submissions.map((row) => row.id).filter(Boolean) as string[];
   const filesBySubmission = new Map<string, any[]>();
+  const commentsBySubmission = new Map<string, any[]>();
   if (submissionIds.length > 0) {
     const placeholders = submissionIds.map(() => "?").join(",");
     const { results: files } = await env.DB.prepare(
@@ -2007,6 +2008,36 @@ async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
       bucket.push(file);
       filesBySubmission.set(file.submission_id, bucket);
     });
+    if (await hasColumn(env, "submission_comments", "submission_id")) {
+      const parentSelect = (await hasColumn(env, "submission_comments", "parent_comment_id"))
+        ? "parent_comment_id"
+        : "NULL as parent_comment_id";
+      const quoteSelect = (await hasColumn(env, "submission_comments", "quote_comment_id"))
+        ? "quote_comment_id"
+        : "NULL as quote_comment_id";
+      const { results: comments } = await env.DB.prepare(
+        `SELECT submission_id,id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason,${parentSelect},${quoteSelect} FROM submission_comments WHERE submission_id IN (${placeholders}) ORDER BY created_at ASC`
+      )
+        .bind(...submissionIds)
+        .all<any>();
+      comments.forEach((comment) => {
+        const bucket = commentsBySubmission.get(comment.submission_id) || [];
+        bucket.push({
+          id: comment.id,
+          author_user_id: comment.author_user_id,
+          author_role: comment.author_role,
+          body: comment.body,
+          created_at: comment.created_at,
+          updated_at: comment.updated_at,
+          deleted_at: comment.deleted_at ?? null,
+          deleted_by: comment.deleted_by ?? null,
+          deleted_reason: comment.deleted_reason ?? null,
+          parent_comment_id: comment.parent_comment_id ?? null,
+          quote_comment_id: comment.quote_comment_id ?? null
+        });
+        commentsBySubmission.set(comment.submission_id, bucket);
+      });
+    }
   }
 
   const normalized = submissions.map((row) => {
@@ -2039,7 +2070,8 @@ async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
         user_name: row.canvas_user_name ?? null
       },
       data_json: dataJson,
-      files: filesBySubmission.get(row.id) || []
+      files: filesBySubmission.get(row.id) || [],
+      comments: commentsBySubmission.get(row.id) || []
     };
   });
 
@@ -2150,6 +2182,18 @@ async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
           );
         });
         lines.push("");
+      }
+      lines.push("### Comments");
+      if (!submission.comments || submission.comments.length === 0) {
+        lines.push("_No comments_", "");
+      } else {
+        submission.comments.forEach((comment: any) => {
+          lines.push(
+            `- ${comment.author_role} ${comment.author_user_id || ""} @ ${comment.created_at ?? "n/a"}`
+          );
+          lines.push(`  ${String(comment.body || "").replace(/\r?\n/g, "<br>")}`);
+          lines.push("");
+        });
       }
     });
     const body = lines.join("\n");
@@ -4758,6 +4802,115 @@ async function restoreSubmission(
     canvasError: canvasResult.ok ? null : canvasResult.error || null,
     canvasStatus: canvasResult.status || null
   };
+}
+
+async function importSubmissionComments(
+  env: Env,
+  submissionId: string,
+  comments: Array<Record<string, unknown>>,
+  actorId: string | null
+) {
+  if (!Array.isArray(comments) || comments.length === 0) return;
+  if (!(await hasColumn(env, "submission_comments", "submission_id"))) return;
+  const hasParent = await hasColumn(env, "submission_comments", "parent_comment_id");
+  const hasQuote = await hasColumn(env, "submission_comments", "quote_comment_id");
+  for (const comment of comments) {
+    if (!comment || typeof comment !== "object") continue;
+    const id = typeof comment.id === "string" && comment.id.trim() ? comment.id.trim() : null;
+    const authorUserId =
+      typeof comment.author_user_id === "string" && comment.author_user_id.trim()
+        ? comment.author_user_id.trim()
+        : actorId;
+    const authorRole =
+      typeof comment.author_role === "string" && comment.author_role.trim()
+        ? comment.author_role.trim()
+        : "admin";
+    const body = typeof comment.body === "string" ? comment.body.trim() : "";
+    if (!id || !authorUserId || !body) continue;
+    const createdAt = typeof comment.created_at === "string" ? comment.created_at : null;
+    const updatedAt = typeof comment.updated_at === "string" ? comment.updated_at : null;
+    const deletedAt = typeof comment.deleted_at === "string" ? comment.deleted_at : null;
+    const deletedBy = typeof comment.deleted_by === "string" ? comment.deleted_by : null;
+    const deletedReason = typeof comment.deleted_reason === "string" ? comment.deleted_reason : null;
+    const parentId =
+      hasParent && typeof comment.parent_comment_id === "string" ? comment.parent_comment_id : null;
+    const quoteId =
+      hasQuote && typeof comment.quote_comment_id === "string" ? comment.quote_comment_id : null;
+
+    if (hasParent && hasQuote) {
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO submission_comments (id, submission_id, author_user_id, author_role, body, created_at, updated_at, deleted_at, deleted_by, deleted_reason, parent_comment_id, quote_comment_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(
+          id,
+          submissionId,
+          authorUserId,
+          authorRole,
+          body,
+          createdAt ?? new Date().toISOString(),
+          updatedAt ?? createdAt ?? new Date().toISOString(),
+          deletedAt,
+          deletedBy,
+          deletedReason,
+          parentId,
+          quoteId
+        )
+        .run();
+    } else if (hasParent) {
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO submission_comments (id, submission_id, author_user_id, author_role, body, created_at, updated_at, deleted_at, deleted_by, deleted_reason, parent_comment_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(
+          id,
+          submissionId,
+          authorUserId,
+          authorRole,
+          body,
+          createdAt ?? new Date().toISOString(),
+          updatedAt ?? createdAt ?? new Date().toISOString(),
+          deletedAt,
+          deletedBy,
+          deletedReason,
+          parentId
+        )
+        .run();
+    } else if (hasQuote) {
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO submission_comments (id, submission_id, author_user_id, author_role, body, created_at, updated_at, deleted_at, deleted_by, deleted_reason, quote_comment_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(
+          id,
+          submissionId,
+          authorUserId,
+          authorRole,
+          body,
+          createdAt ?? new Date().toISOString(),
+          updatedAt ?? createdAt ?? new Date().toISOString(),
+          deletedAt,
+          deletedBy,
+          deletedReason,
+          quoteId
+        )
+        .run();
+    } else {
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO submission_comments (id, submission_id, author_user_id, author_role, body, created_at, updated_at, deleted_at, deleted_by, deleted_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(
+          id,
+          submissionId,
+          authorUserId,
+          authorRole,
+          body,
+          createdAt ?? new Date().toISOString(),
+          updatedAt ?? createdAt ?? new Date().toISOString(),
+          deletedAt,
+          deletedBy,
+          deletedReason
+        )
+        .run();
+    }
+  }
 }
 
 async function restoreFileItem(env: Env, fileId: string) {
@@ -9789,6 +9942,37 @@ export default {
           if (await hasColumn(env, "forms", "submission_backup_enabled")) {
             await ensureSubmissionBackupTask(env, form.slug, form.title, submissionBackupEnabled);
           }
+          if (body?.submissions && Array.isArray(body.submissions)) {
+            for (const submission of body.submissions) {
+              if (!submission || typeof submission !== "object") continue;
+              const submissionId =
+                typeof submission.id === "string" && submission.id.trim()
+                  ? submission.id.trim()
+                  : crypto.randomUUID();
+              const payloadJson =
+                submission.data_json && typeof submission.data_json === "object"
+                  ? JSON.stringify({ data: submission.data_json })
+                  : typeof submission.data_json === "string"
+                    ? submission.data_json
+                    : JSON.stringify({ data: submission.data_json ?? {} });
+              await env.DB.prepare(
+                "INSERT OR IGNORE INTO submissions (id, form_id, user_id, payload_json, created_at, updated_at, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+              )
+                .bind(
+                  submissionId,
+                  existingForm.id,
+                  submission.user_id ?? null,
+                  payloadJson,
+                  submission.created_at ?? new Date().toISOString(),
+                  submission.updated_at ?? submission.created_at ?? new Date().toISOString(),
+                  submission.submitter?.provider ?? null,
+                  submission.submitter?.email ?? null,
+                  submission.submitter?.github_username ?? null
+                )
+                .run();
+              await importSubmissionComments(env, submissionId, submission.comments || [], null);
+            }
+          }
           return jsonResponse(
             200,
             { ok: true, updated: true, restored: existingForm.deleted_at !== null, requestId },
@@ -9839,6 +10023,37 @@ export default {
         }
         if (await hasColumn(env, "forms", "submission_backup_enabled")) {
           await ensureSubmissionBackupTask(env, form.slug, form.title, submissionBackupEnabled);
+        }
+        if (body?.submissions && Array.isArray(body.submissions)) {
+          for (const submission of body.submissions) {
+            if (!submission || typeof submission !== "object") continue;
+            const submissionId =
+              typeof submission.id === "string" && submission.id.trim()
+                ? submission.id.trim()
+                : crypto.randomUUID();
+            const payloadJson =
+              submission.data_json && typeof submission.data_json === "object"
+                ? JSON.stringify({ data: submission.data_json })
+                : typeof submission.data_json === "string"
+                  ? submission.data_json
+                  : JSON.stringify({ data: submission.data_json ?? {} });
+            await env.DB.prepare(
+              "INSERT OR IGNORE INTO submissions (id, form_id, user_id, payload_json, created_at, updated_at, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            )
+              .bind(
+                submissionId,
+                formId,
+                submission.user_id ?? null,
+                payloadJson,
+                submission.created_at ?? new Date().toISOString(),
+                submission.updated_at ?? submission.created_at ?? new Date().toISOString(),
+                submission.submitter?.provider ?? null,
+                submission.submitter?.email ?? null,
+                submission.submitter?.github_username ?? null
+              )
+              .run();
+            await importSubmissionComments(env, submissionId, submission.comments || [], null);
+          }
         }
 
         return jsonResponse(201, { ok: true, created: true, requestId }, requestId, corsHeaders);
@@ -11423,6 +11638,7 @@ export default {
         const format = (url.searchParams.get("format") || "csv").toLowerCase();
         const mode = (url.searchParams.get("mode") || "flat").toLowerCase();
         const includeMeta = url.searchParams.get("includeMeta") !== "0";
+        const includeComments = url.searchParams.get("includeComments") === "1";
         const maxRows = Math.min(Math.max(toNumber(url.searchParams.get("maxRows"), 5000), 1), 50000);
         const fieldsParam = url.searchParams.get("fields");
         const requestedFields = fieldsParam
@@ -11457,6 +11673,40 @@ export default {
           .bind(formSlug, maxRows)
           .all<any>();
 
+        const submissionIds = results.map((row: any) => row.id).filter(Boolean) as string[];
+        const commentsBySubmission = new Map<string, any[]>();
+        if (includeComments && submissionIds.length > 0 && (await hasColumn(env, "submission_comments", "submission_id"))) {
+          const placeholders = submissionIds.map(() => "?").join(",");
+          const parentSelect = (await hasColumn(env, "submission_comments", "parent_comment_id"))
+            ? "parent_comment_id"
+            : "NULL as parent_comment_id";
+          const quoteSelect = (await hasColumn(env, "submission_comments", "quote_comment_id"))
+            ? "quote_comment_id"
+            : "NULL as quote_comment_id";
+          const { results: commentRows } = await env.DB.prepare(
+            `SELECT submission_id,id,author_user_id,author_role,body,created_at,updated_at,deleted_at,deleted_by,deleted_reason,${parentSelect},${quoteSelect} FROM submission_comments WHERE submission_id IN (${placeholders}) ORDER BY created_at ASC`
+          )
+            .bind(...submissionIds)
+            .all<any>();
+          commentRows.forEach((comment) => {
+            const bucket = commentsBySubmission.get(comment.submission_id) || [];
+            bucket.push({
+              id: comment.id,
+              author_user_id: comment.author_user_id,
+              author_role: comment.author_role,
+              body: comment.body,
+              created_at: comment.created_at,
+              updated_at: comment.updated_at,
+              deleted_at: comment.deleted_at ?? null,
+              deleted_by: comment.deleted_by ?? null,
+              deleted_reason: comment.deleted_reason ?? null,
+              parent_comment_id: comment.parent_comment_id ?? null,
+              quote_comment_id: comment.quote_comment_id ?? null
+            });
+            commentsBySubmission.set(comment.submission_id, bucket);
+          });
+        }
+
         const rows = results.map((row: any) => {
           let dataObj: Record<string, unknown> = {};
           try {
@@ -11482,7 +11732,8 @@ export default {
             provider: row.provider ?? null,
             email: row.submitter_email ?? null,
             github_username: row.submitter_github_username ?? null,
-            data: dataObj
+            data: dataObj,
+            comments: includeComments ? commentsBySubmission.get(row.id) || [] : undefined
           };
         });
 
@@ -11511,7 +11762,7 @@ export default {
         if (format === "csv") {
           const headers =
             mode === "json"
-              ? [...metaHeaders, "data_json"]
+              ? [...metaHeaders, "data_json", ...(includeComments ? ["comments_json"] : [])]
               : [...metaHeaders, ...dataKeys];
           const lines = [headers.join(",")];
           rows.forEach((row) => {
@@ -11528,8 +11779,11 @@ export default {
               : [];
             const dataValues =
               mode === "json"
-                ? [JSON.stringify(row.data ?? {})]
-                : dataKeys.map((key) => stringifyCsvValue(row.data?.[key]));
+                ? [
+                    JSON.stringify(row.data ?? {}),
+                    ...(includeComments ? [JSON.stringify(row.comments ?? [])] : [])
+                  ]
+              : dataKeys.map((key) => stringifyCsvValue(row.data?.[key]));
             const values = [...metaValues, ...dataValues].map((value) => escapeDelimited(String(value ?? ""), ","));
             lines.push(values.join(","));
           });

@@ -4426,7 +4426,7 @@ function FormPage({
                       setValues((prev) => ({ ...prev, [field.id]: Array.from(next).join(", ") }));
                     }}
                   />
-                  <span>{option}</span>
+                  <span className="ms-2">{option}</span>
                 </label>
               );
             })}
