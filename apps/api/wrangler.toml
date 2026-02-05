@@ -25,4 +25,4 @@ CANVAS_BASE_URL = "https://canvas.instructure.com"
 CANVAS_ACCOUNT_ID = ""
 
 [triggers]
-crons = ["0 2 * * *"]
+crons = ["*/5 * * * *"]

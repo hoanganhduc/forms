@@ -1797,7 +1797,7 @@ async function runPeriodicReminders(env: Env) {
         // For MVP, we'll just check loosely or assume the cron runs once.
         // But if we want to be safe:
         const sentToday = await env.DB.prepare(
-          "SELECT id FROM email_logs WHERE to_address=? AND form_id=? AND trigger_source='periodic_reminder' AND created_at > datetime('now', '-20 hours')"
+          "SELECT id FROM email_logs WHERE to_email=? AND form_id=? AND trigger_source='periodic_reminder' AND created_at > datetime('now', '-20 hours')"
         ).bind(user.email, form.id).first();
 
         if (!sentToday) {
