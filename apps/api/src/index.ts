@@ -1700,45 +1700,245 @@ async function processCanvasRetryQueue(env: Env, limit = 10) {
   return { processed, failed, deadlettered };
 }
 
-async function runPeriodicReminders(env: Env) {
+type PeriodicReminderStats = {
+  formsTotal: number;
+  formsEligible: number;
+  formsSkippedNotOpen: number;
+  formsSkippedClosed: number;
+  formsSkippedExpired: number;
+  formsNoRecipients: number;
+  submissionsTotal: number;
+  submissionsMissingEmail: number;
+  usersTotal: number;
+  usersDue: number;
+  usersNotDue: number;
+  emailsSent: number;
+  emailsAlreadySent: number;
+  emailsFailed: number;
+};
+
+type PeriodicReminderFormStatus =
+  | "eligible"
+  | "skipped_not_open"
+  | "skipped_closed"
+  | "skipped_expired"
+  | "no_recipients";
+
+type PeriodicReminderFormStats = {
+  formId: string;
+  slug: string;
+  title: string;
+  frequency: string;
+  status: PeriodicReminderFormStatus;
+  submissionsTotal: number;
+  submissionsMissingEmail: number;
+  usersTotal: number;
+  usersDue: number;
+  usersNotDue: number;
+  emailsSent: number;
+  emailsAlreadySent: number;
+  emailsFailed: number;
+  errorSummary?: string;
+};
+
+type PeriodicReminderResult = {
+  stats: PeriodicReminderStats;
+  message: string;
+};
+
+function normalizePeriodicReminderError(value: string | null | undefined): string {
+  if (!value) return "send_failed";
+  return value.replace(/\s+/g, " ").trim().slice(0, 120);
+}
+
+function formatPeriodicReminderErrorSummary(errorCounts: Map<string, number>): string {
+  const entries = Array.from(errorCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3);
+  if (entries.length === 0) return "";
+  return entries.map(([key, count]) => `${key} x${count}`).join(", ");
+}
+
+function formatPeriodicReminderStatus(status: PeriodicReminderFormStatus): string {
+  switch (status) {
+    case "skipped_not_open":
+      return "not_open";
+    case "skipped_closed":
+      return "closed";
+    case "skipped_expired":
+      return "expired";
+    case "no_recipients":
+      return "no_recipients";
+    default:
+      return "ok";
+  }
+}
+
+function formatPeriodicReminderFormDetail(entry: PeriodicReminderFormStats): string {
+  const statusLabel = formatPeriodicReminderStatus(entry.status);
+  const freqLabel = entry.frequency || "weekly";
+  const parts = [
+    `${entry.slug}[${statusLabel} f:${freqLabel}]`,
+    `users ${entry.usersTotal} (due ${entry.usersDue})`,
+    `emails sent ${entry.emailsSent}, skipped ${entry.emailsAlreadySent}, failed ${entry.emailsFailed}`,
+    `no_email ${entry.submissionsMissingEmail}`
+  ];
+  if (entry.errorSummary) {
+    parts.push(`errors ${entry.errorSummary}`);
+  }
+  return parts.join(", ");
+}
+
+function truncatePeriodicReminderMessage(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function selectPeriodicReminderDetails(entries: PeriodicReminderFormStats[]): string {
+  const candidates = entries.filter((entry) =>
+    entry.emailsFailed > 0 ||
+    entry.emailsSent > 0 ||
+    entry.usersDue > 0 ||
+    entry.status !== "eligible"
+  );
+  if (candidates.length === 0) return "";
+  const sorted = [...candidates].sort((a, b) => {
+    if (a.emailsFailed !== b.emailsFailed) return b.emailsFailed - a.emailsFailed;
+    if (a.status !== b.status) return a.status === "eligible" ? 1 : -1;
+    if (a.usersDue !== b.usersDue) return b.usersDue - a.usersDue;
+    if (a.emailsSent !== b.emailsSent) return b.emailsSent - a.emailsSent;
+    return a.slug.localeCompare(b.slug);
+  });
+  const top = sorted.slice(0, 5);
+  const remainder = sorted.length - top.length;
+  const detail = top.map(formatPeriodicReminderFormDetail).join(" | ");
+  if (remainder > 0) {
+    return `${detail} | +${remainder} more`;
+  }
+  return detail;
+}
+
+function buildPeriodicReminderSummary(
+  stats: PeriodicReminderStats,
+  errorCounts: Map<string, number>,
+  formStats: PeriodicReminderFormStats[]
+): string {
+  const parts = [
+    `forms ${stats.formsEligible}/${stats.formsTotal}`,
+    `skipped not_open ${stats.formsSkippedNotOpen}, closed ${stats.formsSkippedClosed}, expired ${stats.formsSkippedExpired}`,
+    `no_recipients ${stats.formsNoRecipients}`,
+    `submissions ${stats.submissionsTotal} (no_email ${stats.submissionsMissingEmail})`,
+    `users ${stats.usersTotal} (due ${stats.usersDue}, not_due ${stats.usersNotDue})`,
+    `emails sent ${stats.emailsSent}, skipped ${stats.emailsAlreadySent}, failed ${stats.emailsFailed}`
+  ];
+  const errorSummary = formatPeriodicReminderErrorSummary(errorCounts);
+  if (errorSummary) {
+    parts.push(`errors ${errorSummary}`);
+  }
+  const details = selectPeriodicReminderDetails(formStats);
+  if (details) {
+    parts.push(`details ${details}`);
+  }
+  return truncatePeriodicReminderMessage(parts.join("; "), 900);
+}
+
+async function runPeriodicReminders(env: Env): Promise<PeriodicReminderResult> {
   const { results: forms } = await env.DB.prepare(
     "SELECT id, slug, title, reminder_frequency, reminder_until, available_from, available_until FROM forms WHERE reminder_enabled=1 AND deleted_at IS NULL"
   ).all<{ id: string; slug: string; title: string; reminder_frequency: string; reminder_until: string | null; available_from: string | null; available_until: string | null }>();
 
-  if (!forms || forms.length === 0) return;
+  const stats: PeriodicReminderStats = {
+    formsTotal: forms?.length ?? 0,
+    formsEligible: 0,
+    formsSkippedNotOpen: 0,
+    formsSkippedClosed: 0,
+    formsSkippedExpired: 0,
+    formsNoRecipients: 0,
+    submissionsTotal: 0,
+    submissionsMissingEmail: 0,
+    usersTotal: 0,
+    usersDue: 0,
+    usersNotDue: 0,
+    emailsSent: 0,
+    emailsAlreadySent: 0,
+    emailsFailed: 0
+  };
+  const errorCounts = new Map<string, number>();
+  const formStats: PeriodicReminderFormStats[] = [];
+
+  if (!forms || forms.length === 0) {
+    return {
+      stats,
+      message: buildPeriodicReminderSummary(stats, errorCounts, formStats)
+    };
+  }
 
   const now = new Date();
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
   for (const form of forms) {
+    const frequency = form.reminder_frequency || "weekly";
+    const perForm: PeriodicReminderFormStats = {
+      formId: form.id,
+      slug: form.slug,
+      title: form.title,
+      frequency,
+      status: "eligible",
+      submissionsTotal: 0,
+      submissionsMissingEmail: 0,
+      usersTotal: 0,
+      usersDue: 0,
+      usersNotDue: 0,
+      emailsSent: 0,
+      emailsAlreadySent: 0,
+      emailsFailed: 0
+    };
+    const formErrorCounts = new Map<string, number>();
+
     // Skip if form is not yet open (available_from is in the future)
     if (form.available_from) {
       const openDate = new Date(form.available_from);
-      if (now < openDate) continue;
+      if (now < openDate) {
+        stats.formsSkippedNotOpen += 1;
+        perForm.status = "skipped_not_open";
+        formStats.push(perForm);
+        continue;
+      }
     }
 
     // Skip if form is already closed (available_until is in the past)
     if (form.available_until) {
       const closeDate = new Date(form.available_until);
-      if (now > closeDate) continue;
+      if (now > closeDate) {
+        stats.formsSkippedClosed += 1;
+        perForm.status = "skipped_closed";
+        formStats.push(perForm);
+        continue;
+      }
     }
 
     // Skip if reminder_until has passed
     if (form.reminder_until) {
       const untilDate = new Date(form.reminder_until);
       untilDate.setHours(23, 59, 59, 999);
-      if (today > untilDate) continue;
+      if (today > untilDate) {
+        stats.formsSkippedExpired += 1;
+        perForm.status = "skipped_expired";
+        formStats.push(perForm);
+        continue;
+      }
     }
-    // Only support weekly/monthly for now to avoid spam
-    // Actually, user wants daily/weekly/monthly. Let's support what we have.
-    // 'daily', 'weekly', 'monthly'.
-    const frequency = form.reminder_frequency || "weekly";
+
+    stats.formsEligible += 1;
 
     // Get all submissions for this form
     const { results: submissions } = await env.DB.prepare(
       "SELECT user_id, submitter_email, created_at FROM submissions WHERE form_id=? AND deleted_at IS NULL ORDER BY created_at ASC"
     ).bind(form.id).all<{ user_id: string | null; submitter_email: string | null; created_at: string }>();
+
+    stats.submissionsTotal += submissions.length;
+    perForm.submissionsTotal = submissions.length;
 
     // Group by user (email or user_id)
     const userMap = new Map<string, { email: string; firstSubmission: Date }>();
@@ -1749,11 +1949,24 @@ async function runPeriodicReminders(env: Env) {
       // If user_id is present but no email in submission, we might need to look up identity?
       // For now rely on submitter_email which is populated for auth users or if they fill email field (if we map it)
       // Actually submitter_email is only populated if authenticated or logic sets it.
-      if (!email) continue;
+      if (!email) {
+        stats.submissionsMissingEmail += 1;
+        perForm.submissionsMissingEmail += 1;
+        continue;
+      }
 
       if (!userMap.has(email)) {
         userMap.set(email, { email, firstSubmission: new Date(sub.created_at) });
       }
+    }
+
+    stats.usersTotal += userMap.size;
+    perForm.usersTotal = userMap.size;
+    if (userMap.size === 0) {
+      stats.formsNoRecipients += 1;
+      perForm.status = "no_recipients";
+      formStats.push(perForm);
+      continue;
     }
 
     for (const user of userMap.values()) {
@@ -1790,48 +2003,103 @@ async function runPeriodicReminders(env: Env) {
         }
       }
 
-      if (shouldSend) {
-        // Check if we already sent an email today to this user for this form
-        // We can check email_logs
-        // This is expensive per user. Optimally we'd do a batch check or have a reminders table.
-        // For MVP, we'll just check loosely or assume the cron runs once.
-        // But if we want to be safe:
-        const sentToday = await env.DB.prepare(
-          "SELECT id FROM email_logs WHERE to_email=? AND form_id=? AND trigger_source='periodic_reminder' AND created_at > datetime('now', '-20 hours')"
-        ).bind(user.email, form.id).first();
+      if (!shouldSend) {
+        stats.usersNotDue += 1;
+        perForm.usersNotDue += 1;
+        continue;
+      }
 
-        if (!sentToday) {
-          const subject = {
-            vi: `Nhắc nhở: ${form.title}`,
-            en: `Reminder: ${form.title}`
-          };
-          const body = {
-            vi: `Xin chào,\n\nĐây là email nhắc nhở bạn điền biểu mẫu "${form.title}".\n\nVui lòng truy cập liên kết dưới đây để điền biểu mẫu:\n${env.BASE_URL_WEB || ""}/#/f/${form.slug}\n\n---\n\nĐây là email tự động. Vui lòng không trả lời email này.`,
-            en: `Hello,\n\nThis is a reminder to fill out the form "${form.title}".\n\nPlease visit the link below to fill out the form:\n${env.BASE_URL_WEB || ""}/#/f/${form.slug}\n\n---\n\nThis is an automated message. Please do not reply to this email.`
-          };
-          // Simple bilingual content
-          const mailBody = `${body.vi}\n\n---\n\n${body.en}`;
+      stats.usersDue += 1;
+      perForm.usersDue += 1;
+      // Check if we already sent an email today to this user for this form
+      // We can check email_logs
+      // This is expensive per user. Optimally we'd do a batch check or have a reminders table.
+      // For MVP, we'll just check loosely or assume the cron runs once.
+      // But if we want to be safe:
+      const sentToday = await env.DB.prepare(
+        "SELECT id FROM email_logs WHERE to_email=? AND form_id=? AND trigger_source='periodic_reminder' AND created_at > datetime('now', '-20 hours')"
+      ).bind(user.email, form.id).first();
 
-          await sendGmailMessage(env, {
-            to: user.email,
-            subject: `${subject.vi} / ${subject.en}`,
-            body: mailBody
-          });
+      if (sentToday) {
+        stats.emailsAlreadySent += 1;
+        perForm.emailsAlreadySent += 1;
+        continue;
+      }
 
-          await logEmailSend(env, {
-            to: user.email,
-            subject: `${subject.vi} / ${subject.en}`,
-            body: mailBody,
-            status: "sent",
-            formId: form.id,
-            formSlug: form.slug,
-            formTitle: form.title,
-            triggerSource: "periodic_reminder"
-          });
+      const subject = {
+        vi: `Nhắc nhở: ${form.title}`,
+        en: `Reminder: ${form.title}`
+      };
+      const body = {
+        vi: `Xin chào,\n\nĐây là email nhắc nhở bạn điền biểu mẫu "${form.title}".\n\nVui lòng truy cập liên kết dưới đây để điền biểu mẫu:\n${env.BASE_URL_WEB || ""}/#/f/${form.slug}\n\n---\n\nĐây là email tự động. Vui lòng không trả lời email này.`,
+        en: `Hello,\n\nThis is a reminder to fill out the form "${form.title}".\n\nPlease visit the link below to fill out the form:\n${env.BASE_URL_WEB || ""}/#/f/${form.slug}\n\n---\n\nThis is an automated message. Please do not reply to this email.`
+      };
+      // Simple bilingual content
+      const mailBody = `${body.vi}\n\n---\n\n${body.en}`;
+      const subjectLine = `${subject.vi} / ${subject.en}`;
+
+      try {
+        const result = await sendGmailMessage(env, {
+          to: user.email,
+          subject: subjectLine,
+          body: mailBody
+        });
+
+        if (result.ok) {
+          stats.emailsSent += 1;
+          perForm.emailsSent += 1;
+        } else {
+          stats.emailsFailed += 1;
+          perForm.emailsFailed += 1;
+          const normalized = normalizePeriodicReminderError(result.error);
+          errorCounts.set(normalized, (errorCounts.get(normalized) || 0) + 1);
+          formErrorCounts.set(normalized, (formErrorCounts.get(normalized) || 0) + 1);
         }
+
+        await logEmailSend(env, {
+          to: user.email,
+          subject: subjectLine,
+          body: mailBody,
+          status: result.ok ? "sent" : "failed",
+          error: result.ok ? null : normalizePeriodicReminderError(result.error),
+          formId: form.id,
+          formSlug: form.slug,
+          formTitle: form.title,
+          triggerSource: "periodic_reminder"
+        });
+      } catch (error) {
+        stats.emailsFailed += 1;
+        perForm.emailsFailed += 1;
+        const normalized = normalizePeriodicReminderError(
+          String((error as Error | undefined)?.message || error)
+        );
+        errorCounts.set(normalized, (errorCounts.get(normalized) || 0) + 1);
+        formErrorCounts.set(normalized, (formErrorCounts.get(normalized) || 0) + 1);
+        await logEmailSend(env, {
+          to: user.email,
+          subject: subjectLine,
+          body: mailBody,
+          status: "failed",
+          error: normalized,
+          formId: form.id,
+          formSlug: form.slug,
+          formTitle: form.title,
+          triggerSource: "periodic_reminder"
+        });
       }
     }
+
+    const formErrorSummary = formatPeriodicReminderErrorSummary(formErrorCounts);
+    if (formErrorSummary) {
+      perForm.errorSummary = formErrorSummary;
+    }
+    formStats.push(perForm);
   }
+
+  return {
+    stats,
+    message: buildPeriodicReminderSummary(stats, errorCounts, formStats)
+  };
 }
 
 const SUBMISSION_BACKUP_TASK_PREFIX = "backup_submissions:";
@@ -2277,8 +2545,8 @@ async function backupFormSubmissionsToDrive(env: Env, formSlug: string) {
 
 async function runRoutineTaskById(env: Env, taskId: string) {
   if (taskId === "periodic_reminders") {
-    await runPeriodicReminders(env);
-    const message = "processed";
+    const result = await runPeriodicReminders(env);
+    const message = result.message;
     await updateRoutineStatus(env, taskId, "ok", message);
     await recordRoutineRun(env, taskId, "ok", message);
     await recordHealthStatus(env, "periodic_reminders", "ok", message);
