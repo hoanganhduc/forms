@@ -10750,8 +10750,15 @@ function AdminEmailsPage({
       );
     }
     loadUsers();
+    const handleFocus = () => {
+      loadUsers();
+    };
+    const refreshId = window.setInterval(loadUsers, 60000);
+    window.addEventListener("focus", handleFocus);
     return () => {
       active = false;
+      window.removeEventListener("focus", handleFocus);
+      window.clearInterval(refreshId);
     };
   }, []);
 
