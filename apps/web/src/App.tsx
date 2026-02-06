@@ -606,6 +606,7 @@ type FormSummary = {
   discussion_markdown_enabled?: boolean;
   discussion_html_enabled?: boolean;
   discussion_mathjax_enabled?: boolean;
+  comment_notify_enabled?: boolean;
 };
 
 type VisibilityMatchMode = "any" | "all";
@@ -651,6 +652,7 @@ type FormDetail = {
   discussion_markdown_enabled?: boolean;
   discussion_html_enabled?: boolean;
   discussion_mathjax_enabled?: boolean;
+  comment_notify_enabled?: boolean;
   canvas_enabled?: boolean;
   canvas_course_id?: string | null;
   canvas_course_name?: string | null;
@@ -12178,6 +12180,8 @@ function BuilderPage({
   const [formBuilderDiscussionHtmlEnabled, setFormBuilderDiscussionHtmlEnabled] = useState(false);
   const [formBuilderDiscussionMathjaxEnabled, setFormBuilderDiscussionMathjaxEnabled] =
     useState(false);
+  const [formBuilderCommentNotifyEnabled, setFormBuilderCommentNotifyEnabled] =
+    useState(true);
   const [formFieldType, setFormFieldType] = useState("text");
   const [formFieldCustomType, setFormFieldCustomType] = useState("");
   const [formFieldId, setFormFieldId] = useState("");
@@ -12242,6 +12246,8 @@ function BuilderPage({
   const [formCreateDiscussionHtmlEnabled, setFormCreateDiscussionHtmlEnabled] = useState(false);
   const [formCreateDiscussionMathjaxEnabled, setFormCreateDiscussionMathjaxEnabled] =
     useState(false);
+  const [formCreateCommentNotifyEnabled, setFormCreateCommentNotifyEnabled] =
+    useState(true);
   const [canvasCourses, setCanvasCourses] = useState<any[]>([]);
   const [canvasCourseQuery, setCanvasCourseQuery] = useState("");
   const [canvasCoursesLoading, setCanvasCoursesLoading] = useState(false);
@@ -12928,6 +12934,7 @@ function BuilderPage({
       setFormBuilderDiscussionMarkdownEnabled(true);
       setFormBuilderDiscussionHtmlEnabled(false);
       setFormBuilderDiscussionMathjaxEnabled(false);
+      setFormBuilderCommentNotifyEnabled(true);
       setFormBuilderTemplateKey("");
       setFormBuilderSlugEdit("");
       return;
@@ -13006,6 +13013,9 @@ function BuilderPage({
       );
       setFormBuilderDiscussionHtmlEnabled(Boolean(selected.discussion_html_enabled));
       setFormBuilderDiscussionMathjaxEnabled(Boolean(selected.discussion_mathjax_enabled));
+      setFormBuilderCommentNotifyEnabled(
+        selected.comment_notify_enabled == null ? true : Boolean(selected.comment_notify_enabled)
+      );
       if (selected.canvas_allowed_section_ids_json) {
         try {
           const parsed = JSON.parse(String(selected.canvas_allowed_section_ids_json));
@@ -13195,7 +13205,9 @@ function BuilderPage({
             ? true
             : Boolean(formData.discussion_markdown_enabled),
         discussionHtmlEnabled: Boolean(formData.discussion_html_enabled),
-        discussionMathjaxEnabled: Boolean(formData.discussion_mathjax_enabled)
+        discussionMathjaxEnabled: Boolean(formData.discussion_mathjax_enabled),
+        commentNotifyEnabled:
+          formData.comment_notify_enabled == null ? true : Boolean(formData.comment_notify_enabled)
       })
     });
     const createPayload = await createRes.json().catch(() => null);
@@ -13287,7 +13299,8 @@ function BuilderPage({
           discussionEnabled: formBuilderDiscussionEnabled,
           discussionMarkdownEnabled: formBuilderDiscussionMarkdownEnabled,
           discussionHtmlEnabled: formBuilderDiscussionHtmlEnabled,
-          discussionMathjaxEnabled: formBuilderDiscussionMathjaxEnabled
+          discussionMathjaxEnabled: formBuilderDiscussionMathjaxEnabled,
+          commentNotifyEnabled: formBuilderCommentNotifyEnabled
         })
       });
       payload = await response.json().catch(() => null);
@@ -13667,7 +13680,8 @@ function BuilderPage({
         discussionEnabled: formCreateDiscussionEnabled,
         discussionMarkdownEnabled: formCreateDiscussionMarkdownEnabled,
         discussionHtmlEnabled: formCreateDiscussionHtmlEnabled,
-        discussionMathjaxEnabled: formCreateDiscussionMathjaxEnabled
+        discussionMathjaxEnabled: formCreateDiscussionMathjaxEnabled,
+        commentNotifyEnabled: formCreateCommentNotifyEnabled
       })
     });
     const payload = await response.json().catch(() => null);
@@ -13708,6 +13722,7 @@ function BuilderPage({
     setFormCreateDiscussionMarkdownEnabled(true);
     setFormCreateDiscussionHtmlEnabled(false);
     setFormCreateDiscussionMathjaxEnabled(false);
+    setFormCreateCommentNotifyEnabled(true);
     await loadBuilder();
   }
 
@@ -14341,26 +14356,45 @@ function BuilderPage({
                   </div>
                 )}
                 <div className="col-md-4">
-                  <label className="form-label">Discussion</label>
-                  <div className="form-check mt-2">
-                    <input
-                      className="form-check-input"
-                      type="checkbox"
-                      checked={formCreateDiscussionEnabled}
-                      onChange={(event) => setFormCreateDiscussionEnabled(event.target.checked)}
-                      id="formCreateDiscussionEnabled"
-                    />
-                    <label className="form-check-label" htmlFor="formCreateDiscussionEnabled">
-                      Enable discussion
-                    </label>
-                  </div>
-                  <div className="d-flex flex-column gap-1 mt-2">
-                    <div className="form-check">
+                    <label className="form-label">Discussion</label>
+                    <div className="form-check mt-2">
                       <input
                         className="form-check-input"
                         type="checkbox"
-                        checked={formCreateDiscussionMarkdownEnabled}
-                        onChange={(event) => setFormCreateDiscussionMarkdownEnabled(event.target.checked)}
+                      checked={formCreateDiscussionEnabled}
+                      onChange={(event) => {
+                        const next = event.target.checked;
+                        setFormCreateDiscussionEnabled(next);
+                        if (!next) {
+                          setFormCreateCommentNotifyEnabled(false);
+                        }
+                      }}
+                        id="formCreateDiscussionEnabled"
+                      />
+                      <label className="form-check-label" htmlFor="formCreateDiscussionEnabled">
+                        Enable discussion
+                      </label>
+                    </div>
+                    <div className="d-flex flex-column gap-1 mt-2">
+                      <div className="form-check">
+                        <input
+                          className="form-check-input"
+                          type="checkbox"
+                          checked={formCreateCommentNotifyEnabled}
+                          onChange={(event) => setFormCreateCommentNotifyEnabled(event.target.checked)}
+                          id="formCreateCommentNotifyEnabled"
+                          disabled={!formCreateDiscussionEnabled}
+                        />
+                        <label className="form-check-label" htmlFor="formCreateCommentNotifyEnabled">
+                          Enable comment notifications
+                        </label>
+                      </div>
+                      <div className="form-check">
+                        <input
+                          className="form-check-input"
+                          type="checkbox"
+                          checked={formCreateDiscussionMarkdownEnabled}
+                          onChange={(event) => setFormCreateDiscussionMarkdownEnabled(event.target.checked)}
                         id="formCreateDiscussionMarkdownEnabled"
                         disabled={!formCreateDiscussionEnabled}
                       />
@@ -14696,8 +14730,14 @@ function BuilderPage({
                       <input
                         className="form-check-input"
                         type="checkbox"
-                        checked={formBuilderDiscussionEnabled}
-                        onChange={(event) => setFormBuilderDiscussionEnabled(event.target.checked)}
+                      checked={formBuilderDiscussionEnabled}
+                      onChange={(event) => {
+                        const next = event.target.checked;
+                        setFormBuilderDiscussionEnabled(next);
+                        if (!next) {
+                          setFormBuilderCommentNotifyEnabled(false);
+                        }
+                      }}
                         disabled={!formBuilderSlug}
                         id="formBuilderDiscussionEnabled"
                       />
@@ -14706,6 +14746,19 @@ function BuilderPage({
                       </label>
                     </div>
                     <div className="d-flex flex-column gap-1 mt-2">
+                      <div className="form-check">
+                        <input
+                          className="form-check-input"
+                          type="checkbox"
+                          checked={formBuilderCommentNotifyEnabled}
+                          onChange={(event) => setFormBuilderCommentNotifyEnabled(event.target.checked)}
+                          id="formBuilderCommentNotifyEnabled"
+                          disabled={!formBuilderSlug || !formBuilderDiscussionEnabled}
+                        />
+                        <label className="form-check-label" htmlFor="formBuilderCommentNotifyEnabled">
+                          Enable comment notifications
+                        </label>
+                      </div>
                       <div className="form-check">
                         <input
                           className="form-check-input"

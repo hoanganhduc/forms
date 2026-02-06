@@ -50,6 +50,7 @@ type FormListRow = {
   password_require_access?: number | null;
   password_require_submit?: number | null;
   save_all_versions?: number | null;
+  comment_notify_enabled?: number | null;
 };
 
 type FormDetailRow = {
@@ -85,6 +86,7 @@ type FormDetailRow = {
   discussion_markdown_enabled?: number | null;
   discussion_html_enabled?: number | null;
   discussion_mathjax_enabled?: number | null;
+  comment_notify_enabled?: number | null;
 };
 
 type FormSubmissionRow = {
@@ -120,6 +122,7 @@ type AdminFormRow = {
   discussion_markdown_enabled?: number | null;
   discussion_html_enabled?: number | null;
   discussion_mathjax_enabled?: number | null;
+  comment_notify_enabled?: number | null;
 };
 
 type TemplateRow = {
@@ -1198,7 +1201,8 @@ async function getFormWithRules(env: Env, slug: string) {
     "discussion_enabled",
     "discussion_markdown_enabled",
     "discussion_html_enabled",
-    "discussion_mathjax_enabled"
+    "discussion_mathjax_enabled",
+    "comment_notify_enabled"
   ];
   const columnSelects = baseColumns.map((column) => `f.${column}`);
   for (const column of optionalColumns) {
@@ -1315,7 +1319,8 @@ async function buildFormDetailPayload(env: Env, row: FormDetailRow) {
       discussion_enabled: toBoolean(row.discussion_enabled ?? 0),
       discussion_markdown_enabled: toBoolean(row.discussion_markdown_enabled ?? 1),
       discussion_html_enabled: toBoolean(row.discussion_html_enabled ?? 0),
-      discussion_mathjax_enabled: toBoolean(row.discussion_mathjax_enabled ?? 0)
+      discussion_mathjax_enabled: toBoolean(row.discussion_mathjax_enabled ?? 0),
+      comment_notify_enabled: toBoolean(row.comment_notify_enabled ?? 1)
     }
   };
 }
@@ -3826,6 +3831,62 @@ function buildCanvasInformMessage(input: {
     input.formLink ? `Link form: ${input.formLink}` : null,
     "",
     "Th\u00f4ng b\u00e1o n\u00e0y \u0111\u01b0\u1ee3c g\u1eedi t\u1ef1 \u0111\u1ed9ng."
+  ];
+  return {
+    subject,
+    body: joinLines([...englishLines, "", ...vietnameseLines])
+  };
+}
+
+function buildSubmissionCommentNotificationMessage(input: {
+  formTitle?: string | null;
+  formSlug?: string | null;
+  submissionId: string;
+  commentBody: string;
+  authorRole: "admin" | "user";
+  recipientRole: "admin" | "submitter";
+  submissionLink?: string | null;
+}): { subject: string; body: string } {
+  const formLabel =
+    input.formTitle?.trim() ||
+    input.formSlug?.trim() ||
+    "form";
+  const authorLabel = input.authorRole === "admin" ? "Admin" : "Submitter";
+  const authorLabelVi = input.authorRole === "admin" ? "Quản trị viên" : "Người nộp";
+  const subjectPrefix =
+    input.recipientRole === "admin" ? "New submitter comment" : "New admin comment";
+  const subject =
+    `${subjectPrefix}: ${formLabel}`;
+  const commentBody = input.commentBody.trim();
+  const englishLines = [
+    "Hello,",
+    "",
+    "A new comment was posted on a submission.",
+    `- Form: ${formLabel}`,
+    `- Submission ID: ${input.submissionId}`,
+    `- From: ${authorLabel}`,
+    "",
+    "Comment:",
+    commentBody,
+    "",
+    input.submissionLink ? `Submission link: ${input.submissionLink}` : null,
+    "",
+    "This message was sent automatically."
+  ];
+  const vietnameseLines = [
+    "Xin chào,",
+    "",
+    "Có bình luận mới trên bài nộp.",
+    `- Biểu mẫu: ${formLabel}`,
+    `- Mã bài nộp: ${input.submissionId}`,
+    `- Từ: ${authorLabelVi}`,
+    "",
+    "Nội dung:",
+    commentBody,
+    "",
+    input.submissionLink ? `Link bài nộp: ${input.submissionLink}` : null,
+    "",
+    "Thông báo này được gửi tự động."
   ];
   return {
     subject,
@@ -8874,6 +8935,26 @@ export default {
           vi: `Xin chào,\n\nĐây là email nhắc nhở bạn điền biểu mẫu "${sampleFormTitle}".\n\nVui lòng truy cập liên kết dưới đây để điền biểu mẫu:\n${env.BASE_URL_WEB || ""}/#/f/${sampleFormSlug}\n\n---\n\nĐây là email tự động. Vui lòng không trả lời email này.`,
           en: `Hello,\n\nThis is a reminder to fill out the form "${sampleFormTitle}".\n\nPlease visit the link below to fill out the form:\n${env.BASE_URL_WEB || ""}/#/f/${sampleFormSlug}\n\n---\n\nThis is an automated message. Please do not reply to this email.`
         };
+        const sampleSubmissionId = "sub_demo_1";
+        const sampleSubmissionLink = `${env.BASE_URL_WEB ?? ""}/#/me/submissions/${sampleSubmissionId}`;
+        const commentAdminMessage = buildSubmissionCommentNotificationMessage({
+          formTitle: sampleFormTitle,
+          formSlug: sampleFormSlug,
+          submissionId: sampleSubmissionId,
+          commentBody: "Thanks for the update. Please revise section 2.",
+          authorRole: "admin",
+          recipientRole: "submitter",
+          submissionLink: sampleSubmissionLink
+        });
+        const commentSubmitterMessage = buildSubmissionCommentNotificationMessage({
+          formTitle: sampleFormTitle,
+          formSlug: sampleFormSlug,
+          submissionId: sampleSubmissionId,
+          commentBody: "I've updated the submission as requested.",
+          authorRole: "user",
+          recipientRole: "admin",
+          submissionLink: sampleSubmissionLink
+        });
         const data = [
           {
             key: "welcome",
@@ -8904,6 +8985,18 @@ export default {
             label: "Periodic reminder",
             subject: `${reminderSubject.vi} / ${reminderSubject.en}`,
             body: `${reminderBody.vi}\n\n---\n\n${reminderBody.en}`
+          },
+          {
+            key: "comment_admin",
+            label: "Comment notification (admin → submitter)",
+            subject: commentAdminMessage.subject,
+            body: commentAdminMessage.body
+          },
+          {
+            key: "comment_submitter",
+            label: "Comment notification (submitter → admin)",
+            subject: commentSubmitterMessage.subject,
+            body: commentSubmitterMessage.body
           }
         ];
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -9086,8 +9179,11 @@ export default {
         const discussionMathjaxSelect = (await hasColumn(env, "forms", "discussion_mathjax_enabled"))
           ? "f.discussion_mathjax_enabled as discussion_mathjax_enabled"
           : "NULL as discussion_mathjax_enabled";
+        const commentNotifySelect = (await hasColumn(env, "forms", "comment_notify_enabled"))
+          ? "f.comment_notify_enabled as comment_notify_enabled"
+          : "NULL as comment_notify_enabled";
         const { results } = await env.DB.prepare(
-          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},${submissionBackupSelect},${submissionBackupFormatsSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},${submissionBackupSelect},${submissionBackupFormatsSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect},${commentNotifySelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
         ).all<AdminFormRow & { submission_count?: number; updated_at?: string | null; created_at?: string | null }>();
 
         const data = results.map((row) => ({
@@ -9120,7 +9216,8 @@ export default {
           discussion_enabled: toBoolean((row as any).discussion_enabled ?? 0),
           discussion_markdown_enabled: toBoolean((row as any).discussion_markdown_enabled ?? 1),
           discussion_html_enabled: toBoolean((row as any).discussion_html_enabled ?? 0),
-          discussion_mathjax_enabled: toBoolean((row as any).discussion_mathjax_enabled ?? 0)
+          discussion_mathjax_enabled: toBoolean((row as any).discussion_mathjax_enabled ?? 0),
+          comment_notify_enabled: toBoolean((row as any).comment_notify_enabled ?? 1)
         }));
 
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
@@ -9147,8 +9244,11 @@ export default {
         const discussionMathjaxSelect = (await hasColumn(env, "forms", "discussion_mathjax_enabled"))
           ? "f.discussion_mathjax_enabled as discussion_mathjax_enabled"
           : "NULL as discussion_mathjax_enabled";
+        const commentNotifySelect = (await hasColumn(env, "forms", "comment_notify_enabled"))
+          ? "f.comment_notify_enabled as comment_notify_enabled"
+          : "NULL as comment_notify_enabled";
         const formRow = await env.DB.prepare(
-          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,f.reminder_until,${submissionBackupSelect},${submissionBackupFormatsSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect},t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL`
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,f.reminder_until,${submissionBackupSelect},${submissionBackupFormatsSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect},${commentNotifySelect},t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL`
         )
           .bind(slug)
           .first<{
@@ -9180,6 +9280,7 @@ export default {
             discussion_markdown_enabled: number | null;
             discussion_html_enabled: number | null;
             discussion_mathjax_enabled: number | null;
+            comment_notify_enabled: number | null;
             template_key: string | null;
             template_name: string | null;
             template_schema_json: string | null;
@@ -9210,6 +9311,7 @@ export default {
             discussion_markdown_enabled: toBoolean(formRow.discussion_markdown_enabled ?? 1),
             discussion_html_enabled: toBoolean(formRow.discussion_html_enabled ?? 0),
             discussion_mathjax_enabled: toBoolean(formRow.discussion_mathjax_enabled ?? 0),
+            comment_notify_enabled: toBoolean(formRow.comment_notify_enabled ?? 1),
             title: formRow.title,
             description: formRow.description ?? null,
             is_locked: toBoolean(formRow.is_locked),
@@ -10442,6 +10544,7 @@ export default {
           discussionMarkdownEnabled?: boolean;
           discussionHtmlEnabled?: boolean;
           discussionMathjaxEnabled?: boolean;
+          commentNotifyEnabled?: boolean;
         } | null = null;
         try {
           body = await parseJsonBody(request);
@@ -10491,6 +10594,8 @@ export default {
             allowed: ["optional", "google", "github", "either", "required"]
           });
         }
+        const discussionEnabled = body.discussionEnabled === true;
+        const commentNotifyEnabled = discussionEnabled && body.commentNotifyEnabled !== false;
 
         if (body.is_public !== undefined && typeof body.is_public !== "boolean") {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
@@ -10779,10 +10884,11 @@ export default {
           { name: "reminder_until", value: body.reminderUntil || null },
           { name: "submission_backup_enabled", value: body.submissionBackupEnabled ? 1 : 0 },
           { name: "submission_backup_formats", value: serializeSubmissionBackupFormats(submissionBackupFormats) },
-          { name: "discussion_enabled", value: body.discussionEnabled ? 1 : 0 },
+          { name: "discussion_enabled", value: discussionEnabled ? 1 : 0 },
           { name: "discussion_markdown_enabled", value: body.discussionMarkdownEnabled !== false ? 1 : 0 },
           { name: "discussion_html_enabled", value: body.discussionHtmlEnabled ? 1 : 0 },
-          { name: "discussion_mathjax_enabled", value: body.discussionMathjaxEnabled ? 1 : 0 }
+          { name: "discussion_mathjax_enabled", value: body.discussionMathjaxEnabled ? 1 : 0 },
+          { name: "comment_notify_enabled", value: commentNotifyEnabled ? 1 : 0 }
         ];
         const formInsertColumns = formInsertBase.map((item) => item.name);
         const formInsertValues = formInsertBase.map((item) => item.value);
@@ -10955,6 +11061,7 @@ export default {
             "discussion_markdown_enabled",
             "discussion_html_enabled",
             "discussion_mathjax_enabled",
+            "comment_notify_enabled",
             "file_rules_json",
             "template_id"
           ];
@@ -11207,6 +11314,9 @@ export default {
               });
             }
             pushOptionalUpdate("discussion_enabled", body.discussionEnabled ? 1 : 0, true);
+            if (body.discussionEnabled === false) {
+              pushOptionalUpdate("comment_notify_enabled", 0, true);
+            }
           }
           if (body?.discussionMarkdownEnabled !== undefined) {
             if (typeof body.discussionMarkdownEnabled !== "boolean") {
@@ -11234,6 +11344,15 @@ export default {
               });
             }
             pushOptionalUpdate("discussion_mathjax_enabled", body.discussionMathjaxEnabled ? 1 : 0, true);
+          }
+          if (body?.commentNotifyEnabled !== undefined) {
+            if (typeof body.commentNotifyEnabled !== "boolean") {
+              return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+                field: "commentNotifyEnabled",
+                message: "expected_boolean"
+              });
+            }
+            pushOptionalUpdate("comment_notify_enabled", body.commentNotifyEnabled ? 1 : 0, true);
           }
 
           if (body?.canvasEnabled !== undefined) {
@@ -14035,11 +14154,26 @@ export default {
           message: "required"
         });
       }
+      const submitterEmailSelect = (await hasColumn(env, "submissions", "submitter_email"))
+        ? "COALESCE(s.submitter_email,(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id AND ui.email IS NOT NULL ORDER BY CASE provider WHEN 'google' THEN 0 ELSE 1 END, created_at ASC LIMIT 1)) as submitter_email"
+        : "(SELECT email FROM user_identities ui WHERE ui.user_id=s.user_id AND ui.email IS NOT NULL ORDER BY CASE provider WHEN 'google' THEN 0 ELSE 1 END, created_at ASC LIMIT 1) as submitter_email";
+      const commentNotifySelect = (await hasColumn(env, "forms", "comment_notify_enabled"))
+        ? "f.comment_notify_enabled as comment_notify_enabled"
+        : "NULL as comment_notify_enabled";
       const submission = await env.DB.prepare(
-        "SELECT s.id,s.user_id,f.discussion_enabled FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL AND f.deleted_at IS NULL"
+        `SELECT s.id,s.user_id,s.form_id,${submitterEmailSelect},f.slug as form_slug,f.title as form_title,f.discussion_enabled,${commentNotifySelect} FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL AND f.deleted_at IS NULL`
       )
         .bind(submissionId)
-        .first<{ id: string; user_id: string | null; discussion_enabled: number | null }>();
+        .first<{
+          id: string;
+          user_id: string | null;
+          form_id: string;
+          form_slug: string | null;
+          form_title: string | null;
+          submitter_email: string | null;
+          discussion_enabled: number | null;
+          comment_notify_enabled: number | null;
+        }>();
       if (!submission) {
         return errorResponse(404, "not_found", requestId, corsHeaders);
       }
@@ -14109,6 +14243,97 @@ export default {
         )
           .bind(commentId, submissionId, authPayload.userId, role, normalized)
           .run();
+      }
+      const commentNotifyEnabled =
+        submission.comment_notify_enabled == null ? true : toBoolean(submission.comment_notify_enabled);
+      const shouldNotify = toBoolean(submission.discussion_enabled ?? 0) && commentNotifyEnabled;
+      if (shouldNotify) {
+        const submissionLinkBase = env.BASE_URL_WEB?.trim() || "";
+        const submissionLink = submissionLinkBase
+          ? `${submissionLinkBase}/#/me/submissions/${submissionId}`
+          : null;
+        const authorEmail = authPayload.email?.trim().toLowerCase() || null;
+        const sendNotification = async (to: string, recipientRole: "admin" | "submitter") => {
+          const message = buildSubmissionCommentNotificationMessage({
+            formTitle: submission.form_title ?? null,
+            formSlug: submission.form_slug ?? null,
+            submissionId,
+            commentBody: normalized,
+            authorRole: role,
+            recipientRole,
+            submissionLink
+          });
+          try {
+            const result = await sendGmailMessage(env, {
+              to,
+              subject: message.subject,
+              body: message.body
+            });
+            await logEmailSend(env, {
+              to,
+              subject: message.subject,
+              body: message.body,
+              status: result.ok ? "sent" : "failed",
+              error: result.ok ? null : result.error || "send_failed",
+              submissionId,
+              formId: submission.form_id,
+              formSlug: submission.form_slug ?? null,
+              formTitle: submission.form_title ?? null,
+              triggeredBy: authPayload.userId,
+              triggerSource: "submission_comment"
+            });
+          } catch (error) {
+            await logEmailSend(env, {
+              to,
+              subject: message.subject,
+              body: message.body,
+              status: "failed",
+              error: String((error as Error | undefined)?.message || error),
+              submissionId,
+              formId: submission.form_id,
+              formSlug: submission.form_slug ?? null,
+              formTitle: submission.form_title ?? null,
+              triggeredBy: authPayload.userId,
+              triggerSource: "submission_comment"
+            });
+          }
+        };
+        if (role === "admin") {
+          const submitterEmail = submission.submitter_email?.trim() || null;
+          const shouldSkipAuthor =
+            (submission.user_id && submission.user_id === authPayload.userId) ||
+            (authorEmail && submitterEmail?.toLowerCase() === authorEmail);
+          if (submitterEmail && !shouldSkipAuthor) {
+            await sendNotification(submitterEmail, "submitter");
+          }
+        } else {
+          const { results: adminRows } = await env.DB.prepare(
+            "SELECT u.id as user_id,(SELECT email FROM user_identities ui WHERE ui.user_id=u.id AND ui.email IS NOT NULL ORDER BY CASE provider WHEN 'google' THEN 0 ELSE 1 END, created_at ASC LIMIT 1) as email FROM users u WHERE u.is_admin=1 AND u.deleted_at IS NULL"
+          ).all<{ user_id: string; email: string | null }>();
+          const seen = new Set<string>();
+          const adminRecipients: string[] = [];
+          for (const row of adminRows) {
+            const email = row.email?.trim();
+            if (!email) continue;
+            const normalizedEmail = email.toLowerCase();
+            if (authorEmail && normalizedEmail === authorEmail) continue;
+            if (row.user_id === authPayload.userId) continue;
+            if (seen.has(normalizedEmail)) continue;
+            seen.add(normalizedEmail);
+            adminRecipients.push(email);
+          }
+          const fallbackAdmin = env.ADMIN_EMAIL?.trim();
+          if (fallbackAdmin) {
+            const normalizedFallback = fallbackAdmin.toLowerCase();
+            if (!seen.has(normalizedFallback) && normalizedFallback !== authorEmail) {
+              seen.add(normalizedFallback);
+              adminRecipients.push(fallbackAdmin);
+            }
+          }
+          for (const email of adminRecipients) {
+            await sendNotification(email, "admin");
+          }
+        }
       }
       const data = await loadSubmissionCommentsPage(env, submissionId, authPayload, 1, 20);
       return jsonResponse(

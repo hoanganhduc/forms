@@ -1,0 +1,1 @@
+ALTER TABLE forms ADD COLUMN comment_notify_enabled INTEGER NOT NULL DEFAULT 1;
