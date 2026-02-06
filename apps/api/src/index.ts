@@ -552,9 +552,10 @@ function extractFields(schema: unknown): Array<{
   multiple?: boolean;
   description?: string;
   visibility?: {
-    dependsOn: string;
-    values: string[];
+    dependsOn?: string;
+    values?: string[];
     mode?: "any" | "all";
+    conditions?: Array<{ dependsOn: string; values: string[]; mode?: "any" | "all" }>;
   };
 }> {
   if (!schema || typeof schema !== "object") return [];
@@ -579,20 +580,26 @@ function extractFields(schema: unknown): Array<{
         : undefined;
       const multiple = typeof record.multiple === "boolean" ? record.multiple : undefined;
       const visibilityRaw = record.visibility;
-      let visibility: { dependsOn: string; values: string[]; mode?: "any" | "all" } | undefined = undefined;
+      let visibility:
+        | { dependsOn: string; values: string[]; mode?: "any" | "all" }
+        | { mode?: "any" | "all"; conditions: Array<{ dependsOn: string; values: string[]; mode?: "any" | "all" }> }
+        | undefined = undefined;
       if (visibilityRaw && typeof visibilityRaw === "object" && !Array.isArray(visibilityRaw)) {
-        const rawDependsOn = (visibilityRaw as any).dependsOn;
-        const dependsOn = typeof rawDependsOn === "string" ? rawDependsOn.trim() : "";
-        const rawValues = (visibilityRaw as any).values;
-        const values = Array.isArray(rawValues)
-          ? rawValues.map((value) => String(value).trim()).filter((value) => value.length > 0)
-          : [];
-        if (dependsOn && values.length > 0) {
-          visibility = {
-            dependsOn,
-            values,
-            mode: (visibilityRaw as any).mode === "all" ? "all" : "any"
-          };
+        const normalized = normalizeVisibilityRule(visibilityRaw);
+        if (normalized) {
+          if (normalized.operator === "all" && normalized.conditions.length === 1) {
+            const [condition] = normalized.conditions;
+            visibility = {
+              dependsOn: condition.dependsOn,
+              values: condition.values,
+              mode: condition.mode
+            };
+          } else {
+            visibility = {
+              mode: normalized.operator,
+              conditions: normalized.conditions
+            };
+          }
         }
       }
       if (!id) return null;
@@ -833,6 +840,35 @@ function validateFileRulesFromSchema(schema: unknown): { fieldId: string; messag
   return null;
 }
 
+function normalizeVisibilityRule(input: unknown): { operator: "any" | "all"; conditions: Array<{ dependsOn: string; values: string[]; mode: "any" | "all" }> } | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const record = input as Record<string, unknown>;
+  const operator = record.mode === "any" ? "any" : "all";
+  const rawConditions = Array.isArray(record.conditions) ? record.conditions : null;
+  if (rawConditions) {
+    const conditions: Array<{ dependsOn: string; values: string[]; mode: "any" | "all" }> = [];
+    for (const raw of rawConditions) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+      const cond = raw as Record<string, unknown>;
+      const dependsOn = typeof cond.dependsOn === "string" ? cond.dependsOn.trim() : "";
+      const values = Array.isArray(cond.values)
+        ? cond.values.map((value) => String(value).trim()).filter((value) => value.length > 0)
+        : [];
+      if (!dependsOn || values.length === 0) return null;
+      const mode = cond.mode === "all" ? "all" : "any";
+      conditions.push({ dependsOn, values, mode });
+    }
+    return conditions.length > 0 ? { operator, conditions } : null;
+  }
+  const dependsOn = typeof record.dependsOn === "string" ? record.dependsOn.trim() : "";
+  const values = Array.isArray(record.values)
+    ? record.values.map((value) => String(value).trim()).filter((value) => value.length > 0)
+    : [];
+  if (!dependsOn || values.length === 0) return null;
+  const mode = record.mode === "all" ? "all" : "any";
+  return { operator: "all", conditions: [{ dependsOn, values, mode }] };
+}
+
 function validateVisibilityRulesFromSchema(schema: unknown): { fieldId: string; message: string } | null {
   if (!schema || typeof schema !== "object") return null;
   const list = (schema as { fields?: unknown }).fields;
@@ -856,21 +892,20 @@ function validateVisibilityRulesFromSchema(schema: unknown): { fieldId: string; 
     const fieldId = typeof record.id === "string" ? record.id : "";
     const visibility = record.visibility;
     if (!visibility || typeof visibility !== "object" || Array.isArray(visibility)) continue;
-    const dependsOn = typeof (visibility as any).dependsOn === "string" ? (visibility as any).dependsOn.trim() : "";
-    const values = Array.isArray((visibility as any).values)
-      ? (visibility as any).values.map((value: unknown) => String(value).trim()).filter(Boolean)
-      : [];
-    if (!dependsOn || values.length === 0) {
+    const normalized = normalizeVisibilityRule(visibility);
+    if (!normalized) {
       return { fieldId, message: "Visibility rule must include dependsOn and values." };
     }
-    if (dependsOn === fieldId) {
-      return { fieldId, message: "Visibility cannot depend on itself." };
-    }
-    if (!fieldIds.has(dependsOn)) {
-      return { fieldId, message: `Visibility depends on missing field ${dependsOn}.` };
-    }
-    if (!controllers.has(dependsOn)) {
-      return { fieldId, message: `Visibility depends on non-choice field ${dependsOn}.` };
+    for (const condition of normalized.conditions) {
+      if (condition.dependsOn === fieldId) {
+        return { fieldId, message: "Visibility cannot depend on itself." };
+      }
+      if (!fieldIds.has(condition.dependsOn)) {
+        return { fieldId, message: `Visibility depends on missing field ${condition.dependsOn}.` };
+      }
+      if (!controllers.has(condition.dependsOn)) {
+        return { fieldId, message: `Visibility depends on non-choice field ${condition.dependsOn}.` };
+      }
     }
   }
   return null;

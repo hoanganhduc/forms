@@ -611,10 +611,17 @@ type FormSummary = {
 
 type VisibilityMatchMode = "any" | "all";
 
-type FieldVisibilityRule = {
+type VisibilityCondition = {
   dependsOn: string;
   values: string[];
   mode?: VisibilityMatchMode;
+};
+
+type FieldVisibilityRule = {
+  dependsOn?: string;
+  values?: string[];
+  mode?: VisibilityMatchMode;
+  conditions?: VisibilityCondition[];
 };
 
 type FormField = {
@@ -876,39 +883,37 @@ function buildVisibilityMap(fields: FormField[], values: Record<string, string>)
       return true;
     }
     const rule = field.visibility;
-    if (!rule || typeof rule !== "object") {
-      memo.set(field.id, true);
-      return true;
-    }
-    const dependsOn = typeof rule.dependsOn === "string" ? rule.dependsOn.trim() : "";
-    if (!dependsOn) {
-      memo.set(field.id, true);
-      return true;
-    }
-    const controller = fieldById.get(dependsOn);
-    if (!controller || !VISIBILITY_CONTROLLER_TYPES.has(controller.type)) {
+    const normalized = normalizeVisibilityRule(rule);
+    if (!normalized) {
       memo.set(field.id, true);
       return true;
     }
     const nextStack = new Set(stack);
     nextStack.add(field.id);
-    if (!compute(controller, nextStack)) {
-      memo.set(field.id, false);
-      return false;
-    }
-    const selected = parseSelectionValues(controller, values[controller.id] || "");
-    const ruleValues = Array.isArray(rule.values)
-      ? rule.values.map((value) => String(value)).filter((value) => value.length > 0)
-      : [];
-    if (ruleValues.length === 0) {
-      memo.set(field.id, true);
-      return true;
-    }
-    const mode = rule.mode === "all" ? "all" : "any";
-    const matches =
-      mode === "all"
+    const evaluateCondition = (condition: VisibilityCondition) => {
+      const dependsOn = condition.dependsOn.trim();
+      if (!dependsOn) return true;
+      const controller = fieldById.get(dependsOn);
+      if (!controller || !VISIBILITY_CONTROLLER_TYPES.has(controller.type)) {
+        return true;
+      }
+      if (!compute(controller, nextStack)) {
+        return false;
+      }
+      const selected = parseSelectionValues(controller, values[controller.id] || "");
+      const ruleValues = Array.isArray(condition.values)
+        ? condition.values.map((value) => String(value)).filter((value) => value.length > 0)
+        : [];
+      if (ruleValues.length === 0) return true;
+      const mode = condition.mode === "all" ? "all" : "any";
+      return mode === "all"
         ? ruleValues.every((value) => selected.includes(value))
         : ruleValues.some((value) => selected.includes(value));
+    };
+    const matches =
+      normalized.operator === "any"
+        ? normalized.conditions.some((condition) => evaluateCondition(condition))
+        : normalized.conditions.every((condition) => evaluateCondition(condition));
     memo.set(field.id, matches);
     return matches;
   };
@@ -1166,17 +1171,37 @@ function parseSchemaText(text: string) {
   return { schema: { fields: [] as Array<Record<string, unknown>> }, fields: [] as Array<Record<string, unknown>> };
 }
 
-function parseVisibilityRule(input: unknown) {
+function normalizeVisibilityRule(input: unknown): { operator: VisibilityMatchMode; conditions: VisibilityCondition[] } | null {
   if (!input || typeof input !== "object" || Array.isArray(input)) return null;
   const record = input as Record<string, unknown>;
+  const operator = record.mode === "any" ? "any" : "all";
+  const rawConditions = Array.isArray(record.conditions) ? record.conditions : null;
+  if (rawConditions) {
+    const conditions: VisibilityCondition[] = [];
+    for (const raw of rawConditions) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+      const cond = raw as Record<string, unknown>;
+      const dependsOn = typeof cond.dependsOn === "string" ? cond.dependsOn.trim() : "";
+      const values = Array.isArray(cond.values)
+        ? cond.values.map((value) => String(value).trim()).filter((value) => value.length > 0)
+        : [];
+      if (!dependsOn || values.length === 0) return null;
+      const mode = cond.mode === "all" ? "all" : "any";
+      conditions.push({ dependsOn, values, mode });
+    }
+    return conditions.length > 0 ? { operator, conditions } : null;
+  }
   const dependsOn = typeof record.dependsOn === "string" ? record.dependsOn.trim() : "";
-  if (!dependsOn) return null;
   const values = Array.isArray(record.values)
     ? record.values.map((value) => String(value).trim()).filter((value) => value.length > 0)
     : [];
-  if (values.length === 0) return null;
+  if (!dependsOn || values.length === 0) return null;
   const mode = record.mode === "all" ? "all" : "any";
-  return { dependsOn, values, mode } as FieldVisibilityRule;
+  return { operator: "all", conditions: [{ dependsOn, values, mode }] };
+}
+
+function parseVisibilityRule(input: unknown) {
+  return normalizeVisibilityRule(input);
 }
 
 function validateFileRulesInSchema(schema: unknown): string | null {
@@ -1242,14 +1267,16 @@ function validateVisibilityRulesInSchema(schema: unknown): string | null {
     if (!parsed) {
       return `Field "${id || "unknown"}" visibility is invalid.`;
     }
-    if (!fieldIds.has(parsed.dependsOn)) {
-      return `Field "${id || "unknown"}" depends on missing field "${parsed.dependsOn}".`;
-    }
-    if (!controllers.has(parsed.dependsOn)) {
-      return `Field "${id || "unknown"}" depends on non-choice field "${parsed.dependsOn}".`;
-    }
-    if (parsed.dependsOn === id) {
-      return `Field "${id || "unknown"}" cannot depend on itself.`;
+    for (const condition of parsed.conditions) {
+      if (!fieldIds.has(condition.dependsOn)) {
+        return `Field "${id || "unknown"}" depends on missing field "${condition.dependsOn}".`;
+      }
+      if (!controllers.has(condition.dependsOn)) {
+        return `Field "${id || "unknown"}" depends on non-choice field "${condition.dependsOn}".`;
+      }
+      if (condition.dependsOn === id) {
+        return `Field "${id || "unknown"}" cannot depend on itself.`;
+      }
     }
   }
   return null;
@@ -1329,9 +1356,8 @@ type FieldBuilderConfig = {
   dateMode: string;
   dateShowTimezone: boolean;
   visibilityEnabled: boolean;
-  visibilityDependsOn: string;
-  visibilityValues: string;
-  visibilityMode: VisibilityMatchMode;
+  visibilityOperator: VisibilityMatchMode;
+  visibilityConditions: Array<{ dependsOn: string; values: string; mode: VisibilityMatchMode }>;
 };
 
 type FileFieldBuilderConfig = {
@@ -1420,25 +1446,38 @@ function buildFieldPayload(config: FieldBuilderConfig) {
     }
   }
   if (config.visibilityEnabled) {
-    const dependsOn = config.visibilityDependsOn.trim();
-    if (!dependsOn) {
-      return { error: "Visibility depends-on field is required." };
+    const normalizedConditions: VisibilityCondition[] = [];
+    for (const condition of config.visibilityConditions) {
+      const dependsOn = condition.dependsOn.trim();
+      const values = condition.values
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => value.length > 0);
+      if (!dependsOn && values.length === 0) {
+        continue;
+      }
+      if (!dependsOn) {
+        return { error: "Visibility depends-on field is required." };
+      }
+      if (dependsOn === config.id.trim()) {
+        return { error: "Visibility depends-on field cannot be the same as the field id." };
+      }
+      if (values.length === 0) {
+        return { error: "Visibility requires at least one match value." };
+      }
+      normalizedConditions.push({
+        dependsOn,
+        values,
+        mode: condition.mode === "all" ? "all" : "any"
+      });
     }
-    if (dependsOn === config.id.trim()) {
-      return { error: "Visibility depends-on field cannot be the same as the field id." };
+    if (normalizedConditions.length === 0) {
+      return { error: "Visibility requires at least one condition." };
     }
-    const values = config.visibilityValues
-      .split(",")
-      .map((value) => value.trim())
-      .filter((value) => value.length > 0);
-    if (values.length === 0) {
-      return { error: "Visibility requires at least one match value." };
-    }
-    const mode = config.visibilityMode === "all" ? "all" : "any";
+    const operator = config.visibilityOperator === "any" ? "any" : "all";
     field.visibility = {
-      dependsOn,
-      values,
-      mode
+      mode: operator,
+      conditions: normalizedConditions
     };
   }
   return { field };
@@ -1628,9 +1667,8 @@ function FieldBuilderPanel({
   builderDateMode,
   builderDateShowTimezone,
   builderVisibilityEnabled,
-  builderVisibilityDependsOn,
-  builderVisibilityValues,
-  builderVisibilityMode,
+  builderVisibilityOperator,
+  builderVisibilityConditions,
   visibilityControllers,
   markdownEnabled,
   mathjaxEnabled,
@@ -1652,9 +1690,8 @@ function FieldBuilderPanel({
   onDateModeChange,
   onDateShowTimezoneChange,
   onVisibilityEnabledChange,
-  onVisibilityDependsOnChange,
-  onVisibilityValuesChange,
-  onVisibilityModeChange,
+  onVisibilityOperatorChange,
+  onVisibilityConditionsChange,
   onAddField,
   fields,
   onRemoveField,
@@ -1682,9 +1719,8 @@ function FieldBuilderPanel({
   builderDateMode: string;
   builderDateShowTimezone: boolean;
   builderVisibilityEnabled: boolean;
-  builderVisibilityDependsOn: string;
-  builderVisibilityValues: string;
-  builderVisibilityMode: VisibilityMatchMode;
+  builderVisibilityOperator: VisibilityMatchMode;
+  builderVisibilityConditions: Array<{ dependsOn: string; values: string; mode: VisibilityMatchMode }>;
   visibilityControllers: Array<{ id: string; label: string; options: string[] }>;
   markdownEnabled: boolean;
   mathjaxEnabled: boolean;
@@ -1706,9 +1742,10 @@ function FieldBuilderPanel({
   onDateModeChange: (value: string) => void;
   onDateShowTimezoneChange: (value: boolean) => void;
   onVisibilityEnabledChange: (value: boolean) => void;
-  onVisibilityDependsOnChange: (value: string) => void;
-  onVisibilityValuesChange: (value: string) => void;
-  onVisibilityModeChange: (value: VisibilityMatchMode) => void;
+  onVisibilityOperatorChange: (value: VisibilityMatchMode) => void;
+  onVisibilityConditionsChange: (
+    value: Array<{ dependsOn: string; values: string; mode: VisibilityMatchMode }>
+  ) => void;
   onAddField: () => void;
   fields: Array<Record<string, unknown>>;
   onRemoveField: (id: string) => void;
@@ -1723,10 +1760,26 @@ function FieldBuilderPanel({
   const availableVisibilityControllers = visibilityControllers.filter(
     (controller) => controller.id !== builderId
   );
-  const visibilityOptions = (
-    availableVisibilityControllers.find((controller) => controller.id === builderVisibilityDependsOn)
-      ?.options ?? []
-  ).join(", ");
+  const visibilityConditions =
+    builderVisibilityConditions.length > 0
+      ? builderVisibilityConditions
+      : [{ dependsOn: "", values: "", mode: "any" as VisibilityMatchMode }];
+  const updateVisibilityCondition = (index: number, patch: Partial<{ dependsOn: string; values: string; mode: VisibilityMatchMode }>) => {
+    const next = visibilityConditions.map((condition, idx) =>
+      idx === index ? { ...condition, ...patch } : condition
+    );
+    onVisibilityConditionsChange(next);
+  };
+  const addVisibilityCondition = () => {
+    onVisibilityConditionsChange([
+      ...visibilityConditions,
+      { dependsOn: "", values: "", mode: "any" }
+    ]);
+  };
+  const removeVisibilityCondition = (index: number) => {
+    const next = visibilityConditions.filter((_, idx) => idx !== index);
+    onVisibilityConditionsChange(next.length > 0 ? next : [{ dependsOn: "", values: "", mode: "any" }]);
+  };
   return (
     <div className="panel panel--compact">
       <div className="panel-header">
@@ -1986,54 +2039,106 @@ function FieldBuilderPanel({
               disabled={availableVisibilityControllers.length === 0}
             />
             <label className="form-check-label" htmlFor={visibilityId}>
-              Show only when another field matches
+              Show only when conditions match
             </label>
           </div>
           {availableVisibilityControllers.length === 0 ? (
             <div className="muted mt-1">Add a dropdown/checkbox field first to enable conditions.</div>
           ) : builderVisibilityEnabled ? (
-            <div className="row g-3 mt-1">
-              <div className="col-md-4">
-                <label className="form-label">Depends on</label>
-                <select
-                  className="form-select"
-                  value={builderVisibilityDependsOn}
-                  onChange={(event) => onVisibilityDependsOnChange(event.target.value)}
-                >
-                  <option value="">Select field</option>
-                  {availableVisibilityControllers.map((controller) => (
-                    <option key={controller.id} value={controller.id}>
-                      {controller.label || controller.id}
-                    </option>
-                  ))}
-                </select>
+            <div className="mt-1">
+              <div className="row g-3">
+                <div className="col-md-4">
+                  <label className="form-label">Match</label>
+                  <select
+                    className="form-select"
+                    value={builderVisibilityOperator}
+                    onChange={(event) =>
+                      onVisibilityOperatorChange(event.target.value === "any" ? "any" : "all")
+                    }
+                  >
+                    <option value="all">All conditions</option>
+                    <option value="any">Any condition</option>
+                  </select>
+                </div>
               </div>
-              <div className="col-md-3">
-                <label className="form-label">Match mode</label>
-                <select
-                  className="form-select"
-                  value={builderVisibilityMode}
-                  onChange={(event) =>
-                    onVisibilityModeChange(event.target.value === "all" ? "all" : "any")
-                  }
+              {visibilityConditions.map((condition, index) => {
+                const visibilityOptions = (
+                  availableVisibilityControllers.find(
+                    (controller) => controller.id === condition.dependsOn
+                  )?.options ?? []
+                ).join(", ");
+                return (
+                  <div className="row g-3 mt-1" key={`visibility-${index}`}>
+                    <div className="col-md-4">
+                      <label className="form-label">Depends on</label>
+                      <select
+                        className="form-select"
+                        value={condition.dependsOn}
+                        onChange={(event) =>
+                          updateVisibilityCondition(index, { dependsOn: event.target.value })
+                        }
+                      >
+                        <option value="">Select field</option>
+                        {availableVisibilityControllers.map((controller) => (
+                          <option key={controller.id} value={controller.id}>
+                            {controller.label || controller.id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="col-md-3">
+                      <label className="form-label">Match mode</label>
+                      <select
+                        className="form-select"
+                        value={condition.mode}
+                        onChange={(event) =>
+                          updateVisibilityCondition(index, {
+                            mode: event.target.value === "all" ? "all" : "any"
+                          })
+                        }
+                      >
+                        <option value="any">Any selected</option>
+                        <option value="all">All selected</option>
+                      </select>
+                    </div>
+                    <div className="col-md-4">
+                      <label className="form-label">Values (comma separated)</label>
+                      <input
+                        className="form-control"
+                        value={condition.values}
+                        onChange={(event) =>
+                          updateVisibilityCondition(index, { values: event.target.value })
+                        }
+                        placeholder="Option A, Option B"
+                      />
+                      {visibilityOptions ? (
+                        <div className="muted mt-1">Available: {visibilityOptions}</div>
+                      ) : (
+                        <div className="muted mt-1">Select a controller field to see options.</div>
+                      )}
+                    </div>
+                    <div className="col-md-1 d-flex align-items-end">
+                      <button
+                        type="button"
+                        className="btn btn-outline-danger btn-sm"
+                        onClick={() => removeVisibilityCondition(index)}
+                        aria-label="Remove condition"
+                        title="Remove condition"
+                      >
+                        <i className="bi bi-x-lg" aria-hidden="true" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+              <div className="mt-2">
+                <button
+                  type="button"
+                  className="btn btn-outline-secondary btn-sm"
+                  onClick={addVisibilityCondition}
                 >
-                  <option value="any">Any selected</option>
-                  <option value="all">All selected</option>
-                </select>
-              </div>
-              <div className="col-md-5">
-                <label className="form-label">Values (comma separated)</label>
-                <input
-                  className="form-control"
-                  value={builderVisibilityValues}
-                  onChange={(event) => onVisibilityValuesChange(event.target.value)}
-                  placeholder="Option A, Option B"
-                />
-                {visibilityOptions ? (
-                  <div className="muted mt-1">Available: {visibilityOptions}</div>
-                ) : (
-                  <div className="muted mt-1">Select a controller field to see options.</div>
-                )}
+                  <i className="bi bi-plus-circle" aria-hidden="true" /> Add condition
+                </button>
               </div>
             </div>
           ) : null}
@@ -12135,9 +12240,11 @@ function BuilderPage({
   const [builderDateShowTimezone, setBuilderDateShowTimezone] = useState(true);
   const [builderAutofillFromLogin, setBuilderAutofillFromLogin] = useState(false);
   const [builderVisibilityEnabled, setBuilderVisibilityEnabled] = useState(false);
-  const [builderVisibilityDependsOn, setBuilderVisibilityDependsOn] = useState("");
-  const [builderVisibilityValues, setBuilderVisibilityValues] = useState("");
-  const [builderVisibilityMode, setBuilderVisibilityMode] = useState<VisibilityMatchMode>("any");
+  const [builderVisibilityOperator, setBuilderVisibilityOperator] =
+    useState<VisibilityMatchMode>("all");
+  const [builderVisibilityConditions, setBuilderVisibilityConditions] = useState<
+    Array<{ dependsOn: string; values: string; mode: VisibilityMatchMode }>
+  >([{ dependsOn: "", values: "", mode: "any" }]);
   const [templateFromFormSlug, setTemplateFromFormSlug] = useState("");
   const [templateFromFormStatus, setTemplateFromFormStatus] = useState<string | null>(null);
   const [templateFieldEditId, setTemplateFieldEditId] = useState("");
@@ -12200,10 +12307,11 @@ function BuilderPage({
   const [formDateShowTimezone, setFormDateShowTimezone] = useState(true);
   const [formAutofillFromLogin, setFormAutofillFromLogin] = useState(false);
   const [formFieldVisibilityEnabled, setFormFieldVisibilityEnabled] = useState(false);
-  const [formFieldVisibilityDependsOn, setFormFieldVisibilityDependsOn] = useState("");
-  const [formFieldVisibilityValues, setFormFieldVisibilityValues] = useState("");
-  const [formFieldVisibilityMode, setFormFieldVisibilityMode] =
-    useState<VisibilityMatchMode>("any");
+  const [formFieldVisibilityOperator, setFormFieldVisibilityOperator] =
+    useState<VisibilityMatchMode>("all");
+  const [formFieldVisibilityConditions, setFormFieldVisibilityConditions] = useState<
+    Array<{ dependsOn: string; values: string; mode: VisibilityMatchMode }>
+  >([{ dependsOn: "", values: "", mode: "any" }]);
   const [formFieldEditId, setFormFieldEditId] = useState("");
   const [formFileFieldId, setFormFileFieldId] = useState("");
   const [formFileFieldLabel, setFormFileFieldLabel] = useState("");
@@ -12678,9 +12786,8 @@ function BuilderPage({
       dateMode: builderDateMode,
       dateShowTimezone: builderDateShowTimezone,
       visibilityEnabled: builderVisibilityEnabled,
-      visibilityDependsOn: builderVisibilityDependsOn,
-      visibilityValues: builderVisibilityValues,
-      visibilityMode: builderVisibilityMode
+      visibilityOperator: builderVisibilityOperator,
+      visibilityConditions: builderVisibilityConditions
     });
     if (nextSchema.error) {
       setTemplateEditorStatus(nextSchema.error);
@@ -12706,9 +12813,8 @@ function BuilderPage({
     setBuilderDateMode("datetime");
     setBuilderDateShowTimezone(true);
     setBuilderVisibilityEnabled(false);
-    setBuilderVisibilityDependsOn("");
-    setBuilderVisibilityValues("");
-    setBuilderVisibilityMode("any");
+    setBuilderVisibilityOperator("all");
+    setBuilderVisibilityConditions([{ dependsOn: "", values: "", mode: "any" }]);
   }
 
   function handleRemoveField(fieldId: string) {
@@ -12790,12 +12896,22 @@ function BuilderPage({
     );
     setBuilderDateShowTimezone(!(type === "date" && rules.timezoneOptional === true));
     const visibility = (field as any).visibility || {};
-    setBuilderVisibilityEnabled(Boolean(visibility?.dependsOn));
-    setBuilderVisibilityDependsOn(typeof visibility?.dependsOn === "string" ? visibility.dependsOn : "");
-    setBuilderVisibilityValues(
-      Array.isArray(visibility?.values) ? visibility.values.join(",") : ""
-    );
-    setBuilderVisibilityMode(visibility?.mode === "all" ? "all" : "any");
+    const normalizedVisibility = normalizeVisibilityRule(visibility);
+    if (normalizedVisibility) {
+      setBuilderVisibilityEnabled(true);
+      setBuilderVisibilityOperator(normalizedVisibility.operator);
+      setBuilderVisibilityConditions(
+        normalizedVisibility.conditions.map((condition) => ({
+          dependsOn: condition.dependsOn,
+          values: condition.values.join(", "),
+          mode: condition.mode === "all" ? "all" : "any"
+        }))
+      );
+    } else {
+      setBuilderVisibilityEnabled(false);
+      setBuilderVisibilityOperator("all");
+      setBuilderVisibilityConditions([{ dependsOn: "", values: "", mode: "any" }]);
+    }
   }
 
   function handleUpdateTemplateField() {
@@ -12818,9 +12934,8 @@ function BuilderPage({
       dateMode: builderDateMode,
       dateShowTimezone: builderDateShowTimezone,
       visibilityEnabled: builderVisibilityEnabled,
-      visibilityDependsOn: builderVisibilityDependsOn,
-      visibilityValues: builderVisibilityValues,
-      visibilityMode: builderVisibilityMode
+      visibilityOperator: builderVisibilityOperator,
+      visibilityConditions: builderVisibilityConditions
     });
     if (nextSchema.error) {
       setTemplateEditorStatus(nextSchema.error);
@@ -13375,9 +13490,8 @@ function BuilderPage({
       dateMode: formDateMode,
       dateShowTimezone: formDateShowTimezone,
       visibilityEnabled: formFieldVisibilityEnabled,
-      visibilityDependsOn: formFieldVisibilityDependsOn,
-      visibilityValues: formFieldVisibilityValues,
-      visibilityMode: formFieldVisibilityMode
+      visibilityOperator: formFieldVisibilityOperator,
+      visibilityConditions: formFieldVisibilityConditions
     });
     if (nextSchema.error) {
       setFormBuilderStatus(nextSchema.error);
@@ -13403,9 +13517,8 @@ function BuilderPage({
     setFormDateMode("datetime");
     setFormDateShowTimezone(true);
     setFormFieldVisibilityEnabled(false);
-    setFormFieldVisibilityDependsOn("");
-    setFormFieldVisibilityValues("");
-    setFormFieldVisibilityMode("any");
+    setFormFieldVisibilityOperator("all");
+    setFormFieldVisibilityConditions([{ dependsOn: "", values: "", mode: "any" }]);
   }
 
   function handleRemoveFormField(fieldId: string) {
@@ -13487,12 +13600,22 @@ function BuilderPage({
     );
     setFormDateShowTimezone(!(type === "date" && rules.timezoneOptional === true));
     const visibility = (field as any).visibility || {};
-    setFormFieldVisibilityEnabled(Boolean(visibility?.dependsOn));
-    setFormFieldVisibilityDependsOn(typeof visibility?.dependsOn === "string" ? visibility.dependsOn : "");
-    setFormFieldVisibilityValues(
-      Array.isArray(visibility?.values) ? visibility.values.join(",") : ""
-    );
-    setFormFieldVisibilityMode(visibility?.mode === "all" ? "all" : "any");
+    const normalizedVisibility = normalizeVisibilityRule(visibility);
+    if (normalizedVisibility) {
+      setFormFieldVisibilityEnabled(true);
+      setFormFieldVisibilityOperator(normalizedVisibility.operator);
+      setFormFieldVisibilityConditions(
+        normalizedVisibility.conditions.map((condition) => ({
+          dependsOn: condition.dependsOn,
+          values: condition.values.join(", "),
+          mode: condition.mode === "all" ? "all" : "any"
+        }))
+      );
+    } else {
+      setFormFieldVisibilityEnabled(false);
+      setFormFieldVisibilityOperator("all");
+      setFormFieldVisibilityConditions([{ dependsOn: "", values: "", mode: "any" }]);
+    }
   }
 
   function handleUpdateFormField() {
@@ -13515,9 +13638,8 @@ function BuilderPage({
       dateMode: formDateMode,
       dateShowTimezone: formDateShowTimezone,
       visibilityEnabled: formFieldVisibilityEnabled,
-      visibilityDependsOn: formFieldVisibilityDependsOn,
-      visibilityValues: formFieldVisibilityValues,
-      visibilityMode: formFieldVisibilityMode
+      visibilityOperator: formFieldVisibilityOperator,
+      visibilityConditions: formFieldVisibilityConditions
     });
     if (nextSchema.error) {
       setFormBuilderStatus(nextSchema.error);
@@ -14939,9 +15061,8 @@ function BuilderPage({
                       builderDateMode={formDateMode}
                       builderDateShowTimezone={formDateShowTimezone}
                       builderVisibilityEnabled={formFieldVisibilityEnabled}
-                      builderVisibilityDependsOn={formFieldVisibilityDependsOn}
-                      builderVisibilityValues={formFieldVisibilityValues}
-                      builderVisibilityMode={formFieldVisibilityMode}
+                      builderVisibilityOperator={formFieldVisibilityOperator}
+                      builderVisibilityConditions={formFieldVisibilityConditions}
                       visibilityControllers={formVisibilityControllers}
                       markdownEnabled={markdownEnabled}
                       mathjaxEnabled={mathjaxEnabled}
@@ -14963,9 +15084,8 @@ function BuilderPage({
                       onDateModeChange={setFormDateMode}
                       onDateShowTimezoneChange={setFormDateShowTimezone}
                       onVisibilityEnabledChange={setFormFieldVisibilityEnabled}
-                      onVisibilityDependsOnChange={setFormFieldVisibilityDependsOn}
-                      onVisibilityValuesChange={setFormFieldVisibilityValues}
-                      onVisibilityModeChange={setFormFieldVisibilityMode}
+                      onVisibilityOperatorChange={setFormFieldVisibilityOperator}
+                      onVisibilityConditionsChange={setFormFieldVisibilityConditions}
                       onAddField={handleAddFormField}
                       fields={formTextFields}
                       onRemoveField={handleRemoveFormField}
@@ -15407,9 +15527,8 @@ function BuilderPage({
                   builderDateMode={builderDateMode}
                   builderDateShowTimezone={builderDateShowTimezone}
                   builderVisibilityEnabled={builderVisibilityEnabled}
-                  builderVisibilityDependsOn={builderVisibilityDependsOn}
-                  builderVisibilityValues={builderVisibilityValues}
-                  builderVisibilityMode={builderVisibilityMode}
+                  builderVisibilityOperator={builderVisibilityOperator}
+                  builderVisibilityConditions={builderVisibilityConditions}
                   visibilityControllers={templateVisibilityControllers}
                   markdownEnabled={markdownEnabled}
                   mathjaxEnabled={mathjaxEnabled}
@@ -15431,9 +15550,8 @@ function BuilderPage({
                   onDateModeChange={setBuilderDateMode}
                   onDateShowTimezoneChange={setBuilderDateShowTimezone}
                   onVisibilityEnabledChange={setBuilderVisibilityEnabled}
-                  onVisibilityDependsOnChange={setBuilderVisibilityDependsOn}
-                  onVisibilityValuesChange={setBuilderVisibilityValues}
-                  onVisibilityModeChange={setBuilderVisibilityMode}
+                  onVisibilityOperatorChange={setBuilderVisibilityOperator}
+                  onVisibilityConditionsChange={setBuilderVisibilityConditions}
                   onAddField={handleAddField}
                   fields={templateTextFields}
                   onRemoveField={handleRemoveField}
