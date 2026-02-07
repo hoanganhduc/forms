@@ -5277,6 +5277,556 @@ async function importSubmissionComments(
   }
 }
 
+type RestoreError = {
+  status: number;
+  code: string;
+  details?: Record<string, unknown>;
+};
+
+function throwRestoreError(status: number, code: string, details?: Record<string, unknown>): never {
+  const error = new Error(code) as Error & RestoreError;
+  error.status = status;
+  error.code = code;
+  error.details = details;
+  throw error;
+}
+
+function isRestoreError(error: unknown): error is RestoreError {
+  return Boolean(
+    error &&
+      typeof error === "object" &&
+      "status" in error &&
+      "code" in error &&
+      typeof (error as any).status === "number" &&
+      typeof (error as any).code === "string"
+  );
+}
+
+async function restoreTemplateFromBackup(
+  env: Env,
+  template: Record<string, unknown>,
+  restoreTrash: boolean
+): Promise<{ created?: boolean; updated?: boolean; restored?: boolean }> {
+  if (!template?.key || !template?.name || template.schema_json === undefined) {
+    throwRestoreError(400, "invalid_payload", { message: "missing_template_fields" });
+  }
+  let parsedSchema: unknown = null;
+  try {
+    parsedSchema =
+      typeof template.schema_json === "string"
+        ? JSON.parse(template.schema_json)
+        : template.schema_json;
+  } catch {
+    throwRestoreError(400, "invalid_payload", { field: "schema_json", message: "invalid_json" });
+  }
+  const ruleError = validateFileRulesFromSchema(parsedSchema);
+  if (ruleError) {
+    throwRestoreError(400, "invalid_payload", {
+      field: "schema_json",
+      message: "invalid_file_rules",
+      detail: ruleError
+    });
+  }
+  const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
+  if (visibilityError) {
+    throwRestoreError(400, "invalid_payload", {
+      field: "schema_json",
+      message: "invalid_visibility_rules",
+      detail: visibilityError
+    });
+  }
+  const fileRulesJson = buildFileRulesJsonFromSchema(JSON.stringify(parsedSchema));
+  const existing = await env.DB.prepare("SELECT id, deleted_at FROM templates WHERE key=?")
+    .bind(template.key)
+    .first<{ id: string; deleted_at: string | null }>();
+  if (existing?.id && existing.deleted_at !== null && !restoreTrash) {
+    throwRestoreError(409, "conflict", { message: "slug_in_trash" });
+  }
+  if (existing?.id) {
+    await env.DB.prepare(
+      "UPDATE templates SET name=?, schema_json=?, file_rules_json=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+    )
+      .bind(
+        String(template.name),
+        JSON.stringify(parsedSchema),
+        fileRulesJson ?? "{}",
+        existing.id
+      )
+      .run();
+    return { updated: true, restored: existing.deleted_at !== null };
+  }
+  const templateId = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO templates (id, key, name, schema_json, file_rules_json) VALUES (?, ?, ?, ?, ?)"
+  )
+    .bind(
+      templateId,
+      String(template.key),
+      String(template.name),
+      JSON.stringify(parsedSchema),
+      fileRulesJson ?? "{}"
+    )
+    .run();
+  return { created: true };
+}
+
+async function restoreFormFromBackup(input: {
+  env: Env;
+  form: Record<string, unknown>;
+  template?: Record<string, unknown>;
+  restoreTrash: boolean;
+  reminderEnabled?: boolean;
+  reminderFrequency?: string;
+  reminderUntil?: string | null;
+  submissions?: Array<Record<string, unknown>>;
+}): Promise<{ created?: boolean; updated?: boolean; restored?: boolean }> {
+  const {
+    env,
+    form,
+    template,
+    restoreTrash,
+    reminderEnabled,
+    reminderFrequency,
+    reminderUntil,
+    submissions
+  } = input;
+  if (!form || !form.slug || !form.title || !form.templateKey) {
+    throwRestoreError(400, "invalid_payload", { message: "missing_form_fields" });
+  }
+  let templateId: string | null = null;
+  let templateSchemaJson: string | null = null;
+  let formSchemaJson: string | null = null;
+  let parsedFormSchema: unknown = null;
+  if (form.schema_json !== undefined && form.schema_json !== null) {
+    try {
+      parsedFormSchema =
+        typeof form.schema_json === "string" ? JSON.parse(form.schema_json) : form.schema_json;
+      formSchemaJson = JSON.stringify(parsedFormSchema);
+    } catch {
+      throwRestoreError(400, "invalid_payload", { field: "schema_json", message: "invalid_json" });
+    }
+    const ruleError = validateFileRulesFromSchema(parsedFormSchema);
+    if (ruleError) {
+      throwRestoreError(400, "invalid_payload", {
+        field: "schema_json",
+        message: "invalid_file_rules",
+        detail: ruleError
+      });
+    }
+    const visibilityError = validateVisibilityRulesFromSchema(parsedFormSchema);
+    if (visibilityError) {
+      throwRestoreError(400, "invalid_payload", {
+        field: "schema_json",
+        message: "invalid_visibility_rules",
+        detail: visibilityError
+      });
+    }
+  }
+  if (template?.key) {
+    let parsedSchema: unknown = null;
+    try {
+      parsedSchema =
+        typeof template.schema_json === "string"
+          ? JSON.parse(template.schema_json)
+          : template.schema_json;
+    } catch {
+      throwRestoreError(400, "invalid_payload", { field: "schema_json", message: "invalid_json" });
+    }
+    const ruleError = validateFileRulesFromSchema(parsedSchema);
+    if (ruleError) {
+      throwRestoreError(400, "invalid_payload", {
+        field: "schema_json",
+        message: "invalid_file_rules",
+        detail: ruleError
+      });
+    }
+    const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
+    if (visibilityError) {
+      throwRestoreError(400, "invalid_payload", {
+        field: "schema_json",
+        message: "invalid_visibility_rules",
+        detail: visibilityError
+      });
+    }
+    const fileRulesJson = buildFileRulesJsonFromSchema(JSON.stringify(parsedSchema));
+    const existingTpl = await env.DB.prepare(
+      "SELECT id FROM templates WHERE key=? AND deleted_at IS NULL"
+    )
+      .bind(template.key)
+      .first<{ id: string }>();
+    if (existingTpl?.id) {
+      templateId = existingTpl.id;
+      await env.DB.prepare(
+        "UPDATE templates SET name=?, schema_json=?, file_rules_json=? WHERE id=?"
+      )
+        .bind(
+          template.name || template.key,
+          JSON.stringify(parsedSchema),
+          fileRulesJson ?? "{}",
+          templateId
+        )
+        .run();
+    } else {
+      templateId = crypto.randomUUID();
+      await env.DB.prepare(
+        "INSERT INTO templates (id, key, name, schema_json, file_rules_json) VALUES (?, ?, ?, ?, ?)"
+      )
+        .bind(
+          templateId,
+          template.key,
+          template.name || template.key,
+          JSON.stringify(parsedSchema),
+          fileRulesJson ?? "{}"
+        )
+        .run();
+    }
+  } else {
+    const existingTpl = await env.DB.prepare(
+      "SELECT id, schema_json FROM templates WHERE key=? AND deleted_at IS NULL"
+    )
+      .bind(form.templateKey)
+      .first<{ id: string; schema_json: string }>();
+    if (existingTpl?.id) {
+      templateId = existingTpl.id;
+      templateSchemaJson = existingTpl.schema_json;
+    } else if (formSchemaJson) {
+      templateId = crypto.randomUUID();
+      await env.DB.prepare(
+        "INSERT INTO templates (id, key, name, schema_json, file_rules_json) VALUES (?, ?, ?, ?, ?)"
+      )
+        .bind(
+          templateId,
+          form.templateKey,
+          form.templateName || form.templateKey,
+          formSchemaJson,
+          buildFileRulesJsonFromSchema(formSchemaJson) ?? "{}"
+        )
+        .run();
+      templateSchemaJson = formSchemaJson;
+    } else {
+      throwRestoreError(400, "invalid_payload", { field: "templateKey", message: "template_not_found" });
+    }
+  }
+
+  const existingForm = await env.DB.prepare("SELECT id, deleted_at FROM forms WHERE slug=?")
+    .bind(form.slug)
+    .first<{ id: string; deleted_at: string | null }>();
+
+  const authPolicy = form.auth_policy ?? "optional";
+  if (!["optional", "google", "github", "either", "required"].includes(String(authPolicy))) {
+    throwRestoreError(400, "invalid_payload", {
+      field: "auth_policy",
+      allowed: ["optional", "google", "github", "either", "required"]
+    });
+  }
+
+  const isPublic = Boolean(form.is_public);
+  const isLocked = Boolean(form.is_locked);
+  const availableFrom = normalizeDateTimeInput(form.available_from ?? null);
+  const availableUntil = normalizeDateTimeInput(form.available_until ?? null);
+  if (availableFrom && availableUntil) {
+    const start = parseIsoTime(availableFrom);
+    const end = parseIsoTime(availableUntil);
+    if (start && end && start >= end) {
+      throwRestoreError(400, "invalid_payload", { field: "availableUntil", message: "must_be_after_start" });
+    }
+  }
+  const passwordRequired = Boolean(form.password_required);
+  let passwordRequireAccess = Boolean(form.password_require_access);
+  let passwordRequireSubmit = Boolean(form.password_require_submit);
+  if (!passwordRequireAccess && !passwordRequireSubmit && passwordRequired) {
+    passwordRequireSubmit = true;
+  }
+  const passwordSalt =
+    typeof form.password_salt === "string" && form.password_salt.trim()
+      ? form.password_salt.trim()
+      : null;
+  const passwordHash =
+    typeof form.password_hash === "string" && form.password_hash.trim()
+      ? form.password_hash.trim()
+      : null;
+  if (passwordRequired && (!passwordSalt || !passwordHash)) {
+    throwRestoreError(400, "invalid_payload", { field: "password", message: "missing_password_hash" });
+  }
+  const canvasEnabled = Boolean(form.canvas_enabled);
+  const canvasAllowed =
+    Array.isArray(form.canvas_allowed_section_ids_json)
+      ? JSON.stringify(form.canvas_allowed_section_ids_json)
+      : typeof form.canvas_allowed_section_ids_json === "string"
+        ? form.canvas_allowed_section_ids_json
+        : null;
+  const fileRulesJson = formSchemaJson
+    ? buildFileRulesJsonFromSchema(formSchemaJson)
+    : typeof form.file_rules_json === "string"
+      ? form.file_rules_json
+      : form.file_rules_json
+        ? JSON.stringify(form.file_rules_json)
+        : null;
+  const submissionBackupEnabled = Boolean(form.submission_backup_enabled);
+  const submissionBackupFormats = parseSubmissionBackupFormats(form.submission_backup_formats);
+  const formVersionSchema = formSchemaJson || templateSchemaJson;
+
+  if (existingForm?.id && existingForm.deleted_at !== null && !restoreTrash) {
+    throwRestoreError(409, "conflict", { message: "slug_in_trash" });
+  }
+  if (existingForm?.id) {
+    await env.DB.prepare(
+      "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_require_access=?, password_require_submit=?, password_salt=?, password_hash=?, submission_backup_enabled=?, submission_backup_formats=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+    )
+      .bind(
+        form.title,
+        form.description ?? null,
+        templateId,
+        isPublic ? 1 : 0,
+        isLocked ? 1 : 0,
+        authPolicy,
+        fileRulesJson,
+        canvasEnabled ? 1 : 0,
+        form.canvas_course_id ?? null,
+        canvasAllowed ?? null,
+        form.canvas_fields_position ?? "bottom",
+        availableFrom,
+        availableUntil,
+        passwordRequired ? 1 : 0,
+        passwordRequireAccess ? 1 : 0,
+        passwordRequireSubmit ? 1 : 0,
+        passwordRequired ? passwordSalt : null,
+        passwordRequired ? passwordHash : null,
+        submissionBackupEnabled ? 1 : 0,
+        serializeSubmissionBackupFormats(submissionBackupFormats),
+        existingForm.id
+      )
+      .run();
+    if (formVersionSchema) {
+      const existingVersion = await env.DB.prepare(
+        "SELECT id FROM form_versions WHERE form_id=? AND version=1"
+      )
+        .bind(existingForm.id)
+        .first<{ id: string }>();
+      if (existingVersion?.id) {
+        await env.DB.prepare("UPDATE form_versions SET schema_json=? WHERE id=?")
+          .bind(formVersionSchema, existingVersion.id)
+          .run();
+      } else {
+        await env.DB.prepare(
+          "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
+        )
+          .bind(crypto.randomUUID(), existingForm.id, formVersionSchema)
+          .run();
+      }
+    }
+    if (await hasColumn(env, "forms", "submission_backup_enabled")) {
+      await ensureSubmissionBackupTask(env, String(form.slug), String(form.title), submissionBackupEnabled);
+    }
+    if (Array.isArray(submissions)) {
+      for (const submission of submissions) {
+        if (!submission || typeof submission !== "object") continue;
+        const submissionId =
+          typeof submission.id === "string" && submission.id.trim()
+            ? submission.id.trim()
+            : crypto.randomUUID();
+        const payloadJson =
+          submission.data_json && typeof submission.data_json === "object"
+            ? JSON.stringify({ data: submission.data_json })
+            : typeof submission.data_json === "string"
+              ? submission.data_json
+              : JSON.stringify({ data: submission.data_json ?? {} });
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO submissions (id, form_id, user_id, payload_json, created_at, updated_at, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+          .bind(
+            submissionId,
+            existingForm.id,
+            submission.user_id ?? null,
+            payloadJson,
+            submission.created_at ?? new Date().toISOString(),
+            submission.updated_at ?? submission.created_at ?? new Date().toISOString(),
+            submission.submitter?.provider ?? null,
+            submission.submitter?.email ?? null,
+            submission.submitter?.github_username ?? null
+          )
+          .run();
+        await importSubmissionComments(env, submissionId, submission.comments || [], null);
+      }
+    }
+    return { updated: true, restored: existingForm.deleted_at !== null };
+  }
+
+  const formId = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO forms (id, slug, title, description, template_id, is_public, is_locked, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, reminder_enabled, reminder_frequency, reminder_until, submission_backup_enabled, submission_backup_formats) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  )
+    .bind(
+      formId,
+      form.slug,
+      form.title,
+      form.description ?? null,
+      templateId,
+      isPublic ? 1 : 0,
+      isLocked ? 1 : 0,
+      authPolicy,
+      fileRulesJson,
+      canvasEnabled ? 1 : 0,
+      form.canvas_course_id ?? null,
+      canvasAllowed ?? null,
+      form.canvas_fields_position ?? "bottom",
+      availableFrom,
+      availableUntil,
+      passwordRequired ? 1 : 0,
+      passwordRequireAccess ? 1 : 0,
+      passwordRequireSubmit ? 1 : 0,
+      passwordRequired ? passwordSalt : null,
+      passwordRequired ? passwordHash : null,
+      reminderEnabled ? 1 : 0,
+      reminderFrequency || "weekly",
+      reminderUntil || null,
+      submissionBackupEnabled ? 1 : 0,
+      serializeSubmissionBackupFormats(submissionBackupFormats)
+    )
+    .run();
+
+  if (formVersionSchema) {
+    await env.DB.prepare(
+      "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
+    )
+      .bind(crypto.randomUUID(), formId, formVersionSchema)
+      .run();
+  }
+  if (await hasColumn(env, "forms", "submission_backup_enabled")) {
+    await ensureSubmissionBackupTask(env, String(form.slug), String(form.title), submissionBackupEnabled);
+  }
+  if (Array.isArray(submissions)) {
+    for (const submission of submissions) {
+      if (!submission || typeof submission !== "object") continue;
+      const submissionId =
+        typeof submission.id === "string" && submission.id.trim()
+          ? submission.id.trim()
+          : crypto.randomUUID();
+      const payloadJson =
+        submission.data_json && typeof submission.data_json === "object"
+          ? JSON.stringify({ data: submission.data_json })
+          : typeof submission.data_json === "string"
+            ? submission.data_json
+            : JSON.stringify({ data: submission.data_json ?? {} });
+      await env.DB.prepare(
+        "INSERT OR IGNORE INTO submissions (id, form_id, user_id, payload_json, created_at, updated_at, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(
+          submissionId,
+          formId,
+          submission.user_id ?? null,
+          payloadJson,
+          submission.created_at ?? new Date().toISOString(),
+          submission.updated_at ?? submission.created_at ?? new Date().toISOString(),
+          submission.submitter?.provider ?? null,
+          submission.submitter?.email ?? null,
+          submission.submitter?.github_username ?? null
+        )
+        .run();
+      await importSubmissionComments(env, submissionId, submission.comments || [], null);
+    }
+  }
+  return { created: true };
+}
+
+async function restoreSubmissionBackup(
+  env: Env,
+  backup: Record<string, unknown>,
+  restoreTrash: boolean
+): Promise<{
+  created: number;
+  updated: number;
+  restored: number;
+  skipped: number;
+  comments: number;
+}> {
+  const form = backup.form as Record<string, unknown> | undefined;
+  const submissions = Array.isArray(backup.submissions) ? backup.submissions : [];
+  if (!form?.slug) {
+    throwRestoreError(400, "invalid_payload", { message: "missing_form_fields" });
+  }
+  const existingForm = await env.DB.prepare("SELECT id FROM forms WHERE slug=? AND deleted_at IS NULL")
+    .bind(form.slug)
+    .first<{ id: string }>();
+  if (!existingForm?.id) {
+    throwRestoreError(404, "not_found", { message: "form_not_found" });
+  }
+  let created = 0;
+  let updated = 0;
+  let restored = 0;
+  let skipped = 0;
+  let comments = 0;
+  for (const submission of submissions) {
+    if (!submission || typeof submission !== "object") {
+      skipped += 1;
+      continue;
+    }
+    const submissionId =
+      typeof (submission as any).id === "string" && (submission as any).id.trim()
+        ? (submission as any).id.trim()
+        : crypto.randomUUID();
+    const payloadJson =
+      (submission as any).data_json && typeof (submission as any).data_json === "object"
+        ? JSON.stringify({ data: (submission as any).data_json })
+        : typeof (submission as any).data_json === "string"
+          ? (submission as any).data_json
+          : JSON.stringify({ data: (submission as any).data_json ?? {} });
+    const existing = await env.DB.prepare(
+      "SELECT id, deleted_at FROM submissions WHERE id=?"
+    )
+      .bind(submissionId)
+      .first<{ id: string; deleted_at: string | null }>();
+    if (existing?.id) {
+      if (existing.deleted_at && restoreTrash) {
+        await env.DB.prepare(
+          "UPDATE submissions SET form_id=?, user_id=?, payload_json=?, created_at=?, updated_at=?, submitter_provider=?, submitter_email=?, submitter_github_username=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+        )
+          .bind(
+            existingForm.id,
+            (submission as any).user_id ?? null,
+            payloadJson,
+            (submission as any).created_at ?? new Date().toISOString(),
+            (submission as any).updated_at ?? (submission as any).created_at ?? new Date().toISOString(),
+            (submission as any).submitter?.provider ?? null,
+            (submission as any).submitter?.email ?? null,
+            (submission as any).submitter?.github_username ?? null,
+            submissionId
+          )
+          .run();
+        updated += 1;
+        restored += 1;
+      } else {
+        skipped += 1;
+      }
+    } else {
+      await env.DB.prepare(
+        "INSERT INTO submissions (id, form_id, user_id, payload_json, created_at, updated_at, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(
+          submissionId,
+          existingForm.id,
+          (submission as any).user_id ?? null,
+          payloadJson,
+          (submission as any).created_at ?? new Date().toISOString(),
+          (submission as any).updated_at ?? (submission as any).created_at ?? new Date().toISOString(),
+          (submission as any).submitter?.provider ?? null,
+          (submission as any).submitter?.email ?? null,
+          (submission as any).submitter?.github_username ?? null
+        )
+        .run();
+      created += 1;
+    }
+    const commentList = Array.isArray((submission as any).comments)
+      ? ((submission as any).comments as Array<Record<string, unknown>>)
+      : [];
+    if (commentList.length > 0) {
+      await importSubmissionComments(env, submissionId, commentList, null);
+      comments += commentList.length;
+    }
+  }
+  return { created, updated, restored, skipped, comments };
+}
+
 async function restoreFileItem(env: Env, fileId: string) {
   await updateRestoreTable(env, "submission_file_items", "id=?", [fileId]);
   const result = await env.DB.prepare(
@@ -9939,6 +10489,154 @@ export default {
           .bind(templateId, tpl.key, tpl.name, JSON.stringify(parsedSchema), fileRulesJson ?? "{}")
           .run();
         return jsonResponse(201, { ok: true, created: true, requestId }, requestId, corsHeaders);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/admin/backups/restore") {
+        let body: Record<string, unknown> | null = null;
+        try {
+          body = await parseJsonBody(request);
+        } catch (error) {
+          return errorResponse(400, "invalid_json", requestId, corsHeaders);
+        }
+        if (!body || typeof body.type !== "string") {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            message: "invalid_backup"
+          });
+        }
+        const restoreTrash = body.restoreTrash === true;
+        const backupType = body.type.toLowerCase();
+
+        if (backupType === "forms_backup") {
+          if (!Array.isArray(body.forms)) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              message: "missing_forms"
+            });
+          }
+          const results: Array<Record<string, unknown>> = [];
+          let created = 0;
+          let updated = 0;
+          let restored = 0;
+          let errors = 0;
+          for (const form of body.forms as Array<Record<string, unknown>>) {
+            const slug = typeof form?.slug === "string" ? form.slug : undefined;
+            try {
+              const result = await restoreFormFromBackup({
+                env,
+                form,
+                restoreTrash,
+                reminderEnabled: Boolean(body.reminderEnabled),
+                reminderFrequency:
+                  typeof body.reminderFrequency === "string" ? body.reminderFrequency : undefined,
+                reminderUntil:
+                  typeof body.reminderUntil === "string" ? body.reminderUntil : null
+              });
+              if (result.created) created += 1;
+              if (result.updated) updated += 1;
+              if (result.restored) restored += 1;
+              results.push({ slug, status: result.created ? "created" : "updated" });
+            } catch (error) {
+              if (isRestoreError(error)) {
+                errors += 1;
+                results.push({
+                  slug,
+                  status: "error",
+                  error: error.code,
+                  details: error.details ?? null
+                });
+                continue;
+              }
+              throw error;
+            }
+          }
+          const summary = {
+            total: (body.forms as Array<Record<string, unknown>>).length,
+            created,
+            updated,
+            restored,
+            errors
+          };
+          return jsonResponse(
+            200,
+            { ok: errors === 0, type: backupType, summary, results, requestId },
+            requestId,
+            corsHeaders
+          );
+        }
+
+        if (backupType === "templates_backup") {
+          if (!Array.isArray(body.templates)) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              message: "missing_templates"
+            });
+          }
+          const results: Array<Record<string, unknown>> = [];
+          let created = 0;
+          let updated = 0;
+          let restored = 0;
+          let errors = 0;
+          for (const template of body.templates as Array<Record<string, unknown>>) {
+            const key = typeof template?.key === "string" ? template.key : undefined;
+            try {
+              const result = await restoreTemplateFromBackup(env, template, restoreTrash);
+              if (result.created) created += 1;
+              if (result.updated) updated += 1;
+              if (result.restored) restored += 1;
+              results.push({ key, status: result.created ? "created" : "updated" });
+            } catch (error) {
+              if (isRestoreError(error)) {
+                errors += 1;
+                results.push({
+                  key,
+                  status: "error",
+                  error: error.code,
+                  details: error.details ?? null
+                });
+                continue;
+              }
+              throw error;
+            }
+          }
+          const summary = {
+            total: (body.templates as Array<Record<string, unknown>>).length,
+            created,
+            updated,
+            restored,
+            errors
+          };
+          return jsonResponse(
+            200,
+            { ok: errors === 0, type: backupType, summary, results, requestId },
+            requestId,
+            corsHeaders
+          );
+        }
+
+        if (backupType === "submission_backup") {
+          try {
+            const summary = await restoreSubmissionBackup(env, body, restoreTrash);
+            const total = Array.isArray(body.submissions) ? body.submissions.length : 0;
+            return jsonResponse(
+              200,
+              {
+                ok: true,
+                type: backupType,
+                summary: { total, ...summary },
+                requestId
+              },
+              requestId,
+              corsHeaders
+            );
+          } catch (error) {
+            if (isRestoreError(error)) {
+              return errorResponse(error.status, error.code, requestId, corsHeaders, error.details);
+            }
+            throw error;
+          }
+        }
+
+        return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+          message: "unsupported_backup_type"
+        });
       }
 
       if (request.method === "POST" && url.pathname === "/api/admin/trash/purge") {

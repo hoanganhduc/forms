@@ -8907,6 +8907,13 @@ function AdminPage({
     total: number;
   } | null>(null);
   const [statusActionId, setStatusActionId] = useState<string | null>(null);
+  const [backupRestorePayload, setBackupRestorePayload] = useState<Record<string, unknown> | null>(
+    null
+  );
+  const [backupRestoreFileName, setBackupRestoreFileName] = useState<string>("");
+  const [backupRestoreStatus, setBackupRestoreStatus] = useState<string | null>(null);
+  const [backupRestoreLoading, setBackupRestoreLoading] = useState(false);
+  const [backupRestoreTrash, setBackupRestoreTrash] = useState(false);
 
   useEffect(() => {
     setSettingsTimezone(appDefaultTimezone || getAppDefaultTimezone());
@@ -9118,6 +9125,70 @@ function AdminPage({
     setRoutineBulkStatus(null);
     setRoutineSelected(new Set());
     onNotice(nextEnabled ? "Selected routines enabled." : "Selected routines disabled.", "success");
+    loadAdmin();
+  }
+
+  function getBackupRestoreType(payload: Record<string, unknown> | null) {
+    return payload && typeof payload.type === "string" ? payload.type : "";
+  }
+
+  async function handleBackupRestoreFile(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    setBackupRestoreStatus(null);
+    setBackupRestorePayload(null);
+    setBackupRestoreFileName(file.name);
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== "object") {
+        setBackupRestoreStatus("Backup file must contain a JSON object.");
+        return;
+      }
+      if (typeof parsed.type !== "string") {
+        setBackupRestoreStatus("Backup file is missing a type field.");
+        return;
+      }
+      setBackupRestorePayload(parsed);
+      setBackupRestoreStatus(null);
+    } catch (error) {
+      setBackupRestoreStatus("Failed to read backup JSON.");
+    }
+  }
+
+  function formatBackupRestoreSummary(summary: any) {
+    if (!summary || typeof summary !== "object") return "Backup restored.";
+    const parts = [];
+    if (typeof summary.total === "number") parts.push(`total ${summary.total}`);
+    if (typeof summary.created === "number") parts.push(`created ${summary.created}`);
+    if (typeof summary.updated === "number") parts.push(`updated ${summary.updated}`);
+    if (typeof summary.restored === "number") parts.push(`restored ${summary.restored}`);
+    if (typeof summary.skipped === "number") parts.push(`skipped ${summary.skipped}`);
+    if (typeof summary.comments === "number") parts.push(`comments ${summary.comments}`);
+    if (typeof summary.errors === "number") parts.push(`errors ${summary.errors}`);
+    return parts.length > 0 ? `Backup restored (${parts.join(", ")}).` : "Backup restored.";
+  }
+
+  async function handleBackupRestore() {
+    if (!backupRestorePayload) {
+      setBackupRestoreStatus("Choose a backup JSON file first.");
+      return;
+    }
+    setBackupRestoreStatus(null);
+    setBackupRestoreLoading(true);
+    const response = await apiFetch(`${API_BASE}/api/admin/backups/restore`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...backupRestorePayload, restoreTrash: backupRestoreTrash })
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setBackupRestoreStatus(payload?.error || "Backup restore failed.");
+      setBackupRestoreLoading(false);
+      return;
+    }
+    setBackupRestoreStatus(formatBackupRestoreSummary(payload?.summary));
+    setBackupRestoreLoading(false);
     loadAdmin();
   }
 
@@ -10589,6 +10660,62 @@ function AdminPage({
             ) : null}
           </div>
         )}
+      </section>
+
+      <section className="panel panel--compact mb-3">
+        <div className="panel-header">
+          <h3 className="mb-0">Backup restore</h3>
+        </div>
+        <div className="row g-3">
+          <div className="col-md-6">
+            <label className="form-label">Backup JSON file</label>
+            <input
+              className="form-control"
+              type="file"
+              accept="application/json,.json"
+              onChange={handleBackupRestoreFile}
+            />
+            {backupRestoreFileName ? (
+              <div className="muted mt-1">Selected: {backupRestoreFileName}</div>
+            ) : null}
+          </div>
+          <div className="col-md-6">
+            <label className="form-label">Detected type</label>
+            <div className="form-control-plaintext">
+              {getBackupRestoreType(backupRestorePayload) || "n/a"}
+            </div>
+            <div className="form-check mt-2">
+              <input
+                className="form-check-input"
+                type="checkbox"
+                checked={backupRestoreTrash}
+                onChange={(event) => setBackupRestoreTrash(event.target.checked)}
+                id="backupRestoreTrash"
+              />
+              <label className="form-check-label" htmlFor="backupRestoreTrash">
+                Restore items even if in trash
+              </label>
+            </div>
+          </div>
+          <div className="col-12 d-flex flex-wrap gap-2 align-items-center">
+            <button
+              type="button"
+              className="btn btn-outline-primary"
+              disabled={backupRestoreLoading || !backupRestorePayload}
+              onClick={handleBackupRestore}
+            >
+              <i className="bi bi-arrow-counterclockwise" aria-hidden="true" /> Restore backup
+            </button>
+            <div className="muted">
+              Supports forms, templates, and submission backup JSON.
+            </div>
+          </div>
+          {backupRestoreStatus ? (
+            <div className="col-12">
+              <div className="alert alert-info mb-0">{backupRestoreStatus}</div>
+            </div>
+          ) : null}
+        </div>
       </section>
 
       <section className="panel panel--compact mb-3">
