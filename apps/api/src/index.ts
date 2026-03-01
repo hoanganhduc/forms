@@ -78,6 +78,8 @@ type FormDetailRow = {
   canvas_fields_position?: string | null;
   reminder_enabled?: number;
   reminder_frequency?: string | null;
+  resubmission_period_days?: number | null;
+  reminder_repeat_days?: number | null;
   reminder_until?: string | null;
   save_all_versions?: number | null;
   submission_backup_enabled?: number | null;
@@ -116,6 +118,8 @@ type AdminFormRow = {
   canvas_fields_position?: string | null;
   reminder_enabled?: number;
   reminder_frequency?: string | null;
+  resubmission_period_days?: number | null;
+  reminder_repeat_days?: number | null;
   reminder_until?: string | null;
   save_all_versions?: number | null;
   discussion_enabled?: number | null;
@@ -335,6 +339,18 @@ function toBoolean(value: number | null): boolean {
   return value ? value !== 0 : false;
 }
 
+async function hasTable(env: Env, table: string): Promise<boolean> {
+  if (!/^[a-zA-Z0-9_]+$/.test(table)) {
+    return false;
+  }
+  const row = await env.DB.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1"
+  )
+    .bind(table)
+    .first<{ "1": number }>();
+  return Boolean(row);
+}
+
 async function hasColumn(env: Env, table: string, column: string): Promise<boolean> {
   if (!/^[a-zA-Z0-9_]+$/.test(table) || !/^[a-zA-Z0-9_]+$/.test(column)) {
     return false;
@@ -398,6 +414,108 @@ function normalizeDateTimeInput(value: unknown): string | null {
   const time = parseIsoTime(trimmed);
   if (!time) return null;
   return new Date(time).toISOString();
+}
+
+const DEFAULT_RESUBMISSION_PERIOD_DAYS = 14;
+const DEFAULT_REMINDER_REPEAT_DAYS = 2;
+
+function normalizeEmailAddress(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().toLowerCase();
+  return trimmed ? trimmed : null;
+}
+
+function parsePositiveInteger(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const normalized = Math.floor(value);
+    return normalized >= 1 ? normalized : null;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const normalized = Math.floor(Number(value));
+    return Number.isFinite(normalized) && normalized >= 1 ? normalized : null;
+  }
+  return null;
+}
+
+function parseLegacyReminderFrequencyDays(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === "daily") return 1;
+  if (normalized === "weekly") return 7;
+  if (normalized === "monthly") return 30;
+  const match = /^(\d+):(days|weeks|months)$/.exec(normalized);
+  if (!match) return null;
+  const count = Number(match[1]);
+  if (!Number.isFinite(count) || count < 1) return null;
+  if (match[2] === "days") return count;
+  if (match[2] === "weeks") return count * 7;
+  return count * 30;
+}
+
+function getFormResubmissionPeriodDays(row: {
+  resubmission_period_days?: number | null;
+  reminder_frequency?: string | null;
+}): number {
+  return (
+    parsePositiveInteger(row.resubmission_period_days) ??
+    parseLegacyReminderFrequencyDays(row.reminder_frequency) ??
+    DEFAULT_RESUBMISSION_PERIOD_DAYS
+  );
+}
+
+function getFormReminderRepeatDays(row: {
+  reminder_repeat_days?: number | null;
+}): number {
+  return parsePositiveInteger(row.reminder_repeat_days) ?? DEFAULT_REMINDER_REPEAT_DAYS;
+}
+
+function deriveReminderPolicyDays(input: {
+  reminder_frequency?: string | null;
+  resubmission_period_days?: number | null;
+  reminder_repeat_days?: number | null;
+}): { resubmissionPeriodDays: number; reminderRepeatDays: number } {
+  return {
+    resubmissionPeriodDays: getFormResubmissionPeriodDays(input),
+    reminderRepeatDays: getFormReminderRepeatDays(input)
+  };
+}
+
+function addDaysToIso(value: string | null | undefined, days: number): string | null {
+  const time = parseIsoTime(value ?? null);
+  if (time === null) return null;
+  return new Date(time + days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function buildReminderRecipientKey(userId: string | null | undefined, email: string | null): string | null {
+  if (email) return `email:${email}`;
+  const trimmedUserId = typeof userId === "string" ? userId.trim() : "";
+  if (trimmedUserId) return `user:${trimmedUserId}`;
+  return null;
+}
+
+async function resolveReminderRecipientIdentity(
+  env: Env,
+  userId: string | null | undefined,
+  submitterEmail: string | null | undefined
+): Promise<{ recipientKey: string; userId: string | null; email: string | null } | null> {
+  const trimmedUserId = typeof userId === "string" && userId.trim() ? userId.trim() : null;
+  let email = normalizeEmailAddress(submitterEmail);
+  if (!email && trimmedUserId) {
+    email = normalizeEmailAddress(await getUserPrimaryEmail(env, trimmedUserId));
+  }
+  const recipientKey = buildReminderRecipientKey(trimmedUserId, email);
+  if (!recipientKey) return null;
+  return {
+    recipientKey,
+    userId: trimmedUserId,
+    email
+  };
+}
+
+function buildLegacyReminderFrequency(days: number): string {
+  const normalized = parsePositiveInteger(days) ?? DEFAULT_RESUBMISSION_PERIOD_DAYS;
+  return `${normalized}:days`;
 }
 
 function getFormAvailability(form: {
@@ -1232,6 +1350,9 @@ async function getFormWithRules(env: Env, slug: string) {
     "password_hash",
     "reminder_enabled",
     "reminder_frequency",
+    "resubmission_period_days",
+    "reminder_repeat_days",
+    "reminder_until",
     "save_all_versions",
     "discussion_enabled",
     "discussion_markdown_enabled",
@@ -1349,7 +1470,11 @@ async function buildFormDetailPayload(env: Env, row: FormDetailRow) {
       canvas_allowed_sections: canvasSections,
       canvas_fields_position: row.canvas_fields_position ?? "bottom",
       reminder_enabled: toBoolean(row.reminder_enabled ?? 0),
-      reminder_frequency: row.reminder_frequency ?? "weekly",
+      reminder_frequency:
+        row.reminder_frequency ?? buildLegacyReminderFrequency(getFormResubmissionPeriodDays(row)),
+      resubmission_period_days: getFormResubmissionPeriodDays(row),
+      reminder_repeat_days: getFormReminderRepeatDays(row),
+      reminder_until: row.reminder_until ?? null,
       save_all_versions: toBoolean(row.save_all_versions ?? 0),
       discussion_enabled: toBoolean(row.discussion_enabled ?? 0),
       discussion_markdown_enabled: toBoolean(row.discussion_markdown_enabled ?? 1),
@@ -1750,6 +1875,7 @@ type PeriodicReminderStats = {
   submissionsTotal: number;
   submissionsMissingEmail: number;
   usersTotal: number;
+  usersDisabled: number;
   usersDue: number;
   usersNotDue: number;
   emailsSent: number;
@@ -1773,6 +1899,7 @@ type PeriodicReminderFormStats = {
   submissionsTotal: number;
   submissionsMissingEmail: number;
   usersTotal: number;
+  usersDisabled: number;
   usersDue: number;
   usersNotDue: number;
   emailsSent: number;
@@ -1816,10 +1943,10 @@ function formatPeriodicReminderStatus(status: PeriodicReminderFormStatus): strin
 
 function formatPeriodicReminderFormDetail(entry: PeriodicReminderFormStats): string {
   const statusLabel = formatPeriodicReminderStatus(entry.status);
-  const freqLabel = entry.frequency || "weekly";
+  const freqLabel = entry.frequency || "due:14d repeat:2d";
   const parts = [
     `${entry.slug}[${statusLabel} f:${freqLabel}]`,
-    `users ${entry.usersTotal} (due ${entry.usersDue})`,
+    `users ${entry.usersTotal} (disabled ${entry.usersDisabled}, due ${entry.usersDue})`,
     `emails sent ${entry.emailsSent}, skipped ${entry.emailsAlreadySent}, failed ${entry.emailsFailed}`,
     `no_email ${entry.submissionsMissingEmail}`
   ];
@@ -1868,7 +1995,7 @@ function buildPeriodicReminderSummary(
     `skipped not_open ${stats.formsSkippedNotOpen}, closed ${stats.formsSkippedClosed}, expired ${stats.formsSkippedExpired}`,
     `no_recipients ${stats.formsNoRecipients}`,
     `submissions ${stats.submissionsTotal} (no_email ${stats.submissionsMissingEmail})`,
-    `users ${stats.usersTotal} (due ${stats.usersDue}, not_due ${stats.usersNotDue})`,
+    `users ${stats.usersTotal} (disabled ${stats.usersDisabled}, due ${stats.usersDue}, not_due ${stats.usersNotDue})`,
     `emails sent ${stats.emailsSent}, skipped ${stats.emailsAlreadySent}, failed ${stats.emailsFailed}`
   ];
   const errorSummary = formatPeriodicReminderErrorSummary(errorCounts);
@@ -1882,10 +2009,272 @@ function buildPeriodicReminderSummary(
   return truncatePeriodicReminderMessage(parts.join("; "), 900);
 }
 
+type ReminderRecipientSyncResult = {
+  submissionsTotal: number;
+  submissionsMissingEmail: number;
+  recipientsTotal: number;
+  recipientsDisabled: number;
+};
+
+type FormReminderRecipientRow = {
+  form_id: string;
+  recipient_key: string;
+  user_id: string | null;
+  email: string | null;
+  enabled: number;
+  latest_submission_at: string | null;
+  last_submission_id: string | null;
+  first_due_at: string | null;
+  next_reminder_at: string | null;
+  last_reminder_sent_at: string | null;
+  last_reminder_status: string | null;
+};
+
+function formatReminderScheduleLabel(
+  resubmissionPeriodDays: number,
+  reminderRepeatDays: number
+): string {
+  return `due:${resubmissionPeriodDays}d repeat:${reminderRepeatDays}d`;
+}
+
+async function hasReminderRecipientState(env: Env): Promise<boolean> {
+  return hasTable(env, "form_reminder_recipients");
+}
+
+async function syncFormReminderRecipientsFromSubmissions(
+  env: Env,
+  formId: string,
+  policy: {
+    reminder_frequency?: string | null;
+    resubmission_period_days?: number | null;
+    reminder_repeat_days?: number | null;
+  }
+): Promise<ReminderRecipientSyncResult> {
+  const emptyResult: ReminderRecipientSyncResult = {
+    submissionsTotal: 0,
+    submissionsMissingEmail: 0,
+    recipientsTotal: 0,
+    recipientsDisabled: 0
+  };
+  if (!(await hasReminderRecipientState(env))) {
+    return emptyResult;
+  }
+
+  const resubmissionPeriodDays = getFormResubmissionPeriodDays(policy);
+  const reminderRepeatDays = getFormReminderRepeatDays(policy);
+  const { results: submissions } = await env.DB.prepare(
+    "SELECT s.id, s.user_id, COALESCE(s.submitter_email, (SELECT ui.email FROM user_identities ui WHERE ui.user_id=s.user_id AND ui.email IS NOT NULL ORDER BY CASE ui.provider WHEN 'google' THEN 0 ELSE 1 END, ui.created_at ASC LIMIT 1)) as submitter_email, COALESCE(s.updated_at, s.created_at) as activity_at FROM submissions s WHERE s.form_id=? AND s.deleted_at IS NULL ORDER BY datetime(COALESCE(s.updated_at, s.created_at)) DESC, s.id DESC"
+  )
+    .bind(formId)
+    .all<{ id: string; user_id: string | null; submitter_email: string | null; activity_at: string | null }>();
+
+  const grouped = new Map<
+    string,
+    { userId: string | null; email: string | null; latestSubmissionAt: string; lastSubmissionId: string }
+  >();
+  let submissionsMissingEmail = 0;
+
+  for (const submission of submissions) {
+    const email = normalizeEmailAddress(submission.submitter_email);
+    if (!email) {
+      submissionsMissingEmail += 1;
+    }
+    const recipientKey = buildReminderRecipientKey(submission.user_id, email);
+    if (!recipientKey) continue;
+    const activityAt =
+      normalizeDateTimeInput(submission.activity_at) ??
+      normalizeDateTimeInput(new Date().toISOString());
+    if (!activityAt) continue;
+    if (!grouped.has(recipientKey)) {
+      grouped.set(recipientKey, {
+        userId: submission.user_id ?? null,
+        email,
+        latestSubmissionAt: activityAt,
+        lastSubmissionId: submission.id
+      });
+    }
+  }
+
+  const { results: existingRows } = await env.DB.prepare(
+    "SELECT form_id, recipient_key, user_id, email, enabled, latest_submission_at, last_submission_id, first_due_at, next_reminder_at, last_reminder_sent_at, last_reminder_status FROM form_reminder_recipients WHERE form_id=?"
+  )
+    .bind(formId)
+    .all<FormReminderRecipientRow>();
+  const existingByKey = new Map(existingRows.map((row) => [row.recipient_key, row]));
+
+  for (const [recipientKey, recipient] of grouped.entries()) {
+    const existing = existingByKey.get(recipientKey);
+    const firstDueAt = addDaysToIso(recipient.latestSubmissionAt, resubmissionPeriodDays);
+    let nextReminderAt = firstDueAt;
+    const existingLastSentAt = existing?.last_reminder_sent_at ?? null;
+    const firstDueTime = parseIsoTime(firstDueAt);
+    const lastSentTime = parseIsoTime(existingLastSentAt);
+    if (firstDueTime !== null && lastSentTime !== null && lastSentTime >= firstDueTime) {
+      nextReminderAt = addDaysToIso(existingLastSentAt, reminderRepeatDays) ?? firstDueAt;
+    }
+    if (existing) {
+      await env.DB.prepare(
+        "UPDATE form_reminder_recipients SET user_id=?, email=?, latest_submission_at=?, last_submission_id=?, first_due_at=?, next_reminder_at=?, updated_at=datetime('now') WHERE form_id=? AND recipient_key=?"
+      )
+        .bind(
+          recipient.userId,
+          recipient.email,
+          recipient.latestSubmissionAt,
+          recipient.lastSubmissionId,
+          firstDueAt,
+          nextReminderAt,
+          formId,
+          recipientKey
+        )
+        .run();
+    } else {
+      await env.DB.prepare(
+        "INSERT INTO form_reminder_recipients (form_id, recipient_key, user_id, email, enabled, latest_submission_at, last_submission_id, first_due_at, next_reminder_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)"
+      )
+        .bind(
+          formId,
+          recipientKey,
+          recipient.userId,
+          recipient.email,
+          recipient.latestSubmissionAt,
+          recipient.lastSubmissionId,
+          firstDueAt,
+          nextReminderAt
+        )
+        .run();
+    }
+  }
+
+  for (const row of existingRows) {
+    if (!grouped.has(row.recipient_key)) {
+      await env.DB.prepare(
+        "DELETE FROM form_reminder_recipients WHERE form_id=? AND recipient_key=?"
+      )
+        .bind(formId, row.recipient_key)
+        .run();
+    }
+  }
+
+  let recipientsDisabled = 0;
+  for (const recipientKey of grouped.keys()) {
+    const existing = existingByKey.get(recipientKey);
+    if (existing && !toBoolean(existing.enabled)) {
+      recipientsDisabled += 1;
+    }
+  }
+
+  return {
+    submissionsTotal: submissions.length,
+    submissionsMissingEmail,
+    recipientsTotal: grouped.size,
+    recipientsDisabled
+  };
+}
+
+async function upsertFormReminderRecipientFromSubmission(
+  env: Env,
+  input: {
+    formId: string;
+    reminder_frequency?: string | null;
+    resubmission_period_days?: number | null;
+    reminder_repeat_days?: number | null;
+    userId: string | null | undefined;
+    submitterEmail: string | null | undefined;
+    submissionId: string;
+    submittedAt: string;
+  }
+): Promise<void> {
+  if (!(await hasReminderRecipientState(env))) {
+    return;
+  }
+  const identity = await resolveReminderRecipientIdentity(env, input.userId, input.submitterEmail);
+  if (!identity) return;
+
+  const resubmissionPeriodDays = getFormResubmissionPeriodDays(input);
+  const firstDueAt = addDaysToIso(input.submittedAt, resubmissionPeriodDays);
+  const existing = await env.DB.prepare(
+    "SELECT enabled FROM form_reminder_recipients WHERE form_id=? AND recipient_key=?"
+  )
+    .bind(input.formId, identity.recipientKey)
+    .first<{ enabled: number }>();
+
+  if (existing) {
+    await env.DB.prepare(
+      "UPDATE form_reminder_recipients SET user_id=?, email=?, latest_submission_at=?, last_submission_id=?, first_due_at=?, next_reminder_at=?, updated_at=datetime('now') WHERE form_id=? AND recipient_key=?"
+    )
+      .bind(
+        identity.userId,
+        identity.email,
+        input.submittedAt,
+        input.submissionId,
+        firstDueAt,
+        firstDueAt,
+        input.formId,
+        identity.recipientKey
+      )
+      .run();
+    return;
+  }
+
+  await env.DB.prepare(
+    "INSERT INTO form_reminder_recipients (form_id, recipient_key, user_id, email, enabled, latest_submission_at, last_submission_id, first_due_at, next_reminder_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)"
+  )
+    .bind(
+      input.formId,
+      identity.recipientKey,
+      identity.userId,
+      identity.email,
+      input.submittedAt,
+      input.submissionId,
+      firstDueAt,
+      firstDueAt
+    )
+    .run();
+}
+
 async function runPeriodicReminders(env: Env): Promise<PeriodicReminderResult> {
+  if (!(await hasReminderRecipientState(env))) {
+    return {
+      stats: {
+        formsTotal: 0,
+        formsEligible: 0,
+        formsSkippedNotOpen: 0,
+        formsSkippedClosed: 0,
+        formsSkippedExpired: 0,
+        formsNoRecipients: 0,
+        submissionsTotal: 0,
+        submissionsMissingEmail: 0,
+        usersTotal: 0,
+        usersDisabled: 0,
+        usersDue: 0,
+        usersNotDue: 0,
+        emailsSent: 0,
+        emailsAlreadySent: 0,
+        emailsFailed: 0
+      },
+      message: "reminder_state_table_missing"
+    };
+  }
+
+  const resubmissionPeriodSelect = (await hasColumn(env, "forms", "resubmission_period_days"))
+    ? "resubmission_period_days"
+    : "NULL as resubmission_period_days";
+  const reminderRepeatSelect = (await hasColumn(env, "forms", "reminder_repeat_days"))
+    ? "reminder_repeat_days"
+    : "NULL as reminder_repeat_days";
   const { results: forms } = await env.DB.prepare(
-    "SELECT id, slug, title, reminder_frequency, reminder_until, available_from, available_until FROM forms WHERE reminder_enabled=1 AND deleted_at IS NULL"
-  ).all<{ id: string; slug: string; title: string; reminder_frequency: string; reminder_until: string | null; available_from: string | null; available_until: string | null }>();
+    `SELECT id, slug, title, reminder_frequency, ${resubmissionPeriodSelect}, ${reminderRepeatSelect}, reminder_until, available_from, available_until FROM forms WHERE reminder_enabled=1 AND deleted_at IS NULL`
+  ).all<{
+    id: string;
+    slug: string;
+    title: string;
+    reminder_frequency: string | null;
+    resubmission_period_days: number | null;
+    reminder_repeat_days: number | null;
+    reminder_until: string | null;
+    available_from: string | null;
+    available_until: string | null;
+  }>();
 
   const stats: PeriodicReminderStats = {
     formsTotal: forms?.length ?? 0,
@@ -1897,6 +2286,7 @@ async function runPeriodicReminders(env: Env): Promise<PeriodicReminderResult> {
     submissionsTotal: 0,
     submissionsMissingEmail: 0,
     usersTotal: 0,
+    usersDisabled: 0,
     usersDue: 0,
     usersNotDue: 0,
     emailsSent: 0,
@@ -1918,7 +2308,9 @@ async function runPeriodicReminders(env: Env): Promise<PeriodicReminderResult> {
   today.setHours(0, 0, 0, 0);
 
   for (const form of forms) {
-    const frequency = form.reminder_frequency || "weekly";
+    const resubmissionPeriodDays = getFormResubmissionPeriodDays(form);
+    const reminderRepeatDays = getFormReminderRepeatDays(form);
+    const frequency = formatReminderScheduleLabel(resubmissionPeriodDays, reminderRepeatDays);
     const perForm: PeriodicReminderFormStats = {
       formId: form.id,
       slug: form.slug,
@@ -1928,6 +2320,7 @@ async function runPeriodicReminders(env: Env): Promise<PeriodicReminderResult> {
       submissionsTotal: 0,
       submissionsMissingEmail: 0,
       usersTotal: 0,
+      usersDisabled: 0,
       usersDue: 0,
       usersNotDue: 0,
       emailsSent: 0,
@@ -1972,95 +2365,72 @@ async function runPeriodicReminders(env: Env): Promise<PeriodicReminderResult> {
 
     stats.formsEligible += 1;
 
-    // Get all submissions for this form
-    const { results: submissions } = await env.DB.prepare(
-      "SELECT user_id, submitter_email, created_at FROM submissions WHERE form_id=? AND deleted_at IS NULL ORDER BY created_at ASC"
-    ).bind(form.id).all<{ user_id: string | null; submitter_email: string | null; created_at: string }>();
+    const syncResult = await syncFormReminderRecipientsFromSubmissions(env, form.id, form);
+    stats.submissionsTotal += syncResult.submissionsTotal;
+    stats.submissionsMissingEmail += syncResult.submissionsMissingEmail;
+    stats.usersTotal += syncResult.recipientsTotal;
+    stats.usersDisabled += syncResult.recipientsDisabled;
+    perForm.submissionsTotal = syncResult.submissionsTotal;
+    perForm.submissionsMissingEmail = syncResult.submissionsMissingEmail;
+    perForm.usersTotal = syncResult.recipientsTotal;
+    perForm.usersDisabled = syncResult.recipientsDisabled;
 
-    stats.submissionsTotal += submissions.length;
-    perForm.submissionsTotal = submissions.length;
-
-    // Group by user (email or user_id)
-    const userMap = new Map<string, { email: string; firstSubmission: Date }>();
-
-    for (const sub of submissions) {
-      const email = sub.submitter_email ? sub.submitter_email.trim().toLowerCase() : null;
-      // If we don't have an email, we can't email them.
-      // If user_id is present but no email in submission, we might need to look up identity?
-      // For now rely on submitter_email which is populated for auth users or if they fill email field (if we map it)
-      // Actually submitter_email is only populated if authenticated or logic sets it.
-      if (!email) {
-        stats.submissionsMissingEmail += 1;
-        perForm.submissionsMissingEmail += 1;
-        continue;
-      }
-
-      if (!userMap.has(email)) {
-        userMap.set(email, { email, firstSubmission: new Date(sub.created_at) });
-      }
-    }
-
-    stats.usersTotal += userMap.size;
-    perForm.usersTotal = userMap.size;
-    if (userMap.size === 0) {
+    const { results: recipients } = await env.DB.prepare(
+      "SELECT form_id, recipient_key, user_id, email, enabled, latest_submission_at, last_submission_id, first_due_at, next_reminder_at, last_reminder_sent_at, last_reminder_status FROM form_reminder_recipients WHERE form_id=? ORDER BY datetime(COALESCE(next_reminder_at, first_due_at, latest_submission_at)) ASC"
+    )
+      .bind(form.id)
+      .all<FormReminderRecipientRow>();
+    const activeRecipients = recipients.filter(
+      (recipient) => toBoolean(recipient.enabled) && Boolean(recipient.email)
+    );
+    if (activeRecipients.length === 0) {
       stats.formsNoRecipients += 1;
       perForm.status = "no_recipients";
       formStats.push(perForm);
       continue;
     }
 
-    for (const user of userMap.values()) {
-      const firstSub = user.firstSubmission;
-      firstSub.setHours(0, 0, 0, 0);
-
-      const diffTime = Math.abs(today.getTime() - firstSub.getTime());
-      const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-
-      let shouldSend = false;
-      const freq = frequency || "1:weeks";
-      let value = 1;
-      let unit = "weeks";
-
-      if (freq.includes(":")) {
-        const parts = freq.split(":");
-        value = parseInt(parts[0]) || 1;
-        unit = parts[1] || "weeks";
-      } else {
-        // Backward compatibility
-        if (freq === "daily") { value = 1; unit = "days"; }
-        else if (freq === "monthly") { value = 1; unit = "months"; }
-        else { value = 1; unit = "weeks"; }
+    for (const recipient of recipients) {
+      if (!toBoolean(recipient.enabled)) {
+        continue;
       }
-
-      if (unit === "days") {
-        if (diffDays > 0 && diffDays % value === 0) shouldSend = true;
-      } else if (unit === "weeks") {
-        if (diffDays > 0 && diffDays % (value * 7) === 0) shouldSend = true;
-      } else if (unit === "months") {
-        const monthDiff = (today.getFullYear() - firstSub.getFullYear()) * 12 + (today.getMonth() - firstSub.getMonth());
-        if (monthDiff > 0 && monthDiff % value === 0 && today.getDate() === firstSub.getDate()) {
-          shouldSend = true;
-        }
-      }
-
-      if (!shouldSend) {
+      if (!recipient.email) {
         stats.usersNotDue += 1;
         perForm.usersNotDue += 1;
         continue;
       }
+      const nextReminderAt = recipient.next_reminder_at ?? recipient.first_due_at;
+      const nextReminderTime = parseIsoTime(nextReminderAt);
+      if (nextReminderTime === null || nextReminderTime > now.getTime()) {
+        stats.usersNotDue += 1;
+        perForm.usersNotDue += 1;
+        continue;
+      }
+      if (recipient.last_reminder_sent_at) {
+        const lastReminderTime = parseIsoTime(recipient.last_reminder_sent_at);
+        if (
+          lastReminderTime !== null &&
+          lastReminderTime + reminderRepeatDays * 24 * 60 * 60 * 1000 > now.getTime()
+        ) {
+          const nextDue = addDaysToIso(recipient.last_reminder_sent_at, reminderRepeatDays);
+          if (nextDue) {
+            await env.DB.prepare(
+              "UPDATE form_reminder_recipients SET next_reminder_at=?, updated_at=datetime('now') WHERE form_id=? AND recipient_key=?"
+            )
+              .bind(nextDue, form.id, recipient.recipient_key)
+              .run();
+          }
+          stats.usersNotDue += 1;
+          perForm.usersNotDue += 1;
+          stats.emailsAlreadySent += 1;
+          perForm.emailsAlreadySent += 1;
+          continue;
+        }
+      }
 
       stats.usersDue += 1;
       perForm.usersDue += 1;
-      // Check if we already sent an email today to this user for this form
-      // We can check email_logs
-      // This is expensive per user. Optimally we'd do a batch check or have a reminders table.
-      // For MVP, we'll just check loosely or assume the cron runs once.
-      // But if we want to be safe:
-      const sentToday = await env.DB.prepare(
-        "SELECT id FROM email_logs WHERE to_email=? AND form_id=? AND trigger_source='periodic_reminder' AND created_at > datetime('now', '-20 hours')"
-      ).bind(user.email, form.id).first();
-
-      if (sentToday) {
+      if (!recipient.email) {
         stats.emailsAlreadySent += 1;
         perForm.emailsAlreadySent += 1;
         continue;
@@ -2080,24 +2450,50 @@ async function runPeriodicReminders(env: Env): Promise<PeriodicReminderResult> {
 
       try {
         const result = await sendGmailMessage(env, {
-          to: user.email,
+          to: recipient.email,
           subject: subjectLine,
           body: mailBody
         });
+        const sentAt = new Date().toISOString();
+        const nextDueAt = addDaysToIso(sentAt, reminderRepeatDays);
 
         if (result.ok) {
           stats.emailsSent += 1;
           perForm.emailsSent += 1;
+          await env.DB.prepare(
+            "UPDATE form_reminder_recipients SET email=?, user_id=?, last_reminder_sent_at=?, last_reminder_status=?, next_reminder_at=?, updated_at=datetime('now') WHERE form_id=? AND recipient_key=?"
+          )
+            .bind(
+              recipient.email,
+              recipient.user_id ?? null,
+              sentAt,
+              "sent",
+              nextDueAt,
+              form.id,
+              recipient.recipient_key
+            )
+            .run();
         } else {
           stats.emailsFailed += 1;
           perForm.emailsFailed += 1;
           const normalized = normalizePeriodicReminderError(result.error);
           errorCounts.set(normalized, (errorCounts.get(normalized) || 0) + 1);
           formErrorCounts.set(normalized, (formErrorCounts.get(normalized) || 0) + 1);
+          await env.DB.prepare(
+            "UPDATE form_reminder_recipients SET email=?, user_id=?, last_reminder_status=?, updated_at=datetime('now') WHERE form_id=? AND recipient_key=?"
+          )
+            .bind(
+              recipient.email,
+              recipient.user_id ?? null,
+              normalized,
+              form.id,
+              recipient.recipient_key
+            )
+            .run();
         }
 
         await logEmailSend(env, {
-          to: user.email,
+          to: recipient.email,
           subject: subjectLine,
           body: mailBody,
           status: result.ok ? "sent" : "failed",
@@ -2115,8 +2511,19 @@ async function runPeriodicReminders(env: Env): Promise<PeriodicReminderResult> {
         );
         errorCounts.set(normalized, (errorCounts.get(normalized) || 0) + 1);
         formErrorCounts.set(normalized, (formErrorCounts.get(normalized) || 0) + 1);
+        await env.DB.prepare(
+          "UPDATE form_reminder_recipients SET email=?, user_id=?, last_reminder_status=?, updated_at=datetime('now') WHERE form_id=? AND recipient_key=?"
+        )
+          .bind(
+            recipient.email,
+            recipient.user_id ?? null,
+            normalized,
+            form.id,
+            recipient.recipient_key
+          )
+          .run();
         await logEmailSend(env, {
-          to: user.email,
+          to: recipient.email,
           subject: subjectLine,
           body: mailBody,
           status: "failed",
@@ -5377,6 +5784,8 @@ async function restoreFormFromBackup(input: {
   restoreTrash: boolean;
   reminderEnabled?: boolean;
   reminderFrequency?: string;
+  resubmissionPeriodDays?: number | null;
+  reminderRepeatDays?: number | null;
   reminderUntil?: string | null;
   submissions?: Array<Record<string, unknown>>;
 }): Promise<{ created?: boolean; updated?: boolean; restored?: boolean }> {
@@ -5387,6 +5796,8 @@ async function restoreFormFromBackup(input: {
     restoreTrash,
     reminderEnabled,
     reminderFrequency,
+    resubmissionPeriodDays,
+    reminderRepeatDays,
     reminderUntil,
     submissions
   } = input;
@@ -5565,13 +5976,26 @@ async function restoreFormFromBackup(input: {
   const submissionBackupEnabled = Boolean(form.submission_backup_enabled);
   const submissionBackupFormats = parseSubmissionBackupFormats(form.submission_backup_formats);
   const formVersionSchema = formSchemaJson || templateSchemaJson;
+  const reminderPolicy = deriveReminderPolicyDays({
+    reminder_frequency:
+      reminderFrequency ??
+      (typeof form.reminder_frequency === "string" ? form.reminder_frequency : null),
+    resubmission_period_days:
+      resubmissionPeriodDays ?? parsePositiveInteger(form.resubmission_period_days) ?? null,
+    reminder_repeat_days:
+      reminderRepeatDays ?? parsePositiveInteger(form.reminder_repeat_days) ?? null
+  });
+  const reminderEnabledValue = reminderEnabled ?? Boolean(form.reminder_enabled);
+  const normalizedReminderUntil = normalizeDateTimeInput(
+    reminderUntil !== undefined ? reminderUntil : form.reminder_until ?? null
+  );
 
   if (existingForm?.id && existingForm.deleted_at !== null && !restoreTrash) {
     throwRestoreError(409, "conflict", { message: "slug_in_trash" });
   }
   if (existingForm?.id) {
     await env.DB.prepare(
-      "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_require_access=?, password_require_submit=?, password_salt=?, password_hash=?, submission_backup_enabled=?, submission_backup_formats=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
+      "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_require_access=?, password_require_submit=?, password_salt=?, password_hash=?, reminder_enabled=?, reminder_frequency=?, resubmission_period_days=?, reminder_repeat_days=?, reminder_until=?, submission_backup_enabled=?, submission_backup_formats=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
     )
       .bind(
         form.title,
@@ -5592,6 +6016,11 @@ async function restoreFormFromBackup(input: {
         passwordRequireSubmit ? 1 : 0,
         passwordRequired ? passwordSalt : null,
         passwordRequired ? passwordHash : null,
+        reminderEnabledValue ? 1 : 0,
+        buildLegacyReminderFrequency(reminderPolicy.resubmissionPeriodDays),
+        reminderPolicy.resubmissionPeriodDays,
+        reminderPolicy.reminderRepeatDays,
+        normalizedReminderUntil,
         submissionBackupEnabled ? 1 : 0,
         serializeSubmissionBackupFormats(submissionBackupFormats),
         existingForm.id
@@ -5621,6 +6050,21 @@ async function restoreFormFromBackup(input: {
     if (Array.isArray(submissions)) {
       for (const submission of submissions) {
         if (!submission || typeof submission !== "object") continue;
+        const submitter =
+          submission.submitter && typeof submission.submitter === "object"
+            ? (submission.submitter as Record<string, unknown>)
+            : null;
+        const comments = Array.isArray(submission.comments)
+          ? (submission.comments as Array<Record<string, unknown>>)
+          : [];
+        const submitterProvider =
+          submitter && typeof submitter.provider === "string" ? submitter.provider : null;
+        const submitterEmail =
+          submitter && typeof submitter.email === "string" ? submitter.email : null;
+        const submitterGithub =
+          submitter && typeof submitter.github_username === "string"
+            ? submitter.github_username
+            : null;
         const submissionId =
           typeof submission.id === "string" && submission.id.trim()
             ? submission.id.trim()
@@ -5641,20 +6085,25 @@ async function restoreFormFromBackup(input: {
             payloadJson,
             submission.created_at ?? new Date().toISOString(),
             submission.updated_at ?? submission.created_at ?? new Date().toISOString(),
-            submission.submitter?.provider ?? null,
-            submission.submitter?.email ?? null,
-            submission.submitter?.github_username ?? null
+            submitterProvider,
+            submitterEmail,
+            submitterGithub
           )
           .run();
-        await importSubmissionComments(env, submissionId, submission.comments || [], null);
+        await importSubmissionComments(env, submissionId, comments, null);
       }
     }
+    await syncFormReminderRecipientsFromSubmissions(env, existingForm.id, {
+      reminder_frequency: buildLegacyReminderFrequency(reminderPolicy.resubmissionPeriodDays),
+      resubmission_period_days: reminderPolicy.resubmissionPeriodDays,
+      reminder_repeat_days: reminderPolicy.reminderRepeatDays
+    });
     return { updated: true, restored: existingForm.deleted_at !== null };
   }
 
   const formId = crypto.randomUUID();
   await env.DB.prepare(
-    "INSERT INTO forms (id, slug, title, description, template_id, is_public, is_locked, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, reminder_enabled, reminder_frequency, reminder_until, submission_backup_enabled, submission_backup_formats) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO forms (id, slug, title, description, template_id, is_public, is_locked, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, reminder_enabled, reminder_frequency, resubmission_period_days, reminder_repeat_days, reminder_until, submission_backup_enabled, submission_backup_formats) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   )
     .bind(
       formId,
@@ -5677,9 +6126,11 @@ async function restoreFormFromBackup(input: {
       passwordRequireSubmit ? 1 : 0,
       passwordRequired ? passwordSalt : null,
       passwordRequired ? passwordHash : null,
-      reminderEnabled ? 1 : 0,
-      reminderFrequency || "weekly",
-      reminderUntil || null,
+      reminderEnabledValue ? 1 : 0,
+      buildLegacyReminderFrequency(reminderPolicy.resubmissionPeriodDays),
+      reminderPolicy.resubmissionPeriodDays,
+      reminderPolicy.reminderRepeatDays,
+      normalizedReminderUntil,
       submissionBackupEnabled ? 1 : 0,
       serializeSubmissionBackupFormats(submissionBackupFormats)
     )
@@ -5698,6 +6149,21 @@ async function restoreFormFromBackup(input: {
   if (Array.isArray(submissions)) {
     for (const submission of submissions) {
       if (!submission || typeof submission !== "object") continue;
+      const submitter =
+        submission.submitter && typeof submission.submitter === "object"
+          ? (submission.submitter as Record<string, unknown>)
+          : null;
+      const comments = Array.isArray(submission.comments)
+        ? (submission.comments as Array<Record<string, unknown>>)
+        : [];
+      const submitterProvider =
+        submitter && typeof submitter.provider === "string" ? submitter.provider : null;
+      const submitterEmail =
+        submitter && typeof submitter.email === "string" ? submitter.email : null;
+      const submitterGithub =
+        submitter && typeof submitter.github_username === "string"
+          ? submitter.github_username
+          : null;
       const submissionId =
         typeof submission.id === "string" && submission.id.trim()
           ? submission.id.trim()
@@ -5718,14 +6184,19 @@ async function restoreFormFromBackup(input: {
           payloadJson,
           submission.created_at ?? new Date().toISOString(),
           submission.updated_at ?? submission.created_at ?? new Date().toISOString(),
-          submission.submitter?.provider ?? null,
-          submission.submitter?.email ?? null,
-          submission.submitter?.github_username ?? null
+          submitterProvider,
+          submitterEmail,
+          submitterGithub
         )
         .run();
-      await importSubmissionComments(env, submissionId, submission.comments || [], null);
+      await importSubmissionComments(env, submissionId, comments, null);
     }
   }
+  await syncFormReminderRecipientsFromSubmissions(env, formId, {
+    reminder_frequency: buildLegacyReminderFrequency(reminderPolicy.resubmissionPeriodDays),
+    resubmission_period_days: reminderPolicy.resubmissionPeriodDays,
+    reminder_repeat_days: reminderPolicy.reminderRepeatDays
+  });
   return { created: true };
 }
 
@@ -5822,6 +6293,20 @@ async function restoreSubmissionBackup(
     if (commentList.length > 0) {
       await importSubmissionComments(env, submissionId, commentList, null);
       comments += commentList.length;
+    }
+  }
+  if (created > 0 || updated > 0 || restored > 0) {
+    const reminderPolicy = await env.DB.prepare(
+      "SELECT reminder_frequency, resubmission_period_days, reminder_repeat_days FROM forms WHERE id=?"
+    )
+      .bind(existingForm.id)
+      .first<{
+        reminder_frequency: string | null;
+        resubmission_period_days: number | null;
+        reminder_repeat_days: number | null;
+      }>();
+    if (reminderPolicy) {
+      await syncFormReminderRecipientsFromSubmissions(env, existingForm.id, reminderPolicy);
     }
   }
   return { created, updated, restored, skipped, comments };
@@ -9743,6 +10228,12 @@ export default {
         const reminderFrequencySelect = (await hasColumn(env, "forms", "reminder_frequency"))
           ? "f.reminder_frequency"
           : "NULL as reminder_frequency";
+        const resubmissionPeriodSelect = (await hasColumn(env, "forms", "resubmission_period_days"))
+          ? "f.resubmission_period_days as resubmission_period_days"
+          : "NULL as resubmission_period_days";
+        const reminderRepeatSelect = (await hasColumn(env, "forms", "reminder_repeat_days"))
+          ? "f.reminder_repeat_days as reminder_repeat_days"
+          : "NULL as reminder_repeat_days";
         const reminderUntilSelect = (await hasColumn(env, "forms", "reminder_until"))
           ? "f.reminder_until"
           : "NULL as reminder_until";
@@ -9768,7 +10259,7 @@ export default {
           ? "f.comment_notify_enabled as comment_notify_enabled"
           : "NULL as comment_notify_enabled";
         const { results } = await env.DB.prepare(
-          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},${submissionBackupSelect},${submissionBackupFormatsSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect},${commentNotifySelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${resubmissionPeriodSelect},${reminderRepeatSelect},${reminderUntilSelect},${submissionBackupSelect},${submissionBackupFormatsSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect},${commentNotifySelect},f.updated_at,f.created_at,t.key as templateKey,COALESCE(s.submission_count,0) as submission_count FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN (SELECT form_id, COUNT(*) as submission_count FROM submissions WHERE deleted_at IS NULL GROUP BY form_id) s ON s.form_id=f.id WHERE f.deleted_at IS NULL ORDER BY f.created_at DESC`
         ).all<AdminFormRow & { submission_count?: number; updated_at?: string | null; created_at?: string | null }>();
 
         const data = results.map((row) => ({
@@ -9794,7 +10285,11 @@ export default {
           password_require_submit: toBoolean(row.password_require_submit ?? 0),
           save_all_versions: toBoolean(row.save_all_versions ?? 0),
           reminder_enabled: toBoolean((row as any).reminder_enabled ?? 0),
-          reminder_frequency: (row as any).reminder_frequency ?? null,
+          reminder_frequency:
+            (row as any).reminder_frequency ??
+            buildLegacyReminderFrequency(getFormResubmissionPeriodDays(row as any)),
+          resubmission_period_days: getFormResubmissionPeriodDays(row as any),
+          reminder_repeat_days: getFormReminderRepeatDays(row as any),
           reminder_until: (row as any).reminder_until ?? null,
           submission_backup_enabled: toBoolean((row as any).submission_backup_enabled ?? 0),
           submission_backup_formats: parseSubmissionBackupFormats((row as any).submission_backup_formats),
@@ -9808,9 +10303,72 @@ export default {
         return jsonResponse(200, { data, requestId }, requestId, corsHeaders);
       }
 
+      const formReminderRecipientsMatch =
+        request.method === "GET"
+          ? url.pathname.match(/^\/api\/admin\/forms\/([^/]+)\/reminder-recipients$/)
+          : null;
+      if (request.method === "GET" && formReminderRecipientsMatch) {
+        const slug = decodeURIComponent(formReminderRecipientsMatch[1]);
+        const form = await env.DB.prepare(
+          "SELECT id, slug, title, reminder_enabled, reminder_frequency, reminder_until, resubmission_period_days, reminder_repeat_days FROM forms WHERE slug=? AND deleted_at IS NULL"
+        )
+          .bind(slug)
+          .first<{
+            id: string;
+            slug: string;
+            title: string;
+            reminder_enabled: number | null;
+            reminder_frequency: string | null;
+            reminder_until: string | null;
+            resubmission_period_days: number | null;
+            reminder_repeat_days: number | null;
+          }>();
+        if (!form) {
+          return errorResponse(404, "not_found", requestId, corsHeaders);
+        }
+        await syncFormReminderRecipientsFromSubmissions(env, form.id, form);
+        const { results } = await env.DB.prepare(
+          "SELECT form_id, recipient_key, user_id, email, enabled, latest_submission_at, last_submission_id, first_due_at, next_reminder_at, last_reminder_sent_at, last_reminder_status FROM form_reminder_recipients WHERE form_id=? ORDER BY CASE WHEN email IS NULL OR trim(email)='' THEN 1 ELSE 0 END, lower(COALESCE(email, recipient_key)) ASC"
+        )
+          .bind(form.id)
+          .all<FormReminderRecipientRow>();
+        return jsonResponse(
+          200,
+          {
+            data: results.map((row) => ({
+              recipient_key: row.recipient_key,
+              user_id: row.user_id ?? null,
+              email: row.email ?? null,
+              enabled: toBoolean(row.enabled),
+              latest_submission_at: row.latest_submission_at ?? null,
+              last_submission_id: row.last_submission_id ?? null,
+              first_due_at: row.first_due_at ?? null,
+              next_reminder_at: row.next_reminder_at ?? null,
+              last_reminder_sent_at: row.last_reminder_sent_at ?? null,
+              last_reminder_status: row.last_reminder_status ?? null
+            })),
+            policy: {
+              reminder_enabled: toBoolean(form.reminder_enabled ?? 0),
+              resubmission_period_days: getFormResubmissionPeriodDays(form),
+              reminder_repeat_days: getFormReminderRepeatDays(form),
+              reminder_until: form.reminder_until ?? null
+            },
+            requestId
+          },
+          requestId,
+          corsHeaders
+        );
+      }
+
       const formBackupMatch = url.pathname.match(/^\/api\/admin\/forms\/([^/]+)\/backup$/);
       if (request.method === "GET" && formBackupMatch) {
         const slug = decodeURIComponent(formBackupMatch[1]);
+        const resubmissionPeriodSelect = (await hasColumn(env, "forms", "resubmission_period_days"))
+          ? "f.resubmission_period_days as resubmission_period_days"
+          : "NULL as resubmission_period_days";
+        const reminderRepeatSelect = (await hasColumn(env, "forms", "reminder_repeat_days"))
+          ? "f.reminder_repeat_days as reminder_repeat_days"
+          : "NULL as reminder_repeat_days";
         const submissionBackupSelect = (await hasColumn(env, "forms", "submission_backup_enabled"))
           ? "f.submission_backup_enabled as submission_backup_enabled"
           : "NULL as submission_backup_enabled";
@@ -9833,7 +10391,7 @@ export default {
           ? "f.comment_notify_enabled as comment_notify_enabled"
           : "NULL as comment_notify_enabled";
         const formRow = await env.DB.prepare(
-          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,f.reminder_until,${submissionBackupSelect},${submissionBackupFormatsSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect},${commentNotifySelect},t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL`
+          `SELECT f.id,f.slug,f.title,f.description,f.is_locked,f.is_public,f.auth_policy,f.canvas_enabled,f.canvas_course_id,f.canvas_allowed_section_ids_json,f.canvas_fields_position,f.available_from,f.available_until,f.password_required,f.password_require_access,f.password_require_submit,f.password_salt,f.password_hash,f.file_rules_json,f.save_all_versions,f.reminder_enabled,f.reminder_frequency,${resubmissionPeriodSelect},${reminderRepeatSelect},f.reminder_until,${submissionBackupSelect},${submissionBackupFormatsSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect},${commentNotifySelect},t.key as template_key,t.name as template_name,t.schema_json as template_schema_json,t.file_rules_json as template_file_rules_json,fv.schema_json as form_schema_json FROM forms f LEFT JOIN templates t ON t.id=f.template_id LEFT JOIN form_versions fv ON fv.form_id=f.id AND fv.version=1 WHERE f.slug=? AND f.deleted_at IS NULL`
         )
           .bind(slug)
           .first<{
@@ -9858,6 +10416,8 @@ export default {
             file_rules_json: string | null;
             reminder_enabled: number;
             reminder_frequency: string | null;
+            resubmission_period_days: number | null;
+            reminder_repeat_days: number | null;
             reminder_until: string | null;
             submission_backup_enabled: number | null;
             submission_backup_formats: string | null;
@@ -9888,7 +10448,10 @@ export default {
           form: {
             slug: formRow.slug,
             reminder_enabled: toBoolean(formRow.reminder_enabled),
-            reminder_frequency: formRow.reminder_frequency,
+            reminder_frequency:
+              formRow.reminder_frequency ?? buildLegacyReminderFrequency(getFormResubmissionPeriodDays(formRow)),
+            resubmission_period_days: getFormResubmissionPeriodDays(formRow),
+            reminder_repeat_days: getFormReminderRepeatDays(formRow),
             reminder_until: formRow.reminder_until ?? null,
             submission_backup_enabled: toBoolean(formRow.submission_backup_enabled ?? 0),
             submission_backup_formats: parseSubmissionBackupFormats(formRow.submission_backup_formats),
@@ -10524,11 +11087,16 @@ export default {
                 env,
                 form,
                 restoreTrash,
-                reminderEnabled: Boolean(body.reminderEnabled),
+                reminderEnabled:
+                  typeof body.reminderEnabled === "boolean" ? body.reminderEnabled : undefined,
                 reminderFrequency:
                   typeof body.reminderFrequency === "string" ? body.reminderFrequency : undefined,
+                resubmissionPeriodDays: parsePositiveInteger(body.resubmissionPeriodDays),
+                reminderRepeatDays: parsePositiveInteger(body.reminderRepeatDays),
                 reminderUntil:
-                  typeof body.reminderUntil === "string" ? body.reminderUntil : null
+                  typeof body.reminderUntil === "string" || body.reminderUntil === null
+                    ? (body.reminderUntil as string | null)
+                    : undefined
               });
               if (result.created) created += 1;
               if (result.updated) updated += 1;
@@ -10785,7 +11353,18 @@ export default {
         return jsonResponse(200, { ok: true, canvasSummary, requestId }, requestId, corsHeaders);
       }
       if (request.method === "POST" && url.pathname === "/api/admin/forms/restore") {
-        let body: { type?: string; form?: any; template?: any; restoreTrash?: boolean; reminderEnabled?: boolean; reminderFrequency?: string; reminderUntil?: string | null } | null = null;
+        let body: {
+          type?: string;
+          form?: Record<string, unknown>;
+          template?: Record<string, unknown>;
+          submissions?: Array<Record<string, unknown>>;
+          restoreTrash?: boolean;
+          reminderEnabled?: boolean;
+          reminderFrequency?: string;
+          resubmissionPeriodDays?: number | null;
+          reminderRepeatDays?: number | null;
+          reminderUntil?: string | null;
+        } | null = null;
         try {
           body = await parseJsonBody(request);
         } catch (error) {
@@ -10796,370 +11375,43 @@ export default {
             message: "invalid_backup"
           });
         }
-        const form = body.form;
-        if (!form.slug || !form.title || !form.templateKey) {
-          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-            message: "missing_form_fields"
+        try {
+          const result = await restoreFormFromBackup({
+            env,
+            form: body.form,
+            template: body.template,
+            submissions: Array.isArray(body.submissions) ? body.submissions : undefined,
+            restoreTrash: body.restoreTrash === true,
+            reminderEnabled:
+              typeof body.reminderEnabled === "boolean" ? body.reminderEnabled : undefined,
+            reminderFrequency:
+              typeof body.reminderFrequency === "string" ? body.reminderFrequency : undefined,
+            resubmissionPeriodDays: parsePositiveInteger(body.resubmissionPeriodDays),
+            reminderRepeatDays: parsePositiveInteger(body.reminderRepeatDays),
+            reminderUntil:
+              typeof body.reminderUntil === "string" || body.reminderUntil === null
+                ? body.reminderUntil
+                : undefined
           });
-        }
-        let templateId: string | null = null;
-        let templateSchemaJson: string | null = null;
-        let formSchemaJson: string | null = null;
-        let parsedFormSchema: unknown = null;
-        if (form.schema_json !== undefined && form.schema_json !== null) {
-          try {
-            parsedFormSchema =
-              typeof form.schema_json === "string" ? JSON.parse(form.schema_json) : form.schema_json;
-            formSchemaJson = JSON.stringify(parsedFormSchema);
-          } catch (error) {
-            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-              field: "schema_json",
-              message: "invalid_json"
-            });
-          }
-          const ruleError = validateFileRulesFromSchema(parsedFormSchema);
-          if (ruleError) {
-            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-              field: "schema_json",
-              message: "invalid_file_rules",
-              detail: ruleError
-            });
-          }
-          const visibilityError = validateVisibilityRulesFromSchema(parsedFormSchema);
-          if (visibilityError) {
-            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-              field: "schema_json",
-              message: "invalid_visibility_rules",
-              detail: visibilityError
-            });
-          }
-        }
-        if (body.template?.key) {
-          const tpl = body.template;
-          let parsedSchema: unknown = null;
-          try {
-            parsedSchema =
-              typeof tpl.schema_json === "string" ? JSON.parse(tpl.schema_json) : tpl.schema_json;
-          } catch (error) {
-            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-              field: "schema_json",
-              message: "invalid_json"
-            });
-          }
-          const ruleError = validateFileRulesFromSchema(parsedSchema);
-          if (ruleError) {
-            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-              field: "schema_json",
-              message: "invalid_file_rules",
-              detail: ruleError
-            });
-          }
-          const visibilityError = validateVisibilityRulesFromSchema(parsedSchema);
-          if (visibilityError) {
-            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-              field: "schema_json",
-              message: "invalid_visibility_rules",
-              detail: visibilityError
-            });
-          }
-          const fileRulesJson = buildFileRulesJsonFromSchema(JSON.stringify(parsedSchema));
-          const existingTpl = await env.DB.prepare(
-            "SELECT id FROM templates WHERE key=? AND deleted_at IS NULL"
-          )
-            .bind(tpl.key)
-            .first<{ id: string }>();
-          if (existingTpl?.id) {
-            templateId = existingTpl.id;
-            await env.DB.prepare(
-              "UPDATE templates SET name=?, schema_json=?, file_rules_json=? WHERE id=?"
-            )
-              .bind(
-                tpl.name || tpl.key,
-                JSON.stringify(parsedSchema),
-                fileRulesJson ?? "{}",
-                templateId
-              )
-              .run();
-          } else {
-            templateId = crypto.randomUUID();
-            await env.DB.prepare(
-              "INSERT INTO templates (id, key, name, schema_json, file_rules_json) VALUES (?, ?, ?, ?, ?)"
-            )
-              .bind(
-                templateId,
-                tpl.key,
-                tpl.name || tpl.key,
-                JSON.stringify(parsedSchema),
-                fileRulesJson ?? "{}"
-              )
-              .run();
-          }
-        } else {
-          const existingTpl = await env.DB.prepare(
-            "SELECT id, schema_json FROM templates WHERE key=? AND deleted_at IS NULL"
-          )
-            .bind(form.templateKey)
-            .first<{ id: string; schema_json: string }>();
-          if (existingTpl?.id) {
-            templateId = existingTpl.id;
-            templateSchemaJson = existingTpl.schema_json;
-          } else if (formSchemaJson) {
-            templateId = crypto.randomUUID();
-            await env.DB.prepare(
-              "INSERT INTO templates (id, key, name, schema_json, file_rules_json) VALUES (?, ?, ?, ?, ?)"
-            )
-              .bind(
-                templateId,
-                form.templateKey,
-                form.templateName || form.templateKey,
-                formSchemaJson,
-                buildFileRulesJsonFromSchema(formSchemaJson) ?? "{}"
-              )
-              .run();
-            templateSchemaJson = formSchemaJson;
-          } else {
-            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-              field: "templateKey",
-              message: "template_not_found"
-            });
-          }
-        }
-
-        const existingForm = await env.DB.prepare(
-          "SELECT id, deleted_at FROM forms WHERE slug=?"
-        )
-          .bind(form.slug)
-          .first<{ id: string; deleted_at: string | null }>();
-
-        const authPolicy = form.auth_policy ?? "optional";
-        if (!["optional", "google", "github", "either", "required"].includes(authPolicy)) {
-          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-            field: "auth_policy",
-            allowed: ["optional", "google", "github", "either", "required"]
-          });
-        }
-
-        const isPublic = Boolean(form.is_public);
-        const isLocked = Boolean(form.is_locked);
-        const availableFrom = normalizeDateTimeInput(form.available_from ?? null);
-        const availableUntil = normalizeDateTimeInput(form.available_until ?? null);
-        if (availableFrom && availableUntil) {
-          const start = parseIsoTime(availableFrom);
-          const end = parseIsoTime(availableUntil);
-          if (start && end && start >= end) {
-            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-              field: "availableUntil",
-              message: "must_be_after_start"
-            });
-          }
-        }
-        const passwordRequired = Boolean(form.password_required);
-        let passwordRequireAccess = Boolean(form.password_require_access);
-        let passwordRequireSubmit = Boolean(form.password_require_submit);
-        if (!passwordRequireAccess && !passwordRequireSubmit && passwordRequired) {
-          passwordRequireSubmit = true;
-        }
-        const passwordSalt =
-          typeof form.password_salt === "string" && form.password_salt.trim()
-            ? form.password_salt.trim()
-            : null;
-        const passwordHash =
-          typeof form.password_hash === "string" && form.password_hash.trim()
-            ? form.password_hash.trim()
-            : null;
-        if (passwordRequired && (!passwordSalt || !passwordHash)) {
-          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
-            field: "password",
-            message: "missing_password_hash"
-          });
-        }
-        const canvasEnabled = Boolean(form.canvas_enabled);
-        const canvasAllowed =
-          Array.isArray(form.canvas_allowed_section_ids_json)
-            ? JSON.stringify(form.canvas_allowed_section_ids_json)
-            : typeof form.canvas_allowed_section_ids_json === "string"
-              ? form.canvas_allowed_section_ids_json
-              : null;
-        const fileRulesJson = formSchemaJson
-          ? buildFileRulesJsonFromSchema(formSchemaJson)
-          : typeof form.file_rules_json === "string"
-            ? form.file_rules_json
-            : form.file_rules_json
-              ? JSON.stringify(form.file_rules_json)
-              : null;
-        const submissionBackupEnabled = Boolean(form.submission_backup_enabled);
-        const submissionBackupFormats = parseSubmissionBackupFormats(form.submission_backup_formats);
-        const formVersionSchema = formSchemaJson || templateSchemaJson;
-
-        if (existingForm?.id && existingForm.deleted_at !== null && body?.restoreTrash !== true) {
-          return errorResponse(409, "conflict", requestId, corsHeaders, {
-            message: "slug_in_trash"
-          });
-        }
-        if (existingForm?.id) {
-          await env.DB.prepare(
-            "UPDATE forms SET title=?, description=?, template_id=?, is_public=?, is_locked=?, auth_policy=?, file_rules_json=?, canvas_enabled=?, canvas_course_id=?, canvas_allowed_section_ids_json=?, canvas_fields_position=?, available_from=?, available_until=?, password_required=?, password_require_access=?, password_require_submit=?, password_salt=?, password_hash=?, submission_backup_enabled=?, submission_backup_formats=?, deleted_at=NULL, deleted_by=NULL, deleted_reason=NULL WHERE id=?"
-          )
-            .bind(
-              form.title,
-              form.description ?? null,
-              templateId,
-              isPublic ? 1 : 0,
-              isLocked ? 1 : 0,
-              authPolicy,
-              fileRulesJson,
-              canvasEnabled ? 1 : 0,
-              form.canvas_course_id ?? null,
-              canvasAllowed ?? null,
-              form.canvas_fields_position ?? "bottom",
-              availableFrom,
-              availableUntil,
-              passwordRequired ? 1 : 0,
-              passwordRequireAccess ? 1 : 0,
-              passwordRequireSubmit ? 1 : 0,
-              passwordRequired ? passwordSalt : null,
-              passwordRequired ? passwordHash : null,
-              submissionBackupEnabled ? 1 : 0,
-              serializeSubmissionBackupFormats(submissionBackupFormats),
-              existingForm.id
-            )
-            .run();
-          if (formVersionSchema) {
-            const existingVersion = await env.DB.prepare(
-              "SELECT id FROM form_versions WHERE form_id=? AND version=1"
-            )
-              .bind(existingForm.id)
-              .first<{ id: string }>();
-            if (existingVersion?.id) {
-              await env.DB.prepare("UPDATE form_versions SET schema_json=? WHERE id=?")
-                .bind(formVersionSchema, existingVersion.id)
-                .run();
-            } else {
-              await env.DB.prepare(
-                "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
-              )
-                .bind(crypto.randomUUID(), existingForm.id, formVersionSchema)
-                .run();
-            }
-          }
-          if (await hasColumn(env, "forms", "submission_backup_enabled")) {
-            await ensureSubmissionBackupTask(env, form.slug, form.title, submissionBackupEnabled);
-          }
-          if (body?.submissions && Array.isArray(body.submissions)) {
-            for (const submission of body.submissions) {
-              if (!submission || typeof submission !== "object") continue;
-              const submissionId =
-                typeof submission.id === "string" && submission.id.trim()
-                  ? submission.id.trim()
-                  : crypto.randomUUID();
-              const payloadJson =
-                submission.data_json && typeof submission.data_json === "object"
-                  ? JSON.stringify({ data: submission.data_json })
-                  : typeof submission.data_json === "string"
-                    ? submission.data_json
-                    : JSON.stringify({ data: submission.data_json ?? {} });
-              await env.DB.prepare(
-                "INSERT OR IGNORE INTO submissions (id, form_id, user_id, payload_json, created_at, updated_at, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-              )
-                .bind(
-                  submissionId,
-                  existingForm.id,
-                  submission.user_id ?? null,
-                  payloadJson,
-                  submission.created_at ?? new Date().toISOString(),
-                  submission.updated_at ?? submission.created_at ?? new Date().toISOString(),
-                  submission.submitter?.provider ?? null,
-                  submission.submitter?.email ?? null,
-                  submission.submitter?.github_username ?? null
-                )
-                .run();
-              await importSubmissionComments(env, submissionId, submission.comments || [], null);
-            }
-          }
+          const status = result.created ? 201 : 200;
           return jsonResponse(
-            200,
-            { ok: true, updated: true, restored: existingForm.deleted_at !== null, requestId },
+            status,
+            {
+              ok: true,
+              created: result.created === true,
+              updated: result.updated === true,
+              restored: result.restored === true,
+              requestId
+            },
             requestId,
             corsHeaders
           );
-        }
-
-        const formId = crypto.randomUUID();
-        await env.DB.prepare(
-          "INSERT INTO forms (id, slug, title, description, template_id, is_public, is_locked, auth_policy, file_rules_json, canvas_enabled, canvas_course_id, canvas_allowed_section_ids_json, canvas_fields_position, available_from, available_until, password_required, password_require_access, password_require_submit, password_salt, password_hash, reminder_enabled, reminder_frequency, reminder_until, submission_backup_enabled, submission_backup_formats) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-          .bind(
-            formId,
-            form.slug,
-            form.title,
-            form.description ?? null,
-            templateId,
-            isPublic ? 1 : 0,
-            isLocked ? 1 : 0,
-            authPolicy,
-            fileRulesJson,
-            canvasEnabled ? 1 : 0,
-            form.canvas_course_id ?? null,
-            canvasAllowed ?? null,
-            form.canvas_fields_position ?? "bottom",
-            availableFrom,
-            availableUntil,
-            passwordRequired ? 1 : 0,
-            passwordRequireAccess ? 1 : 0,
-            passwordRequireSubmit ? 1 : 0,
-            passwordRequired ? passwordSalt : null,
-            passwordRequired ? passwordHash : null,
-            body.reminderEnabled ? 1 : 0,
-            body.reminderFrequency || "weekly",
-            body.reminderUntil || null,
-            submissionBackupEnabled ? 1 : 0,
-            serializeSubmissionBackupFormats(submissionBackupFormats)
-          )
-          .run();
-
-        if (formVersionSchema) {
-          await env.DB.prepare(
-            "INSERT INTO form_versions (id, form_id, version, schema_json) VALUES (?, ?, 1, ?)"
-          )
-            .bind(crypto.randomUUID(), formId, formVersionSchema)
-            .run();
-        }
-        if (await hasColumn(env, "forms", "submission_backup_enabled")) {
-          await ensureSubmissionBackupTask(env, form.slug, form.title, submissionBackupEnabled);
-        }
-        if (body?.submissions && Array.isArray(body.submissions)) {
-          for (const submission of body.submissions) {
-            if (!submission || typeof submission !== "object") continue;
-            const submissionId =
-              typeof submission.id === "string" && submission.id.trim()
-                ? submission.id.trim()
-                : crypto.randomUUID();
-            const payloadJson =
-              submission.data_json && typeof submission.data_json === "object"
-                ? JSON.stringify({ data: submission.data_json })
-                : typeof submission.data_json === "string"
-                  ? submission.data_json
-                  : JSON.stringify({ data: submission.data_json ?? {} });
-            await env.DB.prepare(
-              "INSERT OR IGNORE INTO submissions (id, form_id, user_id, payload_json, created_at, updated_at, submitter_provider, submitter_email, submitter_github_username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-            )
-              .bind(
-                submissionId,
-                formId,
-                submission.user_id ?? null,
-                payloadJson,
-                submission.created_at ?? new Date().toISOString(),
-                submission.updated_at ?? submission.created_at ?? new Date().toISOString(),
-                submission.submitter?.provider ?? null,
-                submission.submitter?.email ?? null,
-                submission.submitter?.github_username ?? null
-              )
-              .run();
-            await importSubmissionComments(env, submissionId, submission.comments || [], null);
+        } catch (error) {
+          if (isRestoreError(error)) {
+            return errorResponse(error.status, error.code, requestId, corsHeaders, error.details);
           }
+          throw error;
         }
-
-        return jsonResponse(201, { ok: true, created: true, requestId }, requestId, corsHeaders);
       }
       if (request.method === "POST" && url.pathname === "/api/admin/templates/from-form") {
         let body: { type?: string; form?: any; restoreTrash?: boolean } | null = null;
@@ -11269,6 +11521,8 @@ export default {
           formPassword?: string | null;
           reminderEnabled?: boolean;
           reminderFrequency?: string;
+          resubmissionPeriodDays?: number;
+          reminderRepeatDays?: number;
           reminderUntil?: string | null;
           saveAllVersions?: boolean | number;
           submissionBackupEnabled?: boolean;
@@ -11492,6 +11746,24 @@ export default {
             message: "expected_boolean"
           });
         }
+        if (
+          body.resubmissionPeriodDays !== undefined &&
+          parsePositiveInteger(body.resubmissionPeriodDays) === null
+        ) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "resubmissionPeriodDays",
+            message: "expected_positive_integer"
+          });
+        }
+        if (
+          body.reminderRepeatDays !== undefined &&
+          parsePositiveInteger(body.reminderRepeatDays) === null
+        ) {
+          return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+            field: "reminderRepeatDays",
+            message: "expected_positive_integer"
+          });
+        }
         if (body.submissionBackupEnabled !== undefined && typeof body.submissionBackupEnabled !== "boolean") {
           return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
             field: "submissionBackupEnabled",
@@ -11520,6 +11792,11 @@ export default {
             });
           }
         }
+        const reminderPolicy = deriveReminderPolicyDays({
+          reminder_frequency: body.reminderFrequency ?? null,
+          resubmission_period_days: body.resubmissionPeriodDays ?? null,
+          reminder_repeat_days: body.reminderRepeatDays ?? null
+        });
         const description = body.description ?? null;
         const mirroredRules = buildFileRulesJsonFromSchema(schemaJsonSource);
         const availableFrom = normalizeDateTimeInput(body.availableFrom ?? null);
@@ -11613,7 +11890,9 @@ export default {
           { name: "password_hash", value: passwordHash },
           { name: "save_all_versions", value: body?.saveAllVersions ? 1 : 0 },
           { name: "reminder_enabled", value: body.reminderEnabled ? 1 : 0 },
-          { name: "reminder_frequency", value: body.reminderFrequency || "weekly" },
+          { name: "reminder_frequency", value: buildLegacyReminderFrequency(reminderPolicy.resubmissionPeriodDays) },
+          { name: "resubmission_period_days", value: reminderPolicy.resubmissionPeriodDays },
+          { name: "reminder_repeat_days", value: reminderPolicy.reminderRepeatDays },
           { name: "reminder_until", value: body.reminderUntil || null },
           { name: "submission_backup_enabled", value: body.submissionBackupEnabled ? 1 : 0 },
           { name: "submission_backup_formats", value: serializeSubmissionBackupFormats(submissionBackupFormats) },
@@ -11717,7 +11996,11 @@ export default {
               available_until: availableUntil,
               password_required: passwordRequired,
               password_require_access: passwordRequireAccess,
-              password_require_submit: passwordRequireSubmit
+              password_require_submit: passwordRequireSubmit,
+              reminder_enabled: Boolean(body.reminderEnabled),
+              resubmission_period_days: reminderPolicy.resubmissionPeriodDays,
+              reminder_repeat_days: reminderPolicy.reminderRepeatDays,
+              reminder_until: body.reminderUntil || null
             },
             warning: canvasWarning ? { code: canvasWarning } : null,
             requestId
@@ -11728,6 +12011,48 @@ export default {
       }
 
       if (request.method === "PATCH") {
+        const reminderRecipientMatch = url.pathname.match(
+          /^\/api\/admin\/forms\/([^/]+)\/reminder-recipients\/([^/]+)$/
+        );
+        if (reminderRecipientMatch) {
+          const slug = decodeURIComponent(reminderRecipientMatch[1]);
+          const recipientKey = decodeURIComponent(reminderRecipientMatch[2]);
+          let body: { enabled?: boolean } | null = null;
+          try {
+            body = await parseJsonBody(request);
+          } catch (error) {
+            return errorResponse(400, "invalid_json", requestId, corsHeaders);
+          }
+          if (!body || typeof body.enabled !== "boolean") {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "enabled",
+              message: "expected_boolean"
+            });
+          }
+          const form = await env.DB.prepare(
+            "SELECT id FROM forms WHERE slug=? AND deleted_at IS NULL"
+          )
+            .bind(slug)
+            .first<{ id: string }>();
+          if (!form) {
+            return errorResponse(404, "not_found", requestId, corsHeaders);
+          }
+          const existing = await env.DB.prepare(
+            "SELECT recipient_key FROM form_reminder_recipients WHERE form_id=? AND recipient_key=?"
+          )
+            .bind(form.id, recipientKey)
+            .first<{ recipient_key: string }>();
+          if (!existing) {
+            return errorResponse(404, "not_found", requestId, corsHeaders);
+          }
+          await env.DB.prepare(
+            "UPDATE form_reminder_recipients SET enabled=?, updated_at=datetime('now') WHERE form_id=? AND recipient_key=?"
+          )
+            .bind(body.enabled ? 1 : 0, form.id, recipientKey)
+            .run();
+          return jsonResponse(200, { ok: true, requestId }, requestId, corsHeaders);
+        }
+
         const formMatch = url.pathname.match(/^\/api\/admin\/forms\/([^/]+)$/);
         if (formMatch) {
           const slug = decodeURIComponent(formMatch[1]);
@@ -11753,6 +12078,8 @@ export default {
             formPassword?: string | null;
             reminderEnabled?: boolean;
             reminderFrequency?: string;
+            resubmissionPeriodDays?: number;
+            reminderRepeatDays?: number;
             reminderUntil?: string | null;
             saveAllVersions?: boolean | number;
             submissionBackupEnabled?: boolean;
@@ -11761,6 +12088,7 @@ export default {
             discussionMarkdownEnabled?: boolean;
             discussionHtmlEnabled?: boolean;
             discussionMathjaxEnabled?: boolean;
+            commentNotifyEnabled?: boolean;
           } | null = null;
           try {
             body = await parseJsonBody(request);
@@ -11786,6 +12114,8 @@ export default {
             "canvas_fields_position",
             "reminder_enabled",
             "reminder_frequency",
+            "resubmission_period_days",
+            "reminder_repeat_days",
             "reminder_until",
             "save_all_versions",
             "submission_backup_enabled",
@@ -11811,6 +12141,10 @@ export default {
             "password_hash",
             "available_from",
             "available_until",
+            "reminder_enabled",
+            "reminder_frequency",
+            "resubmission_period_days",
+            "reminder_repeat_days",
             "reminder_until",
             "canvas_course_id",
             "submission_backup_enabled"
@@ -11834,6 +12168,10 @@ export default {
               password_hash: string | null;
               available_from: string | null;
               available_until: string | null;
+              reminder_enabled: number | null;
+              reminder_frequency: string | null;
+              resubmission_period_days: number | null;
+              reminder_repeat_days: number | null;
               reminder_until: string | null;
               canvas_course_id: string | null;
               submission_backup_enabled: number | null;
@@ -12202,6 +12540,24 @@ export default {
             pushOptionalUpdate("reminder_enabled", body.reminderEnabled ? 1 : 0, true);
           }
 
+          if (
+            body?.resubmissionPeriodDays !== undefined &&
+            parsePositiveInteger(body.resubmissionPeriodDays) === null
+          ) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "resubmissionPeriodDays",
+              message: "expected_positive_integer"
+            });
+          }
+          if (
+            body?.reminderRepeatDays !== undefined &&
+            parsePositiveInteger(body.reminderRepeatDays) === null
+          ) {
+            return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
+              field: "reminderRepeatDays",
+              message: "expected_positive_integer"
+            });
+          }
           if (body?.reminderFrequency !== undefined) {
             if (body.reminderFrequency !== null && !["daily", "weekly", "monthly"].includes(body.reminderFrequency) && !/^\d+:(days|weeks|months)$/.test(body.reminderFrequency)) {
               return errorResponse(400, "invalid_payload", requestId, corsHeaders, {
@@ -12209,7 +12565,35 @@ export default {
                 message: "invalid_value"
               });
             }
-            pushOptionalUpdate("reminder_frequency", body.reminderFrequency || "weekly", true);
+          }
+          const reminderPolicy = deriveReminderPolicyDays({
+            reminder_frequency:
+              body?.reminderFrequency !== undefined
+                ? body.reminderFrequency ?? null
+                : formRow.reminder_frequency ?? null,
+            resubmission_period_days:
+              body?.resubmissionPeriodDays !== undefined
+                ? body.resubmissionPeriodDays ?? null
+                : formRow.resubmission_period_days ?? null,
+            reminder_repeat_days:
+              body?.reminderRepeatDays !== undefined
+                ? body.reminderRepeatDays ?? null
+                : formRow.reminder_repeat_days ?? null
+          });
+          if (body?.reminderFrequency !== undefined || body?.resubmissionPeriodDays !== undefined) {
+            pushOptionalUpdate(
+              "reminder_frequency",
+              buildLegacyReminderFrequency(reminderPolicy.resubmissionPeriodDays),
+              true
+            );
+            pushOptionalUpdate(
+              "resubmission_period_days",
+              reminderPolicy.resubmissionPeriodDays,
+              true
+            );
+          }
+          if (body?.reminderRepeatDays !== undefined) {
+            pushOptionalUpdate("reminder_repeat_days", reminderPolicy.reminderRepeatDays, true);
           }
 
           if (body?.reminderUntil !== undefined) {
@@ -12381,6 +12765,18 @@ export default {
               await renameSubmissionBackupTask(env, slug, nextSlug, nextTitle);
             }
             await ensureSubmissionBackupTask(env, nextSlug, nextTitle, nextBackupEnabled);
+          }
+          if (
+            body?.reminderEnabled !== undefined ||
+            body?.reminderFrequency !== undefined ||
+            body?.resubmissionPeriodDays !== undefined ||
+            body?.reminderRepeatDays !== undefined
+          ) {
+            await syncFormReminderRecipientsFromSubmissions(env, formRow.id, {
+              reminder_frequency: buildLegacyReminderFrequency(reminderPolicy.resubmissionPeriodDays),
+              resubmission_period_days: reminderPolicy.resubmissionPeriodDays,
+              reminder_repeat_days: reminderPolicy.reminderRepeatDays
+            });
           }
           if (newSlug) {
             if (await hasColumn(env, "submissions", "form_slug")) {
@@ -14646,6 +15042,12 @@ export default {
       const reminderFrequencySelect = (await hasColumn(env, "forms", "reminder_frequency"))
         ? "f.reminder_frequency as reminder_frequency"
         : "NULL as reminder_frequency";
+      const resubmissionPeriodSelect = (await hasColumn(env, "forms", "resubmission_period_days"))
+        ? "f.resubmission_period_days as resubmission_period_days"
+        : "NULL as resubmission_period_days";
+      const reminderRepeatSelect = (await hasColumn(env, "forms", "reminder_repeat_days"))
+        ? "f.reminder_repeat_days as reminder_repeat_days"
+        : "NULL as reminder_repeat_days";
       const reminderUntilSelect = (await hasColumn(env, "forms", "reminder_until"))
         ? "f.reminder_until as reminder_until"
         : "NULL as reminder_until";
@@ -14677,7 +15079,7 @@ export default {
         ? "COALESCE(s.submitter_github_username,(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1)) as submitter_github_username"
         : "(SELECT provider_login FROM user_identities ui WHERE ui.user_id=s.user_id ORDER BY ui.created_at DESC LIMIT 1) as submitter_github_username";
       const submission = await env.DB.prepare(
-        `SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,${createdIpSelect},${createdUserAgentSelect},${submitterProviderSelect},${submitterEmailSelect},${submitterGithubSelect},s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${reminderUntilSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect} FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL`
+        `SELECT s.id,s.form_id,s.user_id,s.payload_json,s.created_at,s.updated_at,${createdIpSelect},${createdUserAgentSelect},${submitterProviderSelect},${submitterEmailSelect},${submitterGithubSelect},s.canvas_enroll_status,s.canvas_enroll_error,s.canvas_course_id,s.canvas_section_id,s.canvas_enrolled_at,s.canvas_user_id,s.canvas_user_name,f.slug as form_slug,f.title as form_title,f.is_locked,f.is_public,f.auth_policy,f.save_all_versions,${reminderEnabledSelect},${reminderFrequencySelect},${resubmissionPeriodSelect},${reminderRepeatSelect},${reminderUntilSelect},${discussionEnabledSelect},${discussionMarkdownSelect},${discussionHtmlSelect},${discussionMathjaxSelect} FROM submissions s JOIN forms f ON f.id=s.form_id WHERE s.id=? AND s.deleted_at IS NULL`
       )
         .bind(submissionId)
         .first<{
@@ -14707,6 +15109,8 @@ export default {
           save_all_versions: number | null;
           reminder_enabled: number | null;
           reminder_frequency: string | null;
+          resubmission_period_days: number | null;
+          reminder_repeat_days: number | null;
           reminder_until: string | null;
           discussion_enabled: number | null;
           discussion_markdown_enabled: number | null;
@@ -14793,7 +15197,11 @@ export default {
               auth_policy: submission.auth_policy ?? "optional",
               save_all_versions: toBoolean(submission.save_all_versions ?? 0),
               reminder_enabled: toBoolean(submission.reminder_enabled ?? 0),
-              reminder_frequency: submission.reminder_frequency ?? null,
+              reminder_frequency:
+                submission.reminder_frequency ??
+                buildLegacyReminderFrequency(getFormResubmissionPeriodDays(submission)),
+              resubmission_period_days: getFormResubmissionPeriodDays(submission),
+              reminder_repeat_days: getFormReminderRepeatDays(submission),
               reminder_until: submission.reminder_until ?? null,
               discussion_enabled: toBoolean(submission.discussion_enabled ?? 0),
               discussion_markdown_enabled: toBoolean(submission.discussion_markdown_enabled ?? 1),
@@ -15990,6 +16398,7 @@ export default {
         const createdIp = getRequestIp(request);
         const createdUserAgent = request.headers.get("user-agent");
         const payloadJson = JSON.stringify({ data: body.data });
+        const submissionTimestamp = new Date().toISOString();
         let submissionId = crypto.randomUUID();
         let updated = false;
 
@@ -16055,6 +16464,17 @@ export default {
             )
             .run();
         }
+
+        await upsertFormReminderRecipientFromSubmission(env, {
+          formId: form.id,
+          reminder_frequency: form.reminder_frequency ?? null,
+          resubmission_period_days: form.resubmission_period_days ?? null,
+          reminder_repeat_days: form.reminder_repeat_days ?? null,
+          userId,
+          submitterEmail: submitter.email,
+          submissionId,
+          submittedAt: submissionTimestamp
+        });
 
         return jsonResponse(
           200,
@@ -17149,6 +17569,17 @@ export default {
             .run();
         }
       }
+
+      await upsertFormReminderRecipientFromSubmission(env, {
+        formId: form.id,
+        reminder_frequency: form.reminder_frequency ?? null,
+        resubmission_period_days: form.resubmission_period_days ?? null,
+        reminder_repeat_days: form.reminder_repeat_days ?? null,
+        userId,
+        submitterEmail: submitter.email,
+        submissionId,
+        submittedAt: new Date().toISOString()
+      });
 
       if (fileRefs.length > 0) {
         for (const ref of fileRefs) {

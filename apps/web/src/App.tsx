@@ -601,6 +601,12 @@ type FormSummary = {
   password_required?: boolean;
   password_require_access?: boolean;
   password_require_submit?: boolean;
+  reminder_enabled?: boolean;
+  reminder_frequency?: string | null;
+  resubmission_period_days?: number | null;
+  reminder_repeat_days?: number | null;
+  reminder_until?: string | null;
+  save_all_versions?: boolean;
   is_open?: boolean;
   discussion_enabled?: boolean;
   discussion_markdown_enabled?: boolean;
@@ -654,6 +660,9 @@ type FormDetail = {
   password_require_submit?: boolean;
   reminder_enabled?: boolean;
   reminder_frequency?: string | null;
+  resubmission_period_days?: number | null;
+  reminder_repeat_days?: number | null;
+  reminder_until?: string | null;
   is_open?: boolean;
   discussion_enabled?: boolean;
   discussion_markdown_enabled?: boolean;
@@ -673,6 +682,26 @@ type FormDetail = {
     allowedExtensions: string[];
     required: boolean;
   };
+};
+
+type ReminderRecipientRow = {
+  recipient_key: string;
+  user_id?: string | null;
+  email?: string | null;
+  enabled: boolean;
+  latest_submission_at?: string | null;
+  last_submission_id?: string | null;
+  first_due_at?: string | null;
+  next_reminder_at?: string | null;
+  last_reminder_sent_at?: string | null;
+  last_reminder_status?: string | null;
+};
+
+type ReminderRecipientPolicy = {
+  reminder_enabled: boolean;
+  resubmission_period_days: number;
+  reminder_repeat_days: number;
+  reminder_until?: string | null;
 };
 
 type UserInfo = {
@@ -843,20 +872,73 @@ function isValidTimeString(value: string) {
   return /^([01]\d|2[0-3]):([0-5]\d)$/.test(value);
 }
 
-function formatReminderFrequency(value: string | null | undefined) {
-  if (!value) return "";
+function parsePositiveInteger(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const normalized = Math.floor(value);
+    return normalized >= 1 ? normalized : null;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const normalized = Math.floor(Number(value));
+    return Number.isFinite(normalized) && normalized >= 1 ? normalized : null;
+  }
+  return null;
+}
+
+function parseReminderFrequencyDays(value: string | null | undefined) {
+  if (!value) return null;
   const normalized = value.trim().toLowerCase();
-  if (!normalized) return "";
-  if (normalized === "daily") return "every day";
-  if (normalized === "weekly") return "every week";
-  if (normalized === "monthly") return "every month";
+  if (!normalized) return null;
+  if (normalized === "daily") return 1;
+  if (normalized === "weekly") return 7;
+  if (normalized === "monthly") return 30;
   const match = /^(\d+):(days|weeks|months)$/.exec(normalized);
-  if (!match) return "";
+  if (!match) return null;
   const count = Number(match[1]);
-  if (!Number.isFinite(count) || count <= 0) return "";
-  const unit = match[2];
-  const label = count === 1 ? unit.replace(/s$/, "") : unit;
-  return `every ${count} ${label}`;
+  if (!Number.isFinite(count) || count < 1) return null;
+  if (match[2] === "days") return count;
+  if (match[2] === "weeks") return count * 7;
+  return count * 30;
+}
+
+function getResubmissionPeriodDays(value: {
+  resubmission_period_days?: number | null;
+  reminder_frequency?: string | null;
+}) {
+  return (
+    parsePositiveInteger(value.resubmission_period_days) ??
+    parseReminderFrequencyDays(value.reminder_frequency) ??
+    14
+  );
+}
+
+function getReminderRepeatDays(value: { reminder_repeat_days?: number | null }) {
+  return parsePositiveInteger(value.reminder_repeat_days) ?? 2;
+}
+
+function formatReminderIntervalDays(days: number) {
+  if (!Number.isFinite(days) || days < 1) return "";
+  if (days % 30 === 0) {
+    const months = days / 30;
+    return `${months} month${months === 1 ? "" : "s"}`;
+  }
+  if (days % 7 === 0) {
+    const weeks = days / 7;
+    return `${weeks} week${weeks === 1 ? "" : "s"}`;
+  }
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
+function formatReminderPolicySummary(value: {
+  reminder_frequency?: string | null;
+  resubmission_period_days?: number | null;
+  reminder_repeat_days?: number | null;
+}) {
+  const dueDays = getResubmissionPeriodDays(value);
+  const repeatDays = getReminderRepeatDays(value);
+  const dueText = formatReminderIntervalDays(dueDays);
+  const repeatText = formatReminderIntervalDays(repeatDays);
+  if (!dueText || !repeatText) return "";
+  return `submission due every ${dueText}; after due, reminders repeat every ${repeatText}`;
 }
 
 function parseSelectionValues(field: FormField, rawValue: string) {
@@ -2514,7 +2596,7 @@ function buildSubmissionExportContent({
   const createdAt = formatTimeICT(submission?.created_at ?? null);
   const updatedAt = formatTimeICT(submission?.updated_at ?? null);
   const reminderText = submission?.form?.reminder_enabled
-    ? formatReminderFrequency(submission.form.reminder_frequency)
+    ? formatReminderPolicySummary(submission.form)
     : "";
 
   const metaEntries = [
@@ -2593,8 +2675,8 @@ function buildSubmissionExportContent({
   }
   if (submission?.form?.reminder_enabled) {
     metaEntries.push({
-      key: "reminder_frequency",
-      label: "Reminder frequency",
+      key: "reminder_schedule",
+      label: "Reminder schedule",
       value: reminderText || "enabled"
     });
   }
@@ -6671,12 +6753,12 @@ function SubmissionDetailPage({
   );
   const reminderText = useMemo(() => {
     if (!data?.form?.reminder_enabled) return "";
-    const freqText = formatReminderFrequency(data.form.reminder_frequency);
-    if (!freqText) return "";
+    const scheduleText = formatReminderPolicySummary(data.form);
+    if (!scheduleText) return "";
     const untilText = data.form.reminder_until ? formatTimeICT(data.form.reminder_until) : "";
     return untilText
-      ? `Reminder: resubmit ${freqText} until ${untilText}.`
-      : `Reminder: resubmit ${freqText}.`;
+      ? `Reminder: ${scheduleText} until ${untilText}.`
+      : `Reminder: ${scheduleText}.`;
   }, [data]);
 
   const discussionEnabled = data?.form?.discussion_enabled === true;
@@ -12500,8 +12582,8 @@ function BuilderPage({
   const [canvasSyncing, setCanvasSyncing] = useState(false);
   const [canvasError, setCanvasError] = useState<string | null>(null);
   const [formBuilderReminderEnabled, setFormBuilderReminderEnabled] = useState(false);
-  const [formBuilderReminderValue, setFormBuilderReminderValue] = useState(1);
-  const [formBuilderReminderUnit, setFormBuilderReminderUnit] = useState("weeks");
+  const [formBuilderResubmissionPeriodDays, setFormBuilderResubmissionPeriodDays] = useState(14);
+  const [formBuilderReminderRepeatDays, setFormBuilderReminderRepeatDays] = useState(2);
   const [formBuilderReminderUntil, setFormBuilderReminderUntil] = useState("");
   const [formBuilderSaveAllVersions, setFormBuilderSaveAllVersions] = useState(false);
   const [formBuilderSubmissionBackupEnabled, setFormBuilderSubmissionBackupEnabled] =
@@ -12510,14 +12592,20 @@ function BuilderPage({
     ["json"]
   );
   const [formCreateReminderEnabled, setFormCreateReminderEnabled] = useState(false);
-  const [formCreateReminderValue, setFormCreateReminderValue] = useState(1);
-  const [formCreateReminderUnit, setFormCreateReminderUnit] = useState("weeks");
+  const [formCreateResubmissionPeriodDays, setFormCreateResubmissionPeriodDays] = useState(14);
+  const [formCreateReminderRepeatDays, setFormCreateReminderRepeatDays] = useState(2);
   const [formCreateReminderUntil, setFormCreateReminderUntil] = useState("");
   const [formCreateSaveAllVersions, setFormCreateSaveAllVersions] = useState(false);
   const [formCreateSubmissionBackupEnabled, setFormCreateSubmissionBackupEnabled] =
     useState(false);
   const [formCreateSubmissionBackupFormats, setFormCreateSubmissionBackupFormats] = useState<string[]>(
     ["json"]
+  );
+  const [formReminderRecipients, setFormReminderRecipients] = useState<ReminderRecipientRow[]>([]);
+  const [formReminderPolicy, setFormReminderPolicy] = useState<ReminderRecipientPolicy | null>(null);
+  const [formReminderRecipientsLoading, setFormReminderRecipientsLoading] = useState(false);
+  const [formReminderRecipientsStatus, setFormReminderRecipientsStatus] = useState<string | null>(
+    null
   );
 
   const prevDefaultTimezoneRef = useRef(appDefaultTimezone);
@@ -12629,6 +12717,63 @@ function BuilderPage({
     setCanvasSections(Array.isArray(payload?.data) ? payload.data : []);
     setCanvasSectionsCourseId(courseId);
     setCanvasSectionsNeedsSync(Boolean(payload?.needsSync));
+  }
+
+  async function loadReminderRecipients(slug: string) {
+    if (!slug) {
+      setFormReminderRecipients([]);
+      setFormReminderPolicy(null);
+      setFormReminderRecipientsStatus(null);
+      setFormReminderRecipientsLoading(false);
+      return;
+    }
+    setFormReminderRecipientsLoading(true);
+    setFormReminderRecipientsStatus(null);
+    const response = await apiFetch(
+      `${API_BASE}/api/admin/forms/${encodeURIComponent(slug)}/reminder-recipients`
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      setFormReminderRecipients([]);
+      setFormReminderPolicy(null);
+      setFormReminderRecipientsStatus(payload?.error || "Failed to load reminder recipients.");
+      setFormReminderRecipientsLoading(false);
+      return;
+    }
+    setFormReminderRecipients(Array.isArray(payload?.data) ? payload.data : []);
+    setFormReminderPolicy(payload?.policy || null);
+    setFormReminderRecipientsStatus(null);
+    setFormReminderRecipientsLoading(false);
+  }
+
+  async function handleToggleReminderRecipient(recipientKey: string, enabled: boolean) {
+    if (!formBuilderSlug) return;
+    setFormReminderRecipientsStatus(null);
+    const response = await apiFetch(
+      `${API_BASE}/api/admin/forms/${encodeURIComponent(
+        formBuilderSlug
+      )}/reminder-recipients/${encodeURIComponent(recipientKey)}`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled })
+      }
+    );
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      const message = payload?.error || "Failed to update recipient reminder setting.";
+      setFormReminderRecipientsStatus(message);
+      onNotice(message, "error");
+      return;
+    }
+    setFormReminderRecipients((prev) =>
+      prev.map((recipient) =>
+        recipient.recipient_key === recipientKey ? { ...recipient, enabled } : recipient
+      )
+    );
+    setFormReminderRecipientsStatus(
+      enabled ? "Recipient reminders enabled." : "Recipient reminders disabled."
+    );
   }
 
   async function syncCanvas(mode: "courses" | "course_sections", courseId?: string) {
@@ -13170,14 +13315,14 @@ function BuilderPage({
       setFormBuilderCanvasAllowedSections(null);
       setFormBuilderCanvasPosition("bottom");
       setFormBuilderReminderEnabled(false);
-      setFormBuilderReminderValue(1);
-      setFormBuilderReminderUnit("weeks");
+      setFormBuilderResubmissionPeriodDays(14);
+      setFormBuilderReminderRepeatDays(2);
       setFormBuilderReminderUntil("");
       setFormBuilderSubmissionBackupEnabled(false);
       setFormBuilderSubmissionBackupFormats(["json"]);
       setFormCreateReminderEnabled(false);
-      setFormCreateReminderValue(1);
-      setFormCreateReminderUnit("weeks");
+      setFormCreateResubmissionPeriodDays(14);
+      setFormCreateReminderRepeatDays(2);
       setFormCreateReminderUntil("");
       setFormBuilderDiscussionEnabled(false);
       setFormBuilderDiscussionMarkdownEnabled(true);
@@ -13186,6 +13331,9 @@ function BuilderPage({
       setFormBuilderCommentNotifyEnabled(true);
       setFormBuilderTemplateKey("");
       setFormBuilderSlugEdit("");
+      setFormReminderRecipients([]);
+      setFormReminderPolicy(null);
+      setFormReminderRecipientsStatus(null);
       return;
     }
     setFormBuilderSlugEdit(slug);
@@ -13193,8 +13341,12 @@ function BuilderPage({
     const payload = await response.json().catch(() => null);
     if (!response.ok) {
       setFormBuilderStatus(payload?.error || "Failed to load form schema.");
+      setFormReminderRecipients([]);
+      setFormReminderPolicy(null);
+      setFormReminderRecipientsStatus(null);
       return;
     }
+    await loadReminderRecipients(slug);
     const rawSchema = payload?.data?.template_schema_json || "";
     if (!rawSchema) {
       setFormBuilderSchema("");
@@ -13235,17 +13387,8 @@ function BuilderPage({
       setFormBuilderCanvasCourseId(String(selected.canvas_course_id || ""));
       setFormBuilderCanvasPosition(String(selected.canvas_fields_position || "bottom"));
       setFormBuilderReminderEnabled(Boolean(selected.reminder_enabled));
-      const freq = String(selected.reminder_frequency || "1:weeks");
-      if (freq.includes(":")) {
-        const [val, unit] = freq.split(":");
-        setFormBuilderReminderValue(parseInt(val) || 1);
-        setFormBuilderReminderUnit(unit || "weeks");
-      } else {
-        // Backward compatibility
-        if (freq === "daily") { setFormBuilderReminderValue(1); setFormBuilderReminderUnit("days"); }
-        else if (freq === "monthly") { setFormBuilderReminderValue(1); setFormBuilderReminderUnit("months"); }
-        else { setFormBuilderReminderValue(1); setFormBuilderReminderUnit("weeks"); }
-      }
+      setFormBuilderResubmissionPeriodDays(getResubmissionPeriodDays(selected));
+      setFormBuilderReminderRepeatDays(getReminderRepeatDays(selected));
       setFormBuilderReminderUntil(
         utcToLocalInputWithZone(selected.reminder_until ?? null, formBuilderAvailabilityTimezone)
       );
@@ -13540,7 +13683,8 @@ function BuilderPage({
             : {}),
           canvasFieldsPosition: formBuilderCanvasPosition,
           reminderEnabled: formBuilderReminderEnabled,
-          reminderFrequency: `${formBuilderReminderValue}:${formBuilderReminderUnit}`,
+          resubmissionPeriodDays: formBuilderResubmissionPeriodDays,
+          reminderRepeatDays: formBuilderReminderRepeatDays,
           reminderUntil: localInputToUtcWithZone(formBuilderReminderUntil, formBuilderAvailabilityTimezone) || null,
           saveAllVersions: formBuilderSaveAllVersions,
           submissionBackupEnabled: formBuilderSubmissionBackupEnabled,
@@ -13589,6 +13733,7 @@ function BuilderPage({
       onNotice("Form settings updated.", "success");
     }
     await loadBuilder();
+    await loadReminderRecipients(nextSlug || formBuilderSlug);
   }
 
   function handleCopyFormLink() {
@@ -13931,7 +14076,8 @@ function BuilderPage({
         submissionBackupEnabled: formCreateSubmissionBackupEnabled,
         submissionBackupFormats: formCreateSubmissionBackupFormats,
         reminderEnabled: formCreateReminderEnabled,
-        reminderFrequency: `${formCreateReminderValue}:${formCreateReminderUnit}`,
+        resubmissionPeriodDays: formCreateResubmissionPeriodDays,
+        reminderRepeatDays: formCreateReminderRepeatDays,
         reminderUntil: localInputToUtcWithZone(formCreateReminderUntil, formCreateAvailabilityTimezone) || null,
         discussionEnabled: formCreateDiscussionEnabled,
         discussionMarkdownEnabled: formCreateDiscussionMarkdownEnabled,
@@ -13969,8 +14115,8 @@ function BuilderPage({
     setFormCreateCanvasAllowedSections(null);
     setFormCreateCanvasPosition("bottom");
     setFormCreateReminderEnabled(false);
-    setFormCreateReminderValue(1);
-    setFormCreateReminderUnit("weeks");
+    setFormCreateResubmissionPeriodDays(14);
+    setFormCreateReminderRepeatDays(2);
     setFormCreateReminderUntil("");
     setFormCreateSubmissionBackupEnabled(false);
     setFormCreateSubmissionBackupFormats(["json"]);
@@ -14576,28 +14722,42 @@ function BuilderPage({
                   </div>
                 </div>
                 {formCreateReminderEnabled && (
-                  <div className="col-md-4">
-                    <label className="form-label">Reminder Frequency</label>
+                  <div className="col-md-3">
+                    <label className="form-label">Submission due every</label>
                     <div className="input-group">
                       <input
                         type="number"
                         className="form-control"
                         min="1"
-                        value={formCreateReminderValue}
-                        onChange={(e) =>
-                          setFormCreateReminderValue(Math.max(1, parseInt(e.target.value) || 1))
+                        value={formCreateResubmissionPeriodDays}
+                        onChange={(event) =>
+                          setFormCreateResubmissionPeriodDays(
+                            Math.max(1, parseInt(event.target.value) || 1)
+                          )
                         }
                       />
-                      <select
-                        className="form-select"
-                        value={formCreateReminderUnit}
-                        onChange={(event) => setFormCreateReminderUnit(event.target.value)}
-                      >
-                        <option value="days">Day(s)</option>
-                        <option value="weeks">Week(s)</option>
-                        <option value="months">Month(s)</option>
-                      </select>
+                      <span className="input-group-text">days</span>
                     </div>
+                  </div>
+                )}
+                {formCreateReminderEnabled && (
+                  <div className="col-md-3">
+                    <label className="form-label">After due, remind every</label>
+                    <div className="input-group">
+                      <input
+                        type="number"
+                        className="form-control"
+                        min="1"
+                        value={formCreateReminderRepeatDays}
+                        onChange={(event) =>
+                          setFormCreateReminderRepeatDays(
+                            Math.max(1, parseInt(event.target.value) || 1)
+                          )
+                        }
+                      />
+                      <span className="input-group-text">days</span>
+                    </div>
+                    <div className="muted mt-1">First reminder starts after the submission period.</div>
                   </div>
                 )}
                 {formCreateReminderEnabled && (
@@ -14941,32 +15101,50 @@ function BuilderPage({
                     </div>
                   </div>
                   {formBuilderReminderEnabled && (
-                    <div className="col-md-4">
-                      <label className="form-label">Reminder Frequency</label>
+                    <div className="col-md-3">
+                      <label className="form-label">Submission due every</label>
                       <div className="input-group">
                         <input
                           type="number"
                           className="form-control"
                           min="1"
-                          value={formBuilderReminderValue}
-                          onChange={(e) => setFormBuilderReminderValue(Math.max(1, parseInt(e.target.value) || 1))}
+                          value={formBuilderResubmissionPeriodDays}
+                          onChange={(event) =>
+                            setFormBuilderResubmissionPeriodDays(
+                              Math.max(1, parseInt(event.target.value) || 1)
+                            )
+                          }
                           disabled={!formBuilderSlug}
                         />
-                        <select
-                          className="form-select"
-                          value={formBuilderReminderUnit}
-                          onChange={(event) => setFormBuilderReminderUnit(event.target.value)}
-                          disabled={!formBuilderSlug}
-                        >
-                          <option value="days">Day(s)</option>
-                          <option value="weeks">Week(s)</option>
-                          <option value="months">Month(s)</option>
-                        </select>
+                        <span className="input-group-text">days</span>
                       </div>
                     </div>
                   )}
                   {formBuilderReminderEnabled && (
-                    <div className="col-md-3">
+                  <div className="col-md-3">
+                      <label className="form-label">After due, remind every</label>
+                      <div className="input-group">
+                        <input
+                          type="number"
+                          className="form-control"
+                          min="1"
+                          value={formBuilderReminderRepeatDays}
+                          onChange={(event) =>
+                            setFormBuilderReminderRepeatDays(
+                              Math.max(1, parseInt(event.target.value) || 1)
+                            )
+                          }
+                          disabled={!formBuilderSlug}
+                        />
+                        <span className="input-group-text">days</span>
+                      </div>
+                      <div className="muted mt-1" style={{ fontSize: "0.8rem" }}>
+                        First reminder starts after the submission period.
+                      </div>
+                    </div>
+                  )}
+                  {formBuilderReminderEnabled && (
+                  <div className="col-md-3">
                       <label className="form-label">Reminder until</label>
                       <input
                         className="form-control"
@@ -15154,6 +15332,93 @@ function BuilderPage({
                       onFieldsPositionChange: setFormBuilderCanvasPosition,
                       idPrefix: "form-edit"
                     })}
+                  </div>
+                  <div className="col-12">
+                    <div className="panel panel--compact">
+                      <div className="d-flex flex-wrap justify-content-between align-items-start gap-2">
+                        <div>
+                          <div className="fw-semibold">Reminder recipients</div>
+                          <div className="muted">
+                            Per-user reminder control for this form. Recipients come from the latest
+                            submission identity on this form.
+                          </div>
+                          {formReminderPolicy ? (
+                            <div className="muted mt-1">
+                              Policy: {formatReminderPolicySummary(formReminderPolicy)}
+                              {formReminderPolicy.reminder_until
+                                ? ` until ${formatTimeICT(formReminderPolicy.reminder_until)}`
+                                : ""}
+                            </div>
+                          ) : null}
+                        </div>
+                        <button
+                          type="button"
+                          className="btn btn-outline-secondary btn-sm"
+                          onClick={() => loadReminderRecipients(formBuilderSlug)}
+                          disabled={!formBuilderSlug || formReminderRecipientsLoading}
+                        >
+                          <i className="bi bi-arrow-clockwise" aria-hidden="true" /> Refresh
+                        </button>
+                      </div>
+                      {formReminderRecipientsStatus ? (
+                        <div className="muted mt-2">{formReminderRecipientsStatus}</div>
+                      ) : null}
+                      {!formBuilderSlug ? (
+                        <div className="muted mt-2">Select a form to manage reminder recipients.</div>
+                      ) : formReminderRecipientsLoading ? (
+                        <div className="muted mt-2">Loading reminder recipients...</div>
+                      ) : formReminderRecipients.length === 0 ? (
+                        <div className="muted mt-2">No reminder recipients yet.</div>
+                      ) : (
+                        <div className="table-responsive mt-3">
+                          <table className="table table-sm align-middle mb-0">
+                            <thead>
+                              <tr>
+                                <th>Recipient</th>
+                                <th>Latest submission</th>
+                                <th>Next reminder</th>
+                                <th>Last reminder</th>
+                                <th>Status</th>
+                                <th>Enabled</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {formReminderRecipients.map((recipient) => (
+                                <tr key={recipient.recipient_key}>
+                                  <td>
+                                    <div>{recipient.email || recipient.user_id || recipient.recipient_key}</div>
+                                    {recipient.email && recipient.user_id ? (
+                                      <div className="muted">{recipient.user_id}</div>
+                                    ) : null}
+                                  </td>
+                                  <td>{recipient.latest_submission_at ? formatTimeICT(recipient.latest_submission_at) : "—"}</td>
+                                  <td>{recipient.next_reminder_at ? formatTimeICT(recipient.next_reminder_at) : "—"}</td>
+                                  <td>{recipient.last_reminder_sent_at ? formatTimeICT(recipient.last_reminder_sent_at) : "—"}</td>
+                                  <td>{recipient.last_reminder_status || "—"}</td>
+                                  <td>
+                                    <div className="form-check form-switch m-0">
+                                      <input
+                                        className="form-check-input"
+                                        type="checkbox"
+                                        checked={recipient.enabled}
+                                        onChange={(event) =>
+                                          handleToggleReminderRecipient(
+                                            recipient.recipient_key,
+                                            event.target.checked
+                                          )
+                                        }
+                                        disabled={formReminderRecipientsLoading}
+                                        id={`recipient-${recipient.recipient_key}`}
+                                      />
+                                    </div>
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
                   </div>
                   <div className="col-12">
                     <label className="form-label">Schema JSON</label>
