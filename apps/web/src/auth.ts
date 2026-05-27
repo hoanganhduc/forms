@@ -1,8 +1,20 @@
 const TOKEN_KEY = "form_app_token";
 
+function isUsableToken(token: string) {
+  if (token.length > 8192) return false;
+  if (!/^[A-Za-z0-9._~-]+$/.test(token)) return false;
+  return token.split(".").length === 3;
+}
+
 export function getToken() {
   try {
-    return localStorage.getItem(TOKEN_KEY);
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (!token) return null;
+    if (!isUsableToken(token)) {
+      localStorage.removeItem(TOKEN_KEY);
+      return null;
+    }
+    return token;
   } catch {
     return null;
   }
@@ -30,5 +42,5 @@ export async function apiFetch(input: RequestInfo, init: RequestInit = {}) {
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   }
-  return fetch(input, { ...init, headers, credentials: "include" });
+  return fetch(input, { ...init, headers, credentials: init.credentials ?? "omit" });
 }
