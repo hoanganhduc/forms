@@ -247,6 +247,16 @@ type JwtPayload = {
   exp: number;
 };
 
+type OauthStateRecord = {
+  provider: "google" | "github";
+  returnTo?: string | null;
+  intent?: "link";
+  userId?: string;
+  iat?: number;
+  exp?: number;
+  nonce?: string;
+};
+
 const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7;
 const OAUTH_STATE_TTL_SECONDS = 60 * 10;
 const UPLOAD_TOKEN_TTL_SECONDS = 60 * 15;
@@ -6741,6 +6751,51 @@ async function verifyJwt(token: string, secret: string): Promise<JwtPayload | nu
   }
 }
 
+async function signOauthState(record: OauthStateRecord, secret: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const payloadPart = base64UrlEncode(encoder.encode(JSON.stringify(record)));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(payloadPart));
+  return `${payloadPart}.${base64UrlEncode(new Uint8Array(signature))}`;
+}
+
+async function verifyOauthState(state: string, secret: string): Promise<OauthStateRecord | null> {
+  const parts = state.split(".");
+  if (parts.length !== 2) return null;
+  const [payloadPart, signaturePart] = parts;
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"]
+  );
+  const signature = base64UrlDecode(signaturePart);
+  const valid = await crypto.subtle.verify("HMAC", key, signature, encoder.encode(payloadPart));
+  if (!valid) return null;
+  try {
+    const payload = JSON.parse(
+      new TextDecoder().decode(base64UrlDecode(payloadPart))
+    ) as OauthStateRecord;
+    if (!payload.provider || (payload.provider !== "google" && payload.provider !== "github")) {
+      return null;
+    }
+    if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
 function getTokenFromRequest(request: Request): string | null {
   const authHeader = request.headers.get("Authorization");
   if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -6774,26 +6829,30 @@ async function createOauthState(
   returnTo: string | null,
   extra?: { intent?: "link"; userId?: string }
 ) {
-  const state = crypto.randomUUID();
-  await env.OAUTH_KV.put(
-    `oauth_state:${state}`,
-    JSON.stringify({ provider, returnTo, ...extra }),
-    { expirationTtl: OAUTH_STATE_TTL_SECONDS }
+  const now = Math.floor(Date.now() / 1000);
+  return signOauthState(
+    {
+      provider,
+      returnTo,
+      ...extra,
+      iat: now,
+      exp: now + OAUTH_STATE_TTL_SECONDS,
+      nonce: crypto.randomUUID()
+    },
+    ensureEnv(env.JWT_SECRET, "JWT_SECRET")
   );
-  return state;
 }
 
 async function consumeOauthState(env: Env, state: string) {
+  const signedState = await verifyOauthState(state, ensureEnv(env.JWT_SECRET, "JWT_SECRET"));
+  if (signedState) return signedState;
+
+  // Backward compatibility for OAuth redirects started before signed state rollout.
   const key = `oauth_state:${state}`;
   const stored = await env.OAUTH_KV.get(key);
   if (!stored) return null;
   await env.OAUTH_KV.delete(key);
-  return JSON.parse(stored) as {
-    provider: "google" | "github";
-    returnTo?: string | null;
-    intent?: "link";
-    userId?: string;
-  };
+  return JSON.parse(stored) as OauthStateRecord;
 }
 
 async function createUploadToken(
@@ -8285,14 +8344,14 @@ export default {
       } catch (error) {
         console.error("[oauth_init_failed]", {
           requestId,
-          stage: "kv_put",
+          stage: "state_create",
           message: String((error as Error | undefined)?.stack || (error as Error | undefined)?.message || error)
         });
         return jsonResponse(
           500,
           {
             error: "oauth_init_failed",
-            detail: { kvError: String((error as Error | undefined)?.message || error) },
+            detail: { stateError: String((error as Error | undefined)?.message || error) },
             requestId
           },
           requestId,
@@ -8450,12 +8509,19 @@ export default {
     if (request.method === "GET" && url.pathname === "/auth/callback/google") {
       const state = url.searchParams.get("state");
       const code = url.searchParams.get("code");
+      const fallbackReturn = `${env.BASE_URL_WEB ?? "/"}#/auth/callback`;
       if (!state || !code) {
-        return errorResponse(400, "invalid_request", requestId, corsHeaders);
+        return createRedirectResponse(
+          appendOAuthErrorToUrl(fallbackReturn, "google", "invalid_request", requestId),
+          requestId
+        );
       }
       const stateRecord = await consumeOauthState(env, state);
       if (!stateRecord || stateRecord.provider !== "google") {
-        return errorResponse(400, "invalid_state", requestId, corsHeaders);
+        return createRedirectResponse(
+          appendOAuthErrorToUrl(fallbackReturn, "google", "invalid_state", requestId),
+          requestId
+        );
       }
       try {
         const redirectUri = new URL("/auth/callback/google", ensureEnv(env.BASE_URL_API, "BASE_URL_API")).toString();
@@ -8548,7 +8614,6 @@ export default {
           const redirectTarget = buildAccountReturnUrl(env, { error: "user_deleted" });
           return createRedirectResponse(redirectTarget, requestId);
         }
-        const fallbackReturn = `${env.BASE_URL_WEB ?? "/"}#/auth/callback`;
         const redirectTarget = appendOAuthErrorToUrl(
           stateRecord.returnTo ?? fallbackReturn,
           "google",
@@ -8584,12 +8649,19 @@ export default {
     if (request.method === "GET" && url.pathname === "/auth/callback/github") {
       const state = url.searchParams.get("state");
       const code = url.searchParams.get("code");
+      const fallbackReturn = `${env.BASE_URL_WEB ?? "/"}#/auth/callback`;
       if (!state || !code) {
-        return errorResponse(400, "invalid_request", requestId, corsHeaders);
+        return createRedirectResponse(
+          appendOAuthErrorToUrl(fallbackReturn, "github", "invalid_request", requestId),
+          requestId
+        );
       }
       const stateRecord = await consumeOauthState(env, state);
       if (!stateRecord || stateRecord.provider !== "github") {
-        return errorResponse(400, "invalid_state", requestId, corsHeaders);
+        return createRedirectResponse(
+          appendOAuthErrorToUrl(fallbackReturn, "github", "invalid_state", requestId),
+          requestId
+        );
       }
       try {
         const redirectUri = new URL("/auth/callback/github", ensureEnv(env.BASE_URL_API, "BASE_URL_API")).toString();
@@ -8682,7 +8754,6 @@ export default {
           const redirectTarget = buildAccountReturnUrl(env, { error: "user_deleted" });
           return createRedirectResponse(redirectTarget, requestId);
         }
-        const fallbackReturn = `${env.BASE_URL_WEB ?? "/"}#/auth/callback`;
         const redirectTarget = appendOAuthErrorToUrl(
           stateRecord.returnTo ?? fallbackReturn,
           "github",
