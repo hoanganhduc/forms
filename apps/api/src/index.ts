@@ -6848,6 +6848,22 @@ function appendTokenToUrl(target: string, token: string): string {
   return `${base}#${tokenFragment}`;
 }
 
+function appendOAuthErrorToUrl(
+  target: string,
+  provider: "google" | "github",
+  error: string,
+  requestId: string
+): string {
+  const [base, hash = ""] = target.split("#");
+  const [hashPath, hashQuery = ""] = hash.split("?");
+  const params = new URLSearchParams(hashQuery);
+  params.set("error", error);
+  params.set("provider", provider);
+  params.set("requestId", requestId);
+  const query = params.toString();
+  return `${base}#${hashPath || "/auth/callback"}${query ? `?${query}` : ""}`;
+}
+
 function buildAccountReturnUrl(env: Env, params?: Record<string, string>) {
   const base = env.BASE_URL_WEB ?? "/";
   const accountBase = base.endsWith("/") ? `${base}#/account` : `${base}/#/account`;
@@ -8342,8 +8358,10 @@ export default {
         userId: authPayload.userId
       });
       const clientId = ensureEnv(env.GITHUB_CLIENT_ID, "GITHUB_CLIENT_ID");
+      const redirectUri = new URL("/auth/callback/github", ensureEnv(env.BASE_URL_API, "BASE_URL_API")).toString();
       const authUrl = new URL("https://github.com/login/oauth/authorize");
       authUrl.searchParams.set("client_id", clientId);
+      authUrl.searchParams.set("redirect_uri", redirectUri);
       authUrl.searchParams.set("scope", "read:user user:email");
       authUrl.searchParams.set("state", state);
       return createRedirectResponse(authUrl.toString(), requestId);
@@ -8443,12 +8461,12 @@ export default {
         const redirectUri = new URL("/auth/callback/google", ensureEnv(env.BASE_URL_API, "BASE_URL_API")).toString();
         const tokenResponse = await exchangeGoogleCode(env, code, redirectUri);
         if (!tokenResponse.id_token) {
-          return errorResponse(500, "missing_id_token", requestId, corsHeaders);
+          throw new Error("missing_id_token");
         }
         const clientId = ensureEnv(env.GOOGLE_CLIENT_ID, "GOOGLE_CLIENT_ID");
         const googlePayload = decodeGoogleIdToken(tokenResponse.id_token, clientId);
         if (!googlePayload.sub) {
-          return errorResponse(500, "invalid_id_token", requestId, corsHeaders);
+          throw new Error("invalid_id_token");
         }
         if (stateRecord.intent === "link") {
           if (!stateRecord.userId) {
@@ -8530,21 +8548,19 @@ export default {
           const redirectTarget = buildAccountReturnUrl(env, { error: "user_deleted" });
           return createRedirectResponse(redirectTarget, requestId);
         }
+        const fallbackReturn = `${env.BASE_URL_WEB ?? "/"}#/auth/callback`;
+        const redirectTarget = appendOAuthErrorToUrl(
+          stateRecord.returnTo ?? fallbackReturn,
+          "google",
+          "oauth_callback_failed",
+          requestId
+        );
         console.error("[oauth_callback_failed]", {
           requestId,
           provider: "google",
           message: String((error as Error | undefined)?.stack || message || error)
         });
-        return jsonResponse(
-          500,
-          {
-            error: "oauth_callback_failed",
-            detail: { message },
-            requestId
-          },
-          requestId,
-          corsHeaders
-        );
+        return createRedirectResponse(redirectTarget, requestId);
       }
     }
 
@@ -8556,6 +8572,7 @@ export default {
         const redirectUri = new URL("/auth/callback/github", ensureEnv(env.BASE_URL_API, "BASE_URL_API")).toString();
         const authUrl = new URL("https://github.com/login/oauth/authorize");
         authUrl.searchParams.set("client_id", clientId);
+        authUrl.searchParams.set("redirect_uri", redirectUri);
         authUrl.searchParams.set("scope", "read:user user:email");
         authUrl.searchParams.set("state", state);
         return createRedirectResponse(authUrl.toString(), requestId);
@@ -8578,11 +8595,11 @@ export default {
         const redirectUri = new URL("/auth/callback/github", ensureEnv(env.BASE_URL_API, "BASE_URL_API")).toString();
         const tokenResponse = await exchangeGithubCode(env, code, redirectUri);
         if (!tokenResponse.access_token) {
-          return errorResponse(500, "missing_access_token", requestId, corsHeaders);
+          throw new Error("missing_access_token");
         }
         const profile = await fetchGithubUser(tokenResponse.access_token);
         if (!profile.login || !profile.id) {
-          return errorResponse(500, "invalid_github_profile", requestId, corsHeaders);
+          throw new Error("invalid_github_profile");
         }
         const email = await fetchGithubEmail(tokenResponse.access_token);
         if (stateRecord.intent === "link") {
@@ -8665,21 +8682,19 @@ export default {
           const redirectTarget = buildAccountReturnUrl(env, { error: "user_deleted" });
           return createRedirectResponse(redirectTarget, requestId);
         }
+        const fallbackReturn = `${env.BASE_URL_WEB ?? "/"}#/auth/callback`;
+        const redirectTarget = appendOAuthErrorToUrl(
+          stateRecord.returnTo ?? fallbackReturn,
+          "github",
+          "oauth_callback_failed",
+          requestId
+        );
         console.error("[oauth_callback_failed]", {
           requestId,
           provider: "github",
           message: String((error as Error | undefined)?.stack || message || error)
         });
-        return jsonResponse(
-          500,
-          {
-            error: "oauth_callback_failed",
-            detail: { message },
-            requestId
-          },
-          requestId,
-          corsHeaders
-        );
+        return createRedirectResponse(redirectTarget, requestId);
       }
     }
 

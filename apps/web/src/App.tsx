@@ -790,7 +790,7 @@ const API_BASE =
   (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
     ? DEFAULT_LOCAL_API
     : DEFAULT_PROD_API);
-const PUBLIC_BASE = import.meta.env.VITE_WEB_BASE || "/forms/";
+const PUBLIC_BASE = import.meta.env.VITE_WEB_BASE || import.meta.env.VITE_PUBLIC_BASE || "/forms/";
 const RETURN_TO_KEY = "form_app_return_to";
 
 function formatSize(bytes: number) {
@@ -2897,6 +2897,13 @@ function buildReturnTo() {
   )}`;
 }
 
+function parseHashParams(hash: string) {
+  const value = hash.replace(/^#/, "");
+  const queryIndex = value.indexOf("?");
+  const query = queryIndex >= 0 ? value.slice(queryIndex + 1) : value;
+  return new URLSearchParams(query);
+}
+
 function buildFileIdentity(fieldKey: string, file: File) {
   return `${fieldKey}:${file.name}:${file.size}`;
 }
@@ -3155,14 +3162,22 @@ function AuthCallback({
   const navigate = useNavigate();
   useEffect(() => {
     const url = new URL(window.location.href);
-    const hashParams = new URLSearchParams(url.hash.replace(/^#/, ""));
+    const hashParams = parseHashParams(url.hash);
     const queryParams = url.searchParams;
     const token = hashParams.get("token") || queryParams.get("token");
+    const error = hashParams.get("error") || queryParams.get("error");
+    const provider = hashParams.get("provider") || queryParams.get("provider");
+    const requestId = hashParams.get("requestId") || queryParams.get("requestId");
     if (token) {
       setToken(token);
       onNotice("Logged in successfully.", "success");
+    } else if (error) {
+      const providerLabel = provider ? ` with ${provider.charAt(0).toUpperCase()}${provider.slice(1)}` : "";
+      const requestLabel = requestId ? ` Request ID: ${requestId}.` : "";
+      onNotice(`Login failed${providerLabel}.${requestLabel}`, "error");
     }
-    const returnTo = queryParams.get("return_to") || localStorage.getItem(RETURN_TO_KEY);
+    const returnTo =
+      hashParams.get("return_to") || queryParams.get("return_to") || localStorage.getItem(RETURN_TO_KEY);
     localStorage.removeItem(RETURN_TO_KEY);
     const destination = returnTo || `${PUBLIC_BASE}#/`;
     window.location.replace(destination);

@@ -38,7 +38,7 @@ jobs:
       - name: Build
         env:
           VITE_API_BASE: https://form-app-api.hoanganhduc.workers.dev
-          VITE_PUBLIC_BASE: /forms/
+          VITE_WEB_BASE: /forms/
         run: npm run build:web
 
       - name: Upload artifact
